@@ -885,6 +885,46 @@ func TestDeviceCodeApprovalAllowsLocalWorkerAndDashboardPorts(t *testing.T) {
 	}
 }
 
+func TestLoginReportsCloudflareChallengeInsteadOfJSONDecodeError(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/auth/device-code/start" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("content-type", "text/html; charset=UTF-8")
+		w.Header().Set("cf-mitigated", "challenge")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`<!DOCTYPE html><html><head><title>Just a moment...</title></head><body>Enable JavaScript and cookies to continue</body></html>`))
+	}))
+	defer server.Close()
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"login", "--origin", server.URL}); code == 0 {
+		t.Fatal("login should fail when the control plane returns a Cloudflare challenge")
+	}
+	got := errb.String()
+	for _, expected := range []string{"Cloudflare challenge", "instead of JSON", "rate limits"} {
+		if !strings.Contains(got, expected) {
+			t.Fatalf("login error missing %q: %s", expected, got)
+		}
+	}
+	if strings.Contains(got, "invalid character '<'") {
+		t.Fatalf("login leaked raw JSON decode error: %s", got)
+	}
+}
+
 func TestRemoteSelfRevokeClearsLocalRuntime(t *testing.T) {
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")

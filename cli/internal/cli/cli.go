@@ -40,7 +40,7 @@ type App struct {
 	In  io.Reader
 }
 
-var Version = "0.1.16"
+var Version = "0.1.17"
 
 var defaultControlPlaneOrigin = "http://127.0.0.1:4173"
 
@@ -5505,6 +5505,7 @@ func postJSONBearerStatusWithClient(st *store.FileStore, client *http.Client, ur
 		return 0, err
 	}
 	request.Header.Set("content-type", "application/json")
+	request.Header.Set("accept", "application/json")
 	request.Header.Set("authorization", "Bearer "+bearer)
 	if err := signBearerRequest(st, request, encoded, bearer); err != nil {
 		return 0, err
@@ -5519,8 +5520,8 @@ func postJSONBearerStatusWithClient(st *store.FileStore, client *http.Client, ur
 		return response.StatusCode, err
 	}
 	if out != nil && len(bytes.TrimSpace(responseBody)) > 0 {
-		if err := json.Unmarshal(responseBody, out); err != nil && response.StatusCode >= 200 && response.StatusCode < 300 {
-			return response.StatusCode, err
+		if err := json.Unmarshal(responseBody, out); err != nil {
+			return response.StatusCode, nonJSONControlPlaneResponseError(response, responseBody, err)
 		}
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -5674,6 +5675,7 @@ func postJSONDeviceCodeClaimStatus(st *store.FileStore, url string, body any, cr
 		return 0, err
 	}
 	request.Header.Set("content-type", "application/json")
+	request.Header.Set("accept", "application/json")
 	if err := signDeviceCodeClaimRequest(st, request, encoded, credentialHash); err != nil {
 		return 0, err
 	}
@@ -5682,10 +5684,8 @@ func postJSONDeviceCodeClaimStatus(st *store.FileStore, url string, body any, cr
 		return 0, err
 	}
 	defer response.Body.Close()
-	if out != nil {
-		if err := json.NewDecoder(response.Body).Decode(out); err != nil && !errors.Is(err, io.EOF) {
-			return response.StatusCode, err
-		}
+	if err := decodeJSONResponse(response, out); err != nil {
+		return response.StatusCode, err
 	}
 	return response.StatusCode, nil
 }
@@ -5700,6 +5700,7 @@ func postJSONDeviceSignedStatus(st *store.FileStore, url string, body any, crede
 		return 0, err
 	}
 	request.Header.Set("content-type", "application/json")
+	request.Header.Set("accept", "application/json")
 	if err := signDeviceRequest(st, request, encoded, credentialHash); err != nil {
 		return 0, err
 	}
@@ -5708,10 +5709,8 @@ func postJSONDeviceSignedStatus(st *store.FileStore, url string, body any, crede
 		return 0, err
 	}
 	defer response.Body.Close()
-	if out != nil {
-		if err := json.NewDecoder(response.Body).Decode(out); err != nil && !errors.Is(err, io.EOF) {
-			return response.StatusCode, err
-		}
+	if err := decodeJSONResponse(response, out); err != nil {
+		return response.StatusCode, err
 	}
 	return response.StatusCode, nil
 }
@@ -5721,17 +5720,49 @@ func postJSONStatus(url string, body any, out any) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	response, err := http.Post(url, "application/json", bytes.NewReader(encoded))
+	request, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(encoded))
+	if err != nil {
+		return 0, err
+	}
+	request.Header.Set("content-type", "application/json")
+	request.Header.Set("accept", "application/json")
+	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		return 0, err
 	}
 	defer response.Body.Close()
-	if out != nil {
-		if err := json.NewDecoder(response.Body).Decode(out); err != nil && !errors.Is(err, io.EOF) {
-			return response.StatusCode, err
-		}
+	if err := decodeJSONResponse(response, out); err != nil {
+		return response.StatusCode, err
 	}
 	return response.StatusCode, nil
+}
+
+func decodeJSONResponse(response *http.Response, out any) error {
+	if out == nil {
+		return nil
+	}
+	responseBody, err := io.ReadAll(response.Body)
+	if err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(responseBody)) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(responseBody, out); err != nil {
+		return nonJSONControlPlaneResponseError(response, responseBody, err)
+	}
+	return nil
+}
+
+func nonJSONControlPlaneResponseError(response *http.Response, body []byte, decodeErr error) error {
+	contentType := response.Header.Get("content-type")
+	if response.Header.Get("cf-mitigated") != "" || bytes.Contains(body, []byte("Just a moment")) {
+		return fmt.Errorf("control plane returned HTTP %d with a Cloudflare challenge instead of JSON; API routes should bypass WAF challenges and rely on rate limits", response.StatusCode)
+	}
+	if contentType != "" && !strings.Contains(strings.ToLower(contentType), "json") {
+		return fmt.Errorf("control plane returned HTTP %d with non-JSON content type %q", response.StatusCode, contentType)
+	}
+	return decodeErr
 }
 
 func createDevice(name string) (asiri.Device, []asiri.KeyRef, error) {
