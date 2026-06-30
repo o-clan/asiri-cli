@@ -1,0 +1,6 @@
+interface:
+  display_name: "Asiri"
+  short_description: "Operate Asiri secrets without exposing values"
+  default_prompt: "Use $asiri to inspect my workspace and run this command with the scoped secret."
+policy:
+  allow_implicit_invocation: true

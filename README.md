@@ -10,6 +10,14 @@ When hosted sync is enabled, Asiri keeps secret labels, encrypted secret materia
 
 This CLI is open source so teams can inspect how secrets are decrypted, injected, mounted, and enforced before they trust it.
 
+## Agent Skill
+
+The public source includes an installable Asiri agent skill at `skills/asiri`.
+Ask a compatible agent harness to install that skill when you want it to use
+Asiri safely. The skill focuses on operational use first: inspect metadata, run
+commands with scoped secrets, track new secrets, grant narrow runtime access,
+and stop before changing trust or key material.
+
 ## Install
 
 ```bash
