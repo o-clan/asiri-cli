@@ -79,6 +79,409 @@ func TestWorkloadControlPlaneSessionsRejectMutations(t *testing.T) {
 	}
 }
 
+func TestTrustedCLIConfiguresWorkloadOIDC(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	refreshes := 0
+	createSeen := false
+	trustSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/auth/session/refresh":
+			refreshes++
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_setup",
+				"workspaceSlug":    "prod",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_remote",
+				"accessToken":      "at_setup",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/workloads":
+			if r.Method == http.MethodGet {
+				if r.URL.Query().Get("orgId") != "org_setup" {
+					t.Fatalf("unexpected workload list org: %s", r.URL.RawQuery)
+				}
+				if r.Header.Get("authorization") != "Bearer at_setup" || r.Header.Get("x-asiri-device") != "dev_remote" || r.Header.Get("x-asiri-signature") == "" {
+					t.Fatalf("workload list missing signed trusted session: auth=%s device=%s", r.Header.Get("authorization"), r.Header.Get("x-asiri-device"))
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"workloads": []map[string]any{{
+					"id":              "wli_prod",
+					"orgId":           "org_setup",
+					"slug":            "prod-api",
+					"name":            "Production API",
+					"status":          "active",
+					"createdByUserId": "usr_owner",
+				}}})
+				return
+			}
+			if r.Method != http.MethodPost {
+				http.NotFound(w, r)
+				return
+			}
+			createSeen = true
+			if r.Header.Get("authorization") != "Bearer at_setup" || r.Header.Get("x-asiri-device") != "dev_remote" || r.Header.Get("x-asiri-signature") == "" {
+				t.Fatalf("workload create missing signed trusted session: auth=%s device=%s", r.Header.Get("authorization"), r.Header.Get("x-asiri-device"))
+			}
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["orgId"] != "org_setup" || body["slug"] != "prod-api" || body["name"] != "Production API" {
+				t.Fatalf("unexpected workload create body: %#v", body)
+			}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":              "wli_prod",
+				"orgId":           "org_setup",
+				"slug":            "prod-api",
+				"name":            "Production API",
+				"status":          "active",
+				"createdByUserId": "usr_owner",
+			})
+		case "/v1/workloads/wli_prod/oidc-trusts":
+			trustSeen = true
+			if r.Method != http.MethodPost {
+				http.NotFound(w, r)
+				return
+			}
+			if r.Header.Get("authorization") != "Bearer at_setup" || r.Header.Get("x-asiri-device") != "dev_remote" || r.Header.Get("x-asiri-signature") == "" {
+				t.Fatalf("workload trust missing signed trusted session: auth=%s device=%s", r.Header.Get("authorization"), r.Header.Get("x-asiri-device"))
+			}
+			var body struct {
+				Provider string            `json:"provider"`
+				Issuer   string            `json:"issuer"`
+				Audience string            `json:"audience"`
+				JwksURL  string            `json:"jwksUrl"`
+				Subject  string            `json:"subject"`
+				Claims   map[string]string `json:"claims"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Provider != "generic" || body.Issuer != "https://issuer.example.test" || body.Audience != "asiri-runtime" || body.JwksURL != "https://issuer.example.test/jwks" || body.Subject != "repo:o-clan/asiri:ref:refs/heads/main" || body.Claims["repository"] != "o-clan/asiri" {
+				t.Fatalf("unexpected workload trust body: %#v", body)
+			}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":         "otr_prod",
+				"orgId":      "org_setup",
+				"workloadId": "wli_prod",
+				"provider":   body.Provider,
+				"issuer":     body.Issuer,
+				"audience":   body.Audience,
+				"jwksUrl":    body.JwksURL,
+				"subject":    body.Subject,
+				"claims":     body.Claims,
+				"status":     "active",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "trusted-cli"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkControlPlaneForDevice(server.URL, "org_setup", "prod", "usr_owner", "dev_remote", device.ID, "at_cached", "rt_cached", 3600, time.Now().UTC().Add(7*24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"workload", "create", "--workspace", "prod", "--slug", "prod-api", "--name", "Production API"}); code != 0 {
+		t.Fatalf("workload create failed: %s", errb.String())
+	}
+	if !createSeen || !strings.Contains(out.String(), "Created workload prod-api") {
+		t.Fatalf("workload create did not complete as expected, seen=%v output=%s", createSeen, out.String())
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"workload", "trust", "--workspace", "prod", "--workload", "prod-api", "--provider", "generic", "--issuer", "https://issuer.example.test", "--audience", "asiri-runtime", "--jwks-url", "https://issuer.example.test/jwks", "--subject", "repo:o-clan/asiri:ref:refs/heads/main", "--claim", "repository=o-clan/asiri"}); code != 0 {
+		t.Fatalf("workload trust failed: %s", errb.String())
+	}
+	if refreshes < 2 || !trustSeen || !strings.Contains(out.String(), "Added generic OIDC trust") {
+		t.Fatalf("workload trust did not complete as expected, refreshes=%d seen=%v output=%s", refreshes, trustSeen, out.String())
+	}
+}
+
+func TestSetupDoctorBeforeInitPrintsBootstrapSteps(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"setup", "doctor"}); code != 0 {
+		t.Fatalf("setup doctor should diagnose missing init without failing: %s", errb.String())
+	}
+	got := out.String()
+	for _, expected := range []string{"Asiri setup doctor", "local vault", "missing", "asiri init --device <name>", "asiri login"} {
+		if !strings.Contains(got, expected) {
+			t.Fatalf("setup doctor output missing %q: %s", expected, got)
+		}
+	}
+}
+
+func TestSetupDoctorReportsTrustedDeviceNextSteps(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	recoveryChecked := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/auth/session/refresh":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_prod",
+				"workspaceSlug":    "prod",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_remote",
+				"accessToken":      "at_doctor",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/orgs":
+			if r.Header.Get("authorization") != "Bearer at_doctor" || r.Header.Get("x-asiri-device") != "dev_remote" || r.Header.Get("x-asiri-signature") == "" {
+				t.Fatalf("workspace list missing signed trusted session: auth=%s device=%s", r.Header.Get("authorization"), r.Header.Get("x-asiri-device"))
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"activeOrgId": "org_prod",
+				"organizations": []map[string]any{
+					{"id": "org_prod", "name": "Production", "slug": "prod", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_remote", "canApproveDevice": true},
+					{"id": "org_staging", "name": "Staging", "slug": "staging", "role": "owner", "canPull": false, "canWrite": true, "currentDeviceTrusted": false, "canApproveDevice": true},
+					{"id": "org_shared", "name": "Shared", "slug": "shared", "role": "member", "canPull": false, "canWrite": false, "currentDeviceTrusted": false, "canApproveDevice": false},
+				},
+			})
+		case "/v1/secrets/visible":
+			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{{
+				"id":                     "sec_prod",
+				"orgId":                  "org_prod",
+				"workspaceSlug":          "prod",
+				"scope":                  "prod/api",
+				"name":                   "TOKEN",
+				"version":                1,
+				"status":                 "active",
+				"canWrite":               true,
+				"wrappedToCurrentDevice": true,
+				"currentDeviceId":        "dev_remote",
+			}}})
+		case "/v1/recovery-recipient":
+			recoveryChecked = true
+			if r.URL.Query().Get("orgId") != "org_prod" {
+				t.Fatalf("setup doctor should only query active workspace recovery, got %s", r.URL.RawQuery)
+			}
+			http.Error(w, "not configured", http.StatusNotFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "trusted-cli"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkControlPlaneForDevice(server.URL, "org_prod", "prod", "usr_owner", "dev_remote", device.ID, "at_cached", "rt_cached", 3600, time.Now().UTC().Add(7*24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"setup", "doctor"}); code != 0 {
+		t.Fatalf("setup doctor failed: %s", errb.String())
+	}
+	if !recoveryChecked {
+		t.Fatal("setup doctor should check active workspace recovery")
+	}
+	got := out.String()
+	for _, expected := range []string{
+		"prod", "ready", "not-configured", "asiri recovery setup --workspace prod --output-file <path>",
+		"staging", "not trusted", "asiri device trust --workspace staging",
+		"shared", "ask owner to approve this device",
+	} {
+		if !strings.Contains(got, expected) {
+			t.Fatalf("setup doctor output missing %q: %s", expected, got)
+		}
+	}
+}
+
+func TestSetupDoctorReportsMissingWorkspaceFilter(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/auth/session/refresh":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_prod",
+				"workspaceSlug":    "prod",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_remote",
+				"accessToken":      "at_doctor",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/orgs":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"activeOrgId": "org_prod",
+				"organizations": []map[string]any{{
+					"id": "org_prod", "name": "Production", "slug": "prod", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_remote", "canApproveDevice": true,
+				}},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "trusted-cli"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkControlPlaneForDevice(server.URL, "org_prod", "prod", "usr_owner", "dev_remote", device.ID, "at_cached", "rt_cached", 3600, time.Now().UTC().Add(7*24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"setup", "doctor", "--workspace", "prod", "--workspace", "prdo"}); code == 0 {
+		t.Fatal("setup doctor should fail when any requested workspace is not visible")
+	}
+	if !strings.Contains(errb.String(), "workspace prdo is not visible") {
+		t.Fatalf("setup doctor should report the missing workspace filter: %s", errb.String())
+	}
+}
+
+func TestSetupDoctorDoesNotMarkUnknownChecksReady(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/auth/session/refresh":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_prod",
+				"workspaceSlug":    "prod",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_remote",
+				"accessToken":      "at_doctor",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/orgs":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"activeOrgId": "org_prod",
+				"organizations": []map[string]any{
+					{"id": "org_prod", "name": "Production", "slug": "prod", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_remote", "canApproveDevice": true},
+					{"id": "org_stage", "name": "Staging", "slug": "stage", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_stage", "canApproveDevice": true},
+				},
+			})
+		case "/v1/secrets/visible":
+			http.Error(w, "temporary outage", http.StatusServiceUnavailable)
+		case "/v1/recovery-recipient":
+			http.Error(w, "not configured", http.StatusNotFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "trusted-cli"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkControlPlaneForDevice(server.URL, "org_prod", "prod", "usr_owner", "dev_remote", device.ID, "at_cached", "rt_cached", 3600, time.Now().UTC().Add(7*24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"setup", "doctor"}); code != 0 {
+		t.Fatalf("setup doctor failed: %s", errb.String())
+	}
+	got := out.String()
+	for _, expected := range []string{
+		"prod", "unknown", "asiri setup doctor --workspace prod",
+		"stage", "unknown", "asiri setup doctor --workspace stage",
+	} {
+		if !strings.Contains(got, expected) {
+			t.Fatalf("setup doctor output missing %q: %s", expected, got)
+		}
+	}
+	if strings.Contains(got, "Setup looks ready") {
+		t.Fatalf("setup doctor should not report ready when checks are unknown: %s", got)
+	}
+}
+
 func TestHumanLoginRefusesActiveWorkloadSession(t *testing.T) {
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")

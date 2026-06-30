@@ -40,7 +40,7 @@ type App struct {
 	In  io.Reader
 }
 
-var Version = "0.1.12"
+var Version = "0.1.13"
 
 var defaultControlPlaneOrigin = "http://127.0.0.1:4173"
 
@@ -75,6 +75,8 @@ func (a App) Run(args []string) int {
 	switch cmd {
 	case "init":
 		return a.initLocal(st, args)
+	case "setup":
+		return a.setup(st, args)
 	case "login":
 		return a.login(st, args)
 	case "logout":
@@ -142,6 +144,7 @@ Usage:
 
 Commands:
   init        Create a local encrypted vault and trusted local device.
+  setup       Diagnose local, device, workspace, and recovery setup.
   login       Link this device to the hosted control plane.
   logout      Remove the hosted control-plane session from this device.
   workspace   List visible control-plane workspaces.
@@ -223,6 +226,10 @@ func (a App) helpFor(path []string) int {
 	switch topic {
 	case "init":
 		fmt.Fprint(a.Out, "Usage: asiri init [--device <device>]\n\nCreates a local encrypted vault and a trusted local device. Local vaults do not have workspace slugs.\n")
+	case "setup":
+		fmt.Fprint(a.Out, "Usage: asiri setup <command>\n\nCommands:\n  doctor  Diagnose setup readiness and print next safe steps.\n")
+	case "setup doctor":
+		fmt.Fprint(a.Out, "Usage: asiri setup doctor [--workspace <slug>...]\n\nChecks local initialization, control-plane auth, current-device trust, key coverage, and recovery status. It does not create devices, change trust, rewrap keys, or write secrets.\n")
 	case "version":
 		fmt.Fprint(a.Out, "Usage: asiri version\n       asiri --version\n\nPrints the CLI version.\n")
 	case "login":
@@ -236,7 +243,11 @@ func (a App) helpFor(path []string) int {
 	case "workspace list":
 		fmt.Fprint(a.Out, "Usage: asiri workspace list\n\nShows visible workspaces as a table. This device controls pull and workspace-scoped push. Account write means the user owns the workspace or has effective secret-write capability.\n")
 	case "workload":
-		fmt.Fprint(a.Out, "Usage: asiri workload <command>\n\nCommands:\n  login   Exchange a platform OIDC token for a short-lived workload session.\n")
+		fmt.Fprint(a.Out, "Usage: asiri workload <command>\n\nCommands:\n  create  Create a workload identity from a trusted device session.\n  trust   Add an OIDC trust rule to a workload from a trusted device session.\n  login   Exchange a platform OIDC token for a short-lived workload session.\n")
+	case "workload create":
+		fmt.Fprint(a.Out, "Usage: asiri workload create --workspace <slug> --slug <slug> --name <name>\n\nCreates a control-plane workload identity from a trusted device session using the linked control-plane origin.\n")
+	case "workload trust":
+		fmt.Fprint(a.Out, "Usage: asiri workload trust --workspace <slug> --workload <slug-or-id> --provider github|generic --issuer <url> --audience <aud> [--jwks-url <url>] [--subject <sub>] [--claim key=value] [--expires-at <iso>]\n\nAdds an OIDC trust rule to a workload. Generic trusts require --jwks-url. GitHub trusts default to GitHub's Actions JWKS when --jwks-url is omitted.\n")
 	case "workload login":
 		fmt.Fprintf(a.Out, "Usage: asiri workload login --provider github|generic [--token <jwt>|--token-file <path>] [--audience <aud>] [--origin <url>]\n\nLinks this local device to the control plane as a workload. Default origin: %s.\n", defaultControlPlaneOrigin)
 	case "push":
@@ -448,11 +459,163 @@ func (a App) workload(st *store.FileStore, args []string) int {
 		return a.fail(errors.New("workload subcommand required"))
 	}
 	switch args[0] {
+	case "create":
+		return a.workloadCreate(st, args[1:])
+	case "trust":
+		return a.workloadTrust(st, args[1:])
 	case "login":
 		return a.workloadLogin(st, args[1:])
 	default:
 		return a.fail(fmt.Errorf("unknown workload command %q", args[0]))
 	}
+}
+
+type workloadCreateOptions struct {
+	Workspace string
+	Slug      string
+	Name      string
+}
+
+func parseWorkloadCreateArgs(args []string) (workloadCreateOptions, error) {
+	var options workloadCreateOptions
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--workspace", "-w":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--workspace requires a slug")
+			}
+			slug, err := localWorkspaceSlug(args[i+1])
+			if err != nil {
+				return options, err
+			}
+			options.Workspace = slug
+			i++
+		case "--slug":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--slug requires a value")
+			}
+			options.Slug = args[i+1]
+			i++
+		case "--name":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--name requires a value")
+			}
+			options.Name = args[i+1]
+			i++
+		default:
+			return options, fmt.Errorf("unknown workload create argument %q", args[i])
+		}
+	}
+	if options.Workspace == "" {
+		return options, errors.New("workload create requires --workspace")
+	}
+	if options.Slug == "" {
+		return options, errors.New("workload create requires --slug")
+	}
+	if options.Name == "" {
+		return options, errors.New("workload create requires --name")
+	}
+	return options, nil
+}
+
+type workloadTrustOptions struct {
+	Workspace string
+	Workload  string
+	Provider  string
+	Issuer    string
+	Audience  string
+	JwksURL   string
+	Subject   string
+	Claims    map[string]string
+	ExpiresAt string
+}
+
+func parseWorkloadTrustArgs(args []string) (workloadTrustOptions, error) {
+	options := workloadTrustOptions{Claims: map[string]string{}}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--workspace", "-w":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--workspace requires a slug")
+			}
+			slug, err := localWorkspaceSlug(args[i+1])
+			if err != nil {
+				return options, err
+			}
+			options.Workspace = slug
+			i++
+		case "--workload":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--workload requires a slug or id")
+			}
+			options.Workload = args[i+1]
+			i++
+		case "--provider":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--provider requires github or generic")
+			}
+			options.Provider = args[i+1]
+			i++
+		case "--issuer":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--issuer requires a URL")
+			}
+			options.Issuer = args[i+1]
+			i++
+		case "--audience":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--audience requires a value")
+			}
+			options.Audience = args[i+1]
+			i++
+		case "--jwks-url":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--jwks-url requires a URL")
+			}
+			options.JwksURL = args[i+1]
+			i++
+		case "--subject":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--subject requires a value")
+			}
+			options.Subject = args[i+1]
+			i++
+		case "--claim":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--claim requires key=value")
+			}
+			key, value, ok := strings.Cut(args[i+1], "=")
+			if !ok || strings.TrimSpace(key) == "" || value == "" {
+				return options, errors.New("--claim requires key=value")
+			}
+			options.Claims[key] = value
+			i++
+		case "--expires-at":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--expires-at requires an ISO timestamp")
+			}
+			options.ExpiresAt = args[i+1]
+			i++
+		default:
+			return options, fmt.Errorf("unknown workload trust argument %q", args[i])
+		}
+	}
+	if options.Workspace == "" {
+		return options, errors.New("workload trust requires --workspace")
+	}
+	if options.Workload == "" {
+		return options, errors.New("workload trust requires --workload")
+	}
+	if options.Provider != "github" && options.Provider != "generic" {
+		return options, errors.New("--provider must be github or generic")
+	}
+	if options.Issuer == "" {
+		return options, errors.New("workload trust requires --issuer")
+	}
+	if options.Audience == "" {
+		return options, errors.New("workload trust requires --audience")
+	}
+	return options, nil
 }
 
 type workloadLoginOptions struct {
@@ -508,6 +671,74 @@ func parseWorkloadLoginArgs(args []string) (workloadLoginOptions, error) {
 		return options, errors.New("use either --token or --token-file, not both")
 	}
 	return options, nil
+}
+
+func (a App) workloadCreate(st *store.FileStore, args []string) int {
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	if st.State.ControlPlane == nil {
+		return a.fail(errors.New("asiri is not linked to a control plane"))
+	}
+	if err := rejectWorkloadControlPlaneMutation(st); err != nil {
+		return a.fail(err)
+	}
+	options, err := parseWorkloadCreateArgs(args)
+	if err != nil {
+		return a.fail(err)
+	}
+	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	if err != nil {
+		return a.fail(err)
+	}
+	target, accessToken, err := a.remoteWorkspaceTarget(st, accessToken, options.Workspace)
+	if err != nil {
+		return a.fail(err)
+	}
+	workload, err := createRemoteWorkload(st, st.State.ControlPlane.Origin, accessToken, target.ID, options.Slug, options.Name)
+	if err != nil {
+		return a.fail(err)
+	}
+	fmt.Fprintf(a.Out, "✓ Created workload %s in workspace %s (%s)\n", workload.Slug, target.Slug, workload.ID)
+	return 0
+}
+
+func (a App) workloadTrust(st *store.FileStore, args []string) int {
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	if st.State.ControlPlane == nil {
+		return a.fail(errors.New("asiri is not linked to a control plane"))
+	}
+	if err := rejectWorkloadControlPlaneMutation(st); err != nil {
+		return a.fail(err)
+	}
+	options, err := parseWorkloadTrustArgs(args)
+	if err != nil {
+		return a.fail(err)
+	}
+	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	if err != nil {
+		return a.fail(err)
+	}
+	target, accessToken, err := a.remoteWorkspaceTarget(st, accessToken, options.Workspace)
+	if err != nil {
+		return a.fail(err)
+	}
+	workloads, err := listRemoteWorkloads(st, st.State.ControlPlane.Origin, target.ID, accessToken)
+	if err != nil {
+		return a.fail(err)
+	}
+	workload, ok := findRemoteWorkload(workloads, options.Workload)
+	if !ok {
+		return a.fail(fmt.Errorf("workload %s is not visible in workspace %s", options.Workload, target.Slug))
+	}
+	trust, err := createRemoteOidcTrust(st, st.State.ControlPlane.Origin, accessToken, workload.ID, options)
+	if err != nil {
+		return a.fail(err)
+	}
+	fmt.Fprintf(a.Out, "✓ Added %s OIDC trust for workload %s (audience %s, rule %s)\n", trust.Provider, workload.Slug, trust.Audience, trust.ID)
+	return 0
 }
 
 func (a App) workloadLogin(st *store.FileStore, args []string) int {
@@ -677,6 +908,250 @@ func (a App) workspace(st *store.FileStore, args []string) int {
 	default:
 		return a.fail(fmt.Errorf("unknown workspace command %q", args[0]))
 	}
+}
+
+func (a App) setup(st *store.FileStore, args []string) int {
+	if len(args) == 0 {
+		return a.fail(errors.New("setup subcommand required"))
+	}
+	switch args[0] {
+	case "doctor":
+		return a.setupDoctor(st, args[1:])
+	default:
+		return a.fail(fmt.Errorf("unknown setup command %q", args[0]))
+	}
+}
+
+type setupDoctorCheck struct {
+	Name   string
+	Status string
+	Detail string
+	Next   string
+}
+
+type setupDoctorWorkspace struct {
+	Workspace string
+	Role      string
+	Device    string
+	Keys      string
+	Recovery  string
+	Next      string
+}
+
+func (a App) setupDoctor(st *store.FileStore, args []string) int {
+	workspaceFilters, remaining, err := splitWorkspaceFilters(args, "setup doctor")
+	if err != nil {
+		return a.fail(err)
+	}
+	if err := rejectUnknownArgs(remaining); err != nil {
+		return a.fail(err)
+	}
+	if _, err := localWorkspaceFilterSet(workspaceFilters, "setup doctor"); err != nil {
+		return a.fail(err)
+	}
+
+	fmt.Fprint(a.Out, "Asiri setup doctor\n\n")
+	nextSteps := []string{}
+	seenSteps := map[string]bool{}
+	addStep := func(step string) {
+		step = strings.TrimSpace(step)
+		if step == "" || step == "-" || seenSteps[step] {
+			return
+		}
+		seenSteps[step] = true
+		nextSteps = append(nextSteps, step)
+	}
+	printChecks := func(rows []setupDoctorCheck) {
+		tw := tabwriter.NewWriter(a.Out, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "CHECK\tSTATUS\tDETAIL\tNEXT")
+		for _, row := range rows {
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", row.Name, row.Status, printable(row.Detail), printable(row.Next))
+			addStep(row.Next)
+		}
+		_ = tw.Flush()
+	}
+	printNextSteps := func() {
+		if len(nextSteps) == 0 {
+			fmt.Fprintln(a.Out, "\nNext steps:\n- Setup looks ready for visible trusted workspaces.")
+			return
+		}
+		fmt.Fprintln(a.Out, "\nNext steps:")
+		for _, step := range nextSteps {
+			fmt.Fprintf(a.Out, "- %s\n", step)
+		}
+	}
+
+	checks := []setupDoctorCheck{}
+	if err := st.RequireInitialized(); err != nil {
+		printChecks([]setupDoctorCheck{
+			{Name: "local vault", Status: "missing", Detail: err.Error(), Next: "asiri init --device <name>"},
+			{Name: "control plane", Status: "skipped", Detail: "local vault is required first", Next: "asiri login"},
+		})
+		printNextSteps()
+		return 0
+	}
+	device, deviceErr := st.ActiveDevice()
+	if deviceErr != nil {
+		checks = append(checks, setupDoctorCheck{Name: "local device", Status: "missing", Detail: deviceErr.Error(), Next: "asiri device enroll --name <name>"})
+		printChecks(checks)
+		printNextSteps()
+		return 0
+	}
+	checks = append(checks, setupDoctorCheck{Name: "local vault", Status: "ok", Detail: "initialized", Next: "-"})
+	checks = append(checks, setupDoctorCheck{Name: "local device", Status: "ok", Detail: device.Name, Next: "-"})
+
+	if st.State.ControlPlane == nil {
+		checks = append(checks, setupDoctorCheck{Name: "control plane", Status: "missing", Detail: "not linked", Next: "asiri login"})
+		printChecks(checks)
+		printNextSteps()
+		return 0
+	}
+	checks = append(checks, setupDoctorCheck{Name: "control plane", Status: "linked", Detail: st.State.ControlPlane.Origin, Next: "-"})
+	if st.State.ControlPlane.Source == "oidc" {
+		checks = append(checks, setupDoctorCheck{Name: "session", Status: "workload", Detail: "read-only workload session", Next: "asiri logout && asiri login"})
+		printChecks(checks)
+		printNextSteps()
+		return 0
+	}
+
+	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	if err != nil {
+		checks = append(checks, setupDoctorCheck{Name: "session", Status: "failed", Detail: err.Error(), Next: "asiri login --force"})
+		printChecks(checks)
+		printNextSteps()
+		return 0
+	}
+	checks = append(checks, setupDoctorCheck{Name: "session", Status: "ok", Detail: st.State.ControlPlane.WorkspaceSlug, Next: "-"})
+	printChecks(checks)
+
+	workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken)
+	if err != nil {
+		fmt.Fprintf(a.Out, "\nWorkspace checks unavailable: %s\n", err)
+		addStep("asiri login --force")
+		printNextSteps()
+		return 0
+	}
+	filterSet := map[string]bool{}
+	for _, slug := range workspaceFilters {
+		filterSet[slug] = true
+	}
+	targets := make([]remoteWorkspaceResponse, 0, len(workspaces))
+	foundFilters := map[string]bool{}
+	for _, workspace := range workspaces {
+		if len(filterSet) > 0 && !filterSet[workspace.Slug] {
+			continue
+		}
+		targets = append(targets, workspace)
+		if len(filterSet) > 0 {
+			foundFilters[workspace.Slug] = true
+		}
+	}
+	if len(filterSet) > 0 {
+		missing := make([]string, 0)
+		for slug := range filterSet {
+			if !foundFilters[slug] {
+				missing = append(missing, slug)
+			}
+		}
+		if len(missing) > 0 {
+			sort.Strings(missing)
+			return a.fail(fmt.Errorf("workspace %s is not visible", strings.Join(missing, ", ")))
+		}
+	}
+
+	var remoteSecrets []visibleRemoteSecretRecord
+	secretsKnown := false
+	if secrets, err := listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken); err == nil {
+		remoteSecrets = secrets
+		secretsKnown = true
+	} else {
+		fmt.Fprintf(a.Err, "asiri: remote key coverage unavailable: %s\n", err)
+	}
+	keySummaries := workspaceKeySummaries(st, targets, remoteSecrets, st.State.ControlPlane.WorkspaceID, secretsKnown)
+	rows := make([]setupDoctorWorkspace, 0, len(targets))
+	for _, workspace := range targets {
+		keySummary := keySummaries[workspace.Slug]
+		recoveryStatus := a.setupDoctorRecoveryStatus(st, accessToken, workspace)
+		next := setupDoctorWorkspaceNext(st, workspace, st.State.ControlPlane.WorkspaceID, keySummary.Keys, recoveryStatus)
+		rows = append(rows, setupDoctorWorkspace{
+			Workspace: workspace.Slug,
+			Role:      workspaceRoleLabel(workspace, st.State.UserID),
+			Device:    deviceTrustLabelForWorkspace(workspace, st.State.ControlPlane.WorkspaceID),
+			Keys:      keySummary.Keys,
+			Recovery:  recoveryStatus,
+			Next:      next,
+		})
+		addStep(next)
+	}
+
+	fmt.Fprintln(a.Out, "\nWorkspaces:")
+	tw := tabwriter.NewWriter(a.Out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "WORKSPACE\tROLE\tTHIS DEVICE\tKEYS\tRECOVERY\tNEXT")
+	for _, row := range rows {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", row.Workspace, row.Role, row.Device, row.Keys, row.Recovery, row.Next)
+	}
+	if err := tw.Flush(); err != nil {
+		return a.fail(err)
+	}
+	printNextSteps()
+	return 0
+}
+
+func (a App) setupDoctorRecoveryStatus(st *store.FileStore, accessToken string, workspace remoteWorkspaceResponse) string {
+	if !workspaceDeviceTrusted(workspace, st.State.ControlPlane.WorkspaceID) {
+		return "skipped"
+	}
+	if st.State.Recoveries != nil {
+		if recovery, ok := st.State.Recoveries[workspace.ID]; ok && recovery.RecipientID != "" {
+			return "configured"
+		}
+	}
+	if workspace.ID != st.State.ControlPlane.WorkspaceID {
+		return "unknown"
+	}
+	recovery, err := getActiveRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, workspace.ID, accessToken)
+	if err != nil {
+		return "failed"
+	}
+	if recovery == nil {
+		return "not-configured"
+	}
+	return "configured"
+}
+
+func setupDoctorWorkspaceNext(st *store.FileStore, workspace remoteWorkspaceResponse, activeWorkspaceID, keys, recovery string) string {
+	if st.State.ControlPlane != nil && st.State.ControlPlane.Source == "oidc" {
+		return "asiri logout && asiri login"
+	}
+	if !workspaceDeviceTrusted(workspace, activeWorkspaceID) {
+		if workspaceCanApproveDevice(workspace) {
+			return deviceTrustCommand(st, workspace.Slug)
+		}
+		return "ask owner to approve this device"
+	}
+	switch keys {
+	case "unknown":
+		return fmt.Sprintf("asiri setup doctor --workspace %s", workspace.Slug)
+	case "needs rewrap", "needs cleanup":
+		return workspaceNextAction(st, workspace, activeWorkspaceID, keys)
+	case "unwrapped":
+		if recovery == "configured" {
+			return fmt.Sprintf("asiri recovery restore --workspace %s --key-file <path>", workspace.Slug)
+		}
+		return fmt.Sprintf("use an existing trusted device: asiri rewrap --workspace %s", workspace.Slug)
+	}
+	switch recovery {
+	case "unknown":
+		return fmt.Sprintf("asiri recovery status --workspace %s", workspace.Slug)
+	case "not-configured":
+		if workspace.Role == "owner" {
+			return fmt.Sprintf("asiri recovery setup --workspace %s --output-file <path>", workspace.Slug)
+		}
+		return "ask owner to configure recovery"
+	case "failed":
+		return fmt.Sprintf("asiri recovery status --workspace %s", workspace.Slug)
+	}
+	return "-"
 }
 
 func (a App) push(st *store.FileStore, args []string) int {
@@ -3671,6 +4146,33 @@ type remoteWorkspacesResponse struct {
 	ActiveOrgID   string                    `json:"activeOrgId"`
 }
 
+type remoteWorkloadResponse struct {
+	ID              string `json:"id"`
+	OrgID           string `json:"orgId"`
+	Slug            string `json:"slug"`
+	Name            string `json:"name"`
+	Status          string `json:"status"`
+	CreatedByUserID string `json:"createdByUserId"`
+}
+
+type remoteWorkloadsResponse struct {
+	Workloads []remoteWorkloadResponse `json:"workloads"`
+}
+
+type remoteOidcTrustResponse struct {
+	ID         string            `json:"id"`
+	OrgID      string            `json:"orgId"`
+	WorkloadID string            `json:"workloadId"`
+	Provider   string            `json:"provider"`
+	Issuer     string            `json:"issuer"`
+	Audience   string            `json:"audience"`
+	JwksURL    string            `json:"jwksUrl"`
+	Subject    string            `json:"subject"`
+	Claims     map[string]string `json:"claims"`
+	Status     string            `json:"status"`
+	ExpiresAt  string            `json:"expiresAt"`
+}
+
 type writeOptionsResponse struct {
 	RequestedWorkspaceSlug string                 `json:"requestedWorkspaceSlug"`
 	SourceWorkspace        *writeWorkspaceOption  `json:"sourceWorkspace"`
@@ -3905,6 +4407,65 @@ func listRemoteWorkspaces(st *store.FileStore, origin, accessToken string) ([]re
 		return nil, err
 	}
 	return result.Organizations, nil
+}
+
+func createRemoteWorkload(st *store.FileStore, origin, accessToken, orgID, slug, name string) (remoteWorkloadResponse, error) {
+	var result remoteWorkloadResponse
+	body := map[string]string{"orgId": orgID, "slug": slug, "name": name}
+	if err := postJSONBearer(st, strings.TrimRight(origin, "/")+"/v1/workloads", accessToken, body, &result); err != nil {
+		return result, err
+	}
+	if result.ID == "" || result.Slug == "" {
+		return result, errors.New("control plane created workload without metadata")
+	}
+	return result, nil
+}
+
+func listRemoteWorkloads(st *store.FileStore, origin, orgID, accessToken string) ([]remoteWorkloadResponse, error) {
+	var result remoteWorkloadsResponse
+	endpoint := fmt.Sprintf("%s/v1/workloads?orgId=%s", strings.TrimRight(origin, "/"), url.QueryEscape(orgID))
+	if err := getJSONBearer(st, endpoint, accessToken, &result); err != nil {
+		return nil, err
+	}
+	return result.Workloads, nil
+}
+
+func findRemoteWorkload(workloads []remoteWorkloadResponse, value string) (remoteWorkloadResponse, bool) {
+	for _, workload := range workloads {
+		if workload.ID == value || workload.Slug == value {
+			return workload, true
+		}
+	}
+	return remoteWorkloadResponse{}, false
+}
+
+func createRemoteOidcTrust(st *store.FileStore, origin, accessToken, workloadID string, options workloadTrustOptions) (remoteOidcTrustResponse, error) {
+	body := map[string]any{
+		"provider": options.Provider,
+		"issuer":   options.Issuer,
+		"audience": options.Audience,
+	}
+	if options.JwksURL != "" {
+		body["jwksUrl"] = options.JwksURL
+	}
+	if options.Subject != "" {
+		body["subject"] = options.Subject
+	}
+	if len(options.Claims) > 0 {
+		body["claims"] = options.Claims
+	}
+	if options.ExpiresAt != "" {
+		body["expiresAt"] = options.ExpiresAt
+	}
+	var result remoteOidcTrustResponse
+	endpoint := fmt.Sprintf("%s/v1/workloads/%s/oidc-trusts", strings.TrimRight(origin, "/"), url.PathEscape(workloadID))
+	if err := postJSONBearer(st, endpoint, accessToken, body, &result); err != nil {
+		return result, err
+	}
+	if result.ID == "" || result.WorkloadID == "" {
+		return result, errors.New("control plane created OIDC trust without metadata")
+	}
+	return result, nil
 }
 
 func requireRemoteWorkspace(workspaces []remoteWorkspaceResponse, requested string) (remoteWorkspaceResponse, error) {
