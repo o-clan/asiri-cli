@@ -1,0 +1,4991 @@
+package cli
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/o-clan/asiri/cli/internal/asiri"
+	"github.com/o-clan/asiri/cli/internal/store"
+	"github.com/zalando/go-keyring"
+)
+
+func TestMain(m *testing.M) {
+	keyring.MockInit()
+	os.Exit(m.Run())
+}
+
+func testSecretFile(t *testing.T, value string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(path, []byte(value+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestDefaultControlPlaneOriginMatchesLocalDev(t *testing.T) {
+	if defaultControlPlaneOrigin != "http://127.0.0.1:4173" {
+		t.Fatalf("source default control-plane origin must match local dev, got %s", defaultControlPlaneOrigin)
+	}
+}
+
+func TestLoginOriginSelection(t *testing.T) {
+	old := os.Getenv("ASIRI_CONTROL_PLANE_ORIGIN")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_CONTROL_PLANE_ORIGIN", old) })
+	_ = os.Unsetenv("ASIRI_CONTROL_PLANE_ORIGIN")
+
+	st := &store.FileStore{State: asiri.State{ControlPlane: &asiri.ControlPlaneLink{Origin: "http://127.0.0.1:4173"}}}
+	if got := loginOrigin(nil, st); got != "http://127.0.0.1:4173" {
+		t.Fatalf("login should refresh the saved control-plane origin, got %s", got)
+	}
+	if got := loginOrigin([]string{"--force"}, st); got != defaultControlPlaneOrigin {
+		t.Fatalf("forced login should use the default origin instead of stale saved origin, got %s", got)
+	}
+	_ = os.Setenv("ASIRI_CONTROL_PLANE_ORIGIN", "http://127.0.0.1:8787/")
+	if got := loginOrigin([]string{"--force"}, st); got != "http://127.0.0.1:8787" {
+		t.Fatalf("forced login should honor environment origin, got %s", got)
+	}
+	if got := loginOrigin([]string{"--origin", "http://127.0.0.1:9999/"}, st); got != "http://127.0.0.1:9999" {
+		t.Fatalf("explicit origin should win, got %s", got)
+	}
+}
+
+func TestWorkloadControlPlaneSessionsRejectMutations(t *testing.T) {
+	workloadStore := &store.FileStore{State: asiri.State{ControlPlane: &asiri.ControlPlaneLink{Source: "oidc"}}}
+	if err := rejectWorkloadControlPlaneMutation(workloadStore); err == nil {
+		t.Fatal("workload sessions should reject control-plane mutations")
+	}
+	if err := rejectWorkloadLocalMutation(workloadStore); err == nil {
+		t.Fatal("workload sessions should reject local mutations")
+	}
+
+	humanStore := &store.FileStore{State: asiri.State{ControlPlane: &asiri.ControlPlaneLink{Source: "device-code"}}}
+	if err := rejectWorkloadControlPlaneMutation(humanStore); err != nil {
+		t.Fatalf("human sessions should allow control-plane mutations: %v", err)
+	}
+	if err := rejectWorkloadLocalMutation(humanStore); err != nil {
+		t.Fatalf("human sessions should allow local mutations: %v", err)
+	}
+}
+
+func TestHumanLoginRefusesActiveWorkloadSession(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "workload-host"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkWorkloadControlPlane("http://control.test", "org_prod", "prod", "usr_owner", "wli_prod", "prod-api", "wdev_prod", device.ID, "at_workload", 3600); err != nil {
+		t.Fatal(err)
+	}
+
+	remoteHit := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteHit = true
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"login", "--origin", server.URL}); code == 0 {
+		t.Fatal("human login should fail while a workload session is active")
+	}
+	if remoteHit {
+		t.Fatal("human login should not start remote refresh or device-code flow for workload sessions")
+	}
+	if !strings.Contains(errb.String(), "workload session active; run asiri logout first") {
+		t.Fatalf("unexpected error: %s", errb.String())
+	}
+}
+
+func TestWorkloadWipeCommandsAreRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{name: "local wipe", args: []string{"local", "wipe", "--yes"}},
+		{name: "cache wipe", args: []string{"cache", "wipe"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			old := os.Getenv("ASIRI_HOME")
+			t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+			if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+				t.Fatal(err)
+			}
+
+			var out bytes.Buffer
+			var errb bytes.Buffer
+			app := New(&out, &errb)
+			if code := app.Run([]string{"init", "--device", "workload-host"}); code != 0 {
+				t.Fatalf("init failed: %s", errb.String())
+			}
+			st, err := store.LoadDefault()
+			if err != nil {
+				t.Fatal(err)
+			}
+			device, err := st.ActiveDevice()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := st.LinkWorkloadControlPlane("http://control.test", "org_prod", "prod", "usr_owner", "wli_prod", "prod-api", "wdev_prod", device.ID, "at_workload", 3600); err != nil {
+				t.Fatal(err)
+			}
+
+			out.Reset()
+			errb.Reset()
+			if code := app.Run(tc.args); code == 0 {
+				t.Fatalf("%v should fail for workload sessions", tc.args)
+			}
+			if !strings.Contains(errb.String(), "OIDC workload sessions cannot mutate local vault or policy state") {
+				t.Fatalf("unexpected error: %s", errb.String())
+			}
+			if _, err := os.Stat(filepath.Join(tmp, "local-state.json")); err != nil {
+				t.Fatalf("state file should remain after rejected wipe: %v", err)
+			}
+		})
+	}
+}
+
+func TestWorkloadPullTargetsStayOnBoundWorkspace(t *testing.T) {
+	active := &asiri.ControlPlaneLink{Source: "oidc", WorkspaceID: "org_prod", WorkspaceSlug: "prod"}
+	workspaces := []remoteWorkspaceResponse{
+		{ID: "org_prod", Slug: "prod", CurrentDeviceTrusted: boolPtr(true), CanPull: boolPtr(true)},
+		{ID: "org_staging", Slug: "staging", CurrentDeviceTrusted: boolPtr(true), CanPull: boolPtr(true)},
+	}
+
+	targets, results := pullTargets(active, workspaces, pullOptions{})
+	if len(results) != 0 || len(targets) != 1 || targets[0].Workspace.Slug != "prod" {
+		t.Fatalf("default workload pull should target only active workspace, targets=%#v results=%#v", targets, results)
+	}
+
+	targets, results = pullTargets(active, workspaces, pullOptions{Workspaces: []string{"staging", "prod"}})
+	if len(targets) != 1 || targets[0].Workspace.Slug != "prod" || len(results) != 1 || results[0].Result != "failed" {
+		t.Fatalf("explicit workload pull should fail non-active workspace and keep active target, targets=%#v results=%#v", targets, results)
+	}
+}
+
+func TestWorkloadRuntimeUsesSyncedServicePolicies(t *testing.T) {
+	expiredAt := time.Now().UTC().Add(-time.Minute)
+	validUntil := time.Now().UTC().Add(time.Hour)
+	st := &store.FileStore{State: asiri.State{
+		ControlPlane: &asiri.ControlPlaneLink{Source: "oidc", WorkloadSlug: "prod-api"},
+		Policies: []asiri.Policy{{
+			ID:            "pol_stale",
+			Subject:       "prod-api",
+			ScopePattern:  "prod/*",
+			SecretPattern: "*",
+			Actions:       []string{"read"},
+			ApprovalMode:  "none",
+			CreatedAt:     time.Now().UTC(),
+		}},
+	}}
+	importWorkloadSyncPolicies(st, []syncPolicyResponse{{
+		ID:            "pol_expired_read",
+		SubjectType:   "service",
+		SubjectID:     "prod-api",
+		ScopePattern:  "prod/api",
+		SecretPattern: "DATABASE_URL",
+		Actions:       []string{"read"},
+		ApprovalMode:  "none",
+		CreatedAt:     time.Now().UTC(),
+		ExpiresAt:     &expiredAt,
+	}, {
+		ID:            "pol_inject",
+		SubjectType:   "service",
+		SubjectID:     "prod-api",
+		ScopePattern:  "prod/api",
+		SecretPattern: "DATABASE_URL",
+		Actions:       []string{"inject"},
+		ApprovalMode:  "none",
+		CreatedAt:     time.Now().UTC(),
+		ExpiresAt:     &validUntil,
+	}})
+
+	subject, labelType, err := workloadRuntimeSubject(st, "other-agent", "process-name", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if subject != "prod-api" || labelType != "service" {
+		t.Fatalf("workload runtime subject mismatch: subject=%s type=%s", subject, labelType)
+	}
+	if allowed, _ := st.CheckPolicy(subject, "prod/api/DATABASE_URL", "read"); allowed {
+		t.Fatal("synced inject-only workload policy should not allow raw read")
+	}
+	if allowed, reason := st.CheckPolicy(subject, "prod/api/DATABASE_URL", "inject"); !allowed {
+		t.Fatalf("synced workload policy should allow inject: %s", reason)
+	}
+	if st.State.Policies[1].ExpiresAt == nil || !st.State.Policies[1].ExpiresAt.Equal(validUntil) {
+		t.Fatalf("synced workload policy should preserve expiry: %#v", st.State.Policies[1].ExpiresAt)
+	}
+}
+
+func TestDeviceNamePrintsActiveLocalDevice(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"device", "name"}); code != 0 {
+		t.Fatalf("device name failed: %s", errb.String())
+	}
+	if strings.TrimSpace(out.String()) != "qa-laptop" {
+		t.Fatalf("unexpected device name output: %q", out.String())
+	}
+}
+
+func TestWhoamiShowsControlPlaneUserDetails(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	refreshSeen := false
+	whoamiSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/session/refresh":
+			refreshSeen = true
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["refreshToken"] != "rt_cached" {
+				t.Fatalf("unexpected refresh body: %#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_remote",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_remote",
+				"accessToken":      "at_whoami",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/whoami":
+			whoamiSeen = true
+			if r.Header.Get("authorization") != "Bearer at_whoami" || r.Header.Get("x-asiri-device") != "dev_remote" || r.Header.Get("x-asiri-signature") == "" {
+				t.Fatalf("whoami request missing signed refreshed session: auth=%s device=%s", r.Header.Get("authorization"), r.Header.Get("x-asiri-device"))
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"user": map[string]any{
+					"id":          "usr_owner",
+					"email":       "peter@example.com",
+					"displayName": "Peter Owner",
+					"role":        "user",
+					"status":      "active",
+				},
+				"workspace": map[string]any{
+					"id":   "org_remote",
+					"name": "O Clan",
+					"slug": "oclan-co",
+				},
+				"device": map[string]any{
+					"id":     "dev_remote",
+					"name":   "qa-laptop",
+					"kind":   "laptop",
+					"status": "trusted",
+				},
+				"session": map[string]any{
+					"workspaceId": "org_remote",
+					"deviceId":    "dev_remote",
+					"status":      "active",
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkControlPlaneForDevice(server.URL, "org_remote", "oclan-co", "usr_owner", "dev_remote", device.ID, "at_cached", "rt_cached", 3600, time.Now().UTC().Add(7*24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"whoami"}); code != 0 {
+		t.Fatalf("whoami failed: %s", errb.String())
+	}
+	if !refreshSeen || !whoamiSeen {
+		t.Fatalf("expected refresh and whoami endpoints, refresh=%v whoami=%v", refreshSeen, whoamiSeen)
+	}
+	got := out.String()
+	for _, expected := range []string{"peter@example.com", "Peter Owner", "oclan-co", "LOCAL DEVICE", "qa-laptop", "REMOTE DEVICE", "dev_remote"} {
+		if !strings.Contains(got, expected) {
+			t.Fatalf("whoami output missing %q: %s", expected, got)
+		}
+	}
+}
+
+func TestDeviceCodeApprovalOriginMustMatchControlPlaneOrigin(t *testing.T) {
+	device := asiri.Device{
+		Name:                "qa-laptop",
+		Kind:                "laptop",
+		EncryptionPublicKey: "enc",
+		SigningPublicKey:    "sig",
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/auth/device-code/start" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"deviceCode":              "dc_test",
+			"userCode":                "ABCD-2345",
+			"verificationUri":         "https://asiri.dev/dashboard/",
+			"verificationUriComplete": "https://asiri.dev/dashboard/?code=ABCD-2345",
+			"expiresIn":               30,
+			"interval":                2,
+		})
+	}))
+	defer server.Close()
+
+	_, err := startDeviceCodeLogin(server.URL, "local", device)
+	if err == nil || !strings.Contains(err.Error(), "does not match control-plane origin") {
+		t.Fatalf("expected mismatched approval origin error, got %v", err)
+	}
+}
+
+func TestDeviceCodeApprovalAllowsLocalWorkerAndDashboardPorts(t *testing.T) {
+	for _, testcase := range []struct {
+		controlPlane string
+		approval     string
+	}{
+		{
+			controlPlane: "http://127.0.0.1:8787",
+			approval:     "http://127.0.0.1:4173/dashboard/?code=ABCD-2345",
+		},
+		{
+			controlPlane: "http://localhost:8787",
+			approval:     "http://127.0.0.1:4173/dashboard/?code=ABCD-2345",
+		},
+	} {
+		if err := validateDeviceCodeApprovalOrigin(testcase.controlPlane, testcase.approval); err != nil {
+			t.Fatalf("expected local approval origin to be accepted for %#v: %v", testcase, err)
+		}
+	}
+}
+
+func TestRemoteSelfRevokeClearsLocalRuntime(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_self",
+				"userCode":                "SELF-1234",
+				"verificationUri":         serverURL(r) + "/auth/device",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=SELF-1234",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_remote",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_remote",
+				"accessToken":      "at_self",
+				"refreshToken":     "rt_self",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/devices/dev_remote/revoke":
+			if r.Header.Get("authorization") != "Bearer at_self" {
+				t.Fatalf("unexpected remote revoke auth header: %s", r.Header.Get("authorization"))
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "dev_remote", "name": "qa-laptop", "status": "revoked"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "blocked_after_revoke")},
+		{"login", "--origin", server.URL},
+		{"device", "revoke", "--workspace", "oclan-co", "dev_remote", "--remote"},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed: %s", step, errb.String())
+		}
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State.ControlPlane != nil {
+		t.Fatalf("remote self-revoke should clear control-plane link: %#v", st.State.ControlPlane)
+	}
+	if len(st.State.KeyRefs) != 0 {
+		t.Fatalf("remote self-revoke should clear local key refs: %#v", st.State.KeyRefs)
+	}
+	if _, _, err := st.GetSecret("oclan-co/local/asiri/API_KEY"); err == nil {
+		t.Fatal("remote self-revoke should block local decryption")
+	}
+}
+
+func TestRemoteRevokeConflictKeepsLocalRuntime(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	revokeSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/devices/dev_remote/revoke":
+			revokeSeen = true
+			if r.Header.Get("authorization") != "Bearer at_test" {
+				t.Fatalf("unexpected remote revoke auth header: %s", r.Header.Get("authorization"))
+			}
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":               "request_failed",
+				"message":             "device revocation would leave 1 active secret version(s) without any trusted device or recovery key; configure recovery or rewrap another trusted device first",
+				"affectedSecretCount": 1,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkControlPlaneForDevice(server.URL, "org_remote", "oclan-co", "usr_owner", "dev_remote", device.ID, "at_test", "rt_test", 3600, time.Now().UTC().Add(7*24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"device", "revoke", "--workspace", "oclan-co", "dev_remote", "--remote"}); code == 0 {
+		t.Fatalf("remote revoke should fail")
+	}
+	if !revokeSeen {
+		t.Fatalf("expected remote revoke endpoint to be called")
+	}
+	if !strings.Contains(errb.String(), "without any trusted device or recovery key") {
+		t.Fatalf("remote revoke conflict should include server guidance: %s", errb.String())
+	}
+	reloaded, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.State.ControlPlane == nil {
+		t.Fatalf("failed remote revoke should keep control-plane link")
+	}
+	if len(reloaded.State.KeyRefs) == 0 {
+		t.Fatalf("failed remote revoke should keep local key refs")
+	}
+}
+
+func TestCLIEndToEndLocalRuntime(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	steps := [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "qa", "openai/api_key", "--value-file", testSecretFile(t, "qa_secret_value")},
+		{"grant", "--workspace", "qa", "codex", "openai/api_key", "--inject-only"},
+		{"run", "--workspace", "qa", "--agent", "codex", "--env", "OPENAI_API_KEY=openai/api_key", "--", "sh", "-c", "test \"$OPENAI_API_KEY\" = qa_secret_value"},
+		{"broker", "start", "--once"},
+	}
+	for _, step := range steps {
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	if strings.Contains(out.String(), "qa_secret_value") {
+		t.Fatalf("asiri output leaked secret: %s", out.String())
+	}
+	if code := app.Run([]string{"get", "--workspace", "qa", "openai/api_key", "--agent", "codex"}); code == 0 {
+		t.Fatalf("agent raw read should be denied without explicit --read grant")
+	}
+	if !strings.Contains(errb.String(), "raw read requires") {
+		t.Fatalf("expected raw read denial, got stderr=%s", errb.String())
+	}
+}
+
+func TestAuditTailWorkspaceFilterMatchesWorkspaceMetadata(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Audit("local-human", "control_plane_push", "allowed", "", "", "qa push", map[string]string{"workspace": "qa"})
+	st.Audit("local-human", "control_plane_rewrap", "allowed", "", "", "qa rewrap", map[string]string{"workspaceSlug": "qa"})
+	st.Audit("local-human", "control_plane_push", "allowed", "", "", "prod push", map[string]string{"workspace": "prod"})
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"audit", "tail", "--workspace", "qa", "--limit", "10"}); code != 0 {
+		t.Fatalf("audit tail failed: %s", errb.String())
+	}
+	audit := out.String()
+	if !strings.Contains(audit, "qa push") || !strings.Contains(audit, "qa rewrap") {
+		t.Fatalf("workspace audit filter missed matching events: %s", audit)
+	}
+	if strings.Contains(audit, "prod push") {
+		t.Fatalf("workspace audit filter included another workspace: %s", audit)
+	}
+}
+
+func TestShortPathRejectsKnownDifferentWorkspacePrefix(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.BindWorkspacePrefix("other", "org_other", "other"); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"add", "--workspace", "qa", "other/openai/api_key", "--value-file", testSecretFile(t, "secret_value")}); code == 0 {
+		t.Fatal("known different workspace prefix should be rejected")
+	}
+	if !strings.Contains(errb.String(), "add accepts short paths") {
+		t.Fatalf("expected short-path guidance, got %s", errb.String())
+	}
+}
+
+func TestInitRejectsWorkspaceSlug(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--workspace", "oclan-co", "--device", "qa-laptop"}); code == 0 {
+		t.Fatal("init should reject workspace slugs")
+	}
+	if !strings.Contains(errb.String(), "local vaults do not have workspace slugs") {
+		t.Fatalf("expected workspace rejection, got stderr=%s", errb.String())
+	}
+}
+
+func TestLoginUsesDeviceCodeFlow(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	startSeen := false
+	tokenSeen := false
+	refreshSeen := false
+	remoteRevokeSeen := false
+	logoutSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			startSeen = true
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["localWorkspaceSlug"] != "" || body["workspaceSlug"] != "" || body["deviceName"] != "qa-laptop" || body["encryptionPublicKey"] == "" || body["signingPublicKey"] == "" {
+				t.Fatalf("unexpected start body: %#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_test",
+				"userCode":                "ABCD-2345",
+				"verificationUri":         serverURL(r) + "/auth/device",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=ABCD-2345",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			tokenSeen = true
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["deviceCode"] != "dc_test" {
+				t.Fatalf("unexpected token body: %#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_remote",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_remote",
+				"accessToken":      "at_test",
+				"refreshToken":     "rt_test",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/auth/session/refresh":
+			refreshSeen = true
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["refreshToken"] != "rt_test" {
+				t.Fatalf("unexpected refresh body: %#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_remote",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_remote",
+				"accessToken":      "at_refreshed",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/devices/dev_other/revoke":
+			remoteRevokeSeen = true
+			if r.Header.Get("authorization") != "Bearer at_refreshed" {
+				t.Fatalf("unexpected remote revoke auth header: %s", r.Header.Get("authorization"))
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":     "dev_other",
+				"name":   "ci-runner",
+				"status": "revoked",
+			})
+		case "/v1/auth/session/logout":
+			logoutSeen = true
+			if r.Header.Get("x-asiri-device") != "dev_remote" || r.Header.Get("x-asiri-signature") == "" {
+				t.Fatalf("logout request missing signed device proof")
+			}
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["refreshToken"] != "rt_test" {
+				t.Fatalf("unexpected logout body: %#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "logged_out"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"login", "--origin", server.URL}); code != 0 {
+		t.Fatalf("login failed: %s", errb.String())
+	}
+	if !startSeen || !tokenSeen {
+		t.Fatalf("expected start and token endpoints to be called")
+	}
+	if !strings.Contains(out.String(), "ABCD-2345") || !strings.Contains(out.String(), "oclan-co") {
+		t.Fatalf("login output missing code or workspace: %s", out.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State.ControlPlane == nil || st.State.ControlPlane.DeviceID != "dev_remote" || st.State.ControlPlane.WorkspaceSlug != "oclan-co" {
+		t.Fatalf("control-plane link not persisted: %#v", st.State.ControlPlane)
+	}
+	bytes, err := os.ReadFile(filepath.Join(tmp, "local-state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(bytes), "rt_test") || strings.Contains(string(bytes), "at_test") {
+		t.Fatalf("local state persisted session token: %s", string(bytes))
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"login", "--origin", server.URL}); code != 0 {
+		t.Fatalf("refresh login failed: %s", errb.String())
+	}
+	if !refreshSeen {
+		t.Fatalf("expected refresh endpoint to be called")
+	}
+	if strings.Contains(out.String(), "ABCD-2345") || !strings.Contains(out.String(), "session refreshed") {
+		t.Fatalf("refresh login should not start device-code flow: %s", out.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"device", "revoke", "--workspace", "oclan-co", "dev_other", "--remote"}); code != 0 {
+		t.Fatalf("remote device revoke failed: %s", errb.String())
+	}
+	if !remoteRevokeSeen {
+		t.Fatalf("expected remote revoke endpoint to be called")
+	}
+	if !strings.Contains(out.String(), "ci-runner") || !strings.Contains(out.String(), "oclan-co") {
+		t.Fatalf("remote revoke output missing device or workspace: %s", out.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"logout"}); code != 0 {
+		t.Fatalf("logout failed: %s", errb.String())
+	}
+	if !logoutSeen {
+		t.Fatalf("expected logout endpoint to be called")
+	}
+	st, err = store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State.ControlPlane != nil {
+		t.Fatalf("control-plane link not cleared: %#v", st.State.ControlPlane)
+	}
+}
+
+func TestRemoteRevocationClearsLocalKeyMaterial(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	revoked := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_revoked",
+				"userCode":                "REVOKE-1",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=REVOKE-1",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_revoked",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_revoked",
+				"accessToken":      "at_revoked",
+				"refreshToken":     "rt_revoked",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/auth/session/refresh":
+			revoked = true
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "device_not_trusted"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"pull"}); code == 0 {
+		t.Fatalf("expected revoked device pull failure, stdout=%s", out.String())
+	}
+	if !revoked || !strings.Contains(errb.String(), "local key material was cleared") {
+		t.Fatalf("expected remote revocation cleanup, revoked=%v stderr=%s", revoked, errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State.ControlPlane != nil || len(st.State.KeyRefs) != 0 {
+		t.Fatalf("revoked device kept control-plane link or key refs: %#v", st.State)
+	}
+	if _, _, err := st.GetSecret("oclan-co/local/asiri/API_KEY"); err == nil {
+		t.Fatal("revoked local vault still decrypted existing secret")
+	}
+}
+
+func serverURL(r *http.Request) string {
+	return "http://" + r.Host
+}
+
+func TestPushAndPullUseBearerAccessToken(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	secretPushSeen := false
+	syncSeen := false
+	rewrapSeen := false
+	devicePublicKey := ""
+	var pushedSecret map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["localWorkspaceSlug"] != "" || body["workspaceSlug"] != "" {
+				t.Fatalf("unexpected workspace hint: %#v", body)
+			}
+			devicePublicKey = body["encryptionPublicKey"]
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_push",
+				"userCode":                "PUSH-1234",
+				"verificationUri":         serverURL(r) + "/auth/device",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=PUSH-1234",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_remote",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_remote",
+				"accessToken":      "at_push",
+				"refreshToken":     "rt_push",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/orgs":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"activeOrgId": "org_remote",
+				"organizations": []map[string]any{
+					{"id": "org_remote", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true},
+				},
+			})
+		case "/v1/sync/write-options":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"requestedWorkspaceSlug": "oclan-co",
+				"activeWorkspace": map[string]any{
+					"id":       "org_remote",
+					"slug":     "oclan-co",
+					"canWrite": true,
+					"paths": []map[string]any{{
+						"fullPath": "oclan-co/local/asiri/API_KEY",
+						"canWrite": true,
+					}},
+				},
+			})
+		case "/v1/secrets":
+			if r.Method == http.MethodPost {
+				secretPushSeen = true
+				if r.Header.Get("authorization") != "Bearer at_push" {
+					t.Fatalf("unexpected push auth header: %s", r.Header.Get("authorization"))
+				}
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				if body["orgId"] != "org_remote" || body["createdByDeviceId"] != "dev_remote" || body["scope"] != "oclan-co/local/asiri" || body["name"] != "API_KEY" {
+					t.Fatalf("unexpected pushed secret body: %#v", body)
+				}
+				wrapped, ok := body["wrappedKeys"].([]any)
+				if !ok || len(wrapped) != 1 {
+					t.Fatalf("missing wrapped keys: %#v", body["wrappedKeys"])
+				}
+				wrappedKey := wrapped[0].(map[string]any)
+				if wrappedKey["recipientId"] != "dev_remote" || wrappedKey["wrapAlgorithm"] != "p256-hkdf-aes256gcm" {
+					t.Fatalf("unexpected wrapped key: %#v", wrappedKey)
+				}
+				pushedSecret = body
+				pushedSecret["id"] = "secv_remote"
+				pushedSecret["status"] = "active"
+				pushedSecret["createdAt"] = time.Now().UTC().Format(time.RFC3339)
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": "secv_remote", "status": "active"})
+				return
+			}
+			if r.Method != http.MethodGet {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{pushedSecret}})
+		case "/v1/secrets/encrypted":
+			if r.Method != http.MethodGet {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{pushedSecret}})
+		case "/v1/sync":
+			syncSeen = true
+			if r.Header.Get("authorization") != "Bearer at_push" {
+				t.Fatalf("unexpected sync auth header: %s", r.Header.Get("authorization"))
+			}
+			if r.URL.Query().Get("orgId") != "org_remote" || r.URL.Query().Get("deviceId") != "dev_remote" {
+				t.Fatalf("unexpected sync query: %s", r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"orgId":            "org_remote",
+				"deviceId":         "dev_remote",
+				"issuedAt":         time.Now().UTC().Format(time.RFC3339),
+				"encryptedSecrets": []map[string]any{pushedSecret},
+			})
+		case "/v1/devices":
+			if r.Header.Get("authorization") != "Bearer at_push" {
+				t.Fatalf("unexpected device list auth header: %s", r.Header.Get("authorization"))
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"devices": []map[string]any{
+					{"id": "dev_remote", "name": "qa-laptop", "status": "trusted", "kind": "laptop", "encryptionPublicKey": devicePublicKey},
+					{"id": "dev_other", "name": "server", "status": "trusted", "kind": "server", "encryptionPublicKey": devicePublicKey},
+				},
+			})
+		case "/v1/secrets/secv_remote/wrapped-keys":
+			rewrapSeen = true
+			if r.Header.Get("authorization") != "Bearer at_push" {
+				t.Fatalf("unexpected rewrap auth header: %s", r.Header.Get("authorization"))
+			}
+			var body map[string][]map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if len(body["wrappedKeys"]) != 1 || body["wrappedKeys"][0]["recipientId"] != "dev_other" {
+				t.Fatalf("unexpected rewrap body: %#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "secv_remote", "status": "active"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
+		{"login", "--origin", server.URL},
+		{"push", "--workspace", "oclan-co"},
+		{"pull"},
+		{"rewrap", "--workspace", "oclan-co"},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	if !secretPushSeen || !syncSeen || !rewrapSeen {
+		t.Fatalf("expected push, pull, and rewrap endpoints to be called")
+	}
+	if strings.Contains(out.String(), "secret_value") || strings.Contains(errb.String(), "secret_value") {
+		t.Fatalf("push/pull leaked secret stdout=%q stderr=%q", out.String(), errb.String())
+	}
+}
+
+func TestRewrapSkipsRemoteVersionMissingLocally(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	devicePublicKey := ""
+	rewrapSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			devicePublicKey = body["encryptionPublicKey"]
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_rewrap_skip",
+				"userCode":                "SKIP-1234",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=SKIP-1234",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_remote",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_remote",
+				"accessToken":      "at_rewrap_skip",
+				"refreshToken":     "rt_rewrap_skip",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/devices":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"devices": []map[string]any{
+					{"id": "dev_remote", "name": "qa-laptop", "status": "trusted", "kind": "laptop", "encryptionPublicKey": devicePublicKey},
+					{"id": "dev_other", "name": "server", "status": "trusted", "kind": "server", "encryptionPublicKey": devicePublicKey},
+				},
+			})
+		case "/v1/secrets/encrypted":
+			if r.Method != http.MethodGet {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"secrets": []map[string]any{{
+					"id":         "secv_remote_newer",
+					"orgId":      "org_remote",
+					"scope":      "oclan-co/local/asiri",
+					"name":       "API_KEY",
+					"version":    2,
+					"algorithm":  "aes-256-gcm",
+					"nonce":      "unused",
+					"ciphertext": "unused",
+					"aad":        "org_remote:oclan-co/local/asiri:API_KEY:2:dev_remote",
+					"status":     "active",
+					"wrappedKeys": []map[string]any{{
+						"recipientType": "device",
+						"recipientId":   "dev_remote",
+						"wrapAlgorithm": "p256-hkdf-aes256gcm",
+						"wrappedKey":    "unused",
+					}},
+				}},
+			})
+		case "/v1/secrets/secv_remote_newer/wrapped-keys":
+			rewrapSeen = true
+			t.Fatal("rewrap should skip remote versions that are not stored locally")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
+		{"login", "--origin", server.URL},
+		{"rewrap", "--workspace", "oclan-co"},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	if rewrapSeen {
+		t.Fatal("rewrap endpoint should not be called")
+	}
+	if !strings.Contains(out.String(), "missing matching local key material") {
+		t.Fatalf("rewrap output missing skip result: %s", out.String())
+	}
+}
+
+func TestRewrapAddsCurrentTrustedDeviceWhenLocalKeyExists(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	devicePublicKey := ""
+	rewrapSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			devicePublicKey = body["encryptionPublicKey"]
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_rewrap_current",
+				"userCode":                "CURR-1234",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=CURR-1234",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_remote",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_remote",
+				"accessToken":      "at_rewrap_current",
+				"refreshToken":     "rt_rewrap_current",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/devices":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"devices": []map[string]any{
+					{"id": "dev_remote", "name": "qa-laptop", "status": "trusted", "kind": "laptop", "encryptionPublicKey": devicePublicKey},
+				},
+			})
+		case "/v1/secrets/encrypted":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"secrets": []map[string]any{{
+					"id":         "secv_current_missing",
+					"orgId":      "org_remote",
+					"scope":      "oclan-co/local/asiri",
+					"name":       "API_KEY",
+					"version":    1,
+					"algorithm":  "aes-256-gcm",
+					"nonce":      "unused",
+					"ciphertext": "unused",
+					"aad":        "org_remote:oclan-co/local/asiri:API_KEY:1:dev_remote",
+					"status":     "active",
+					"wrappedKeys": []map[string]any{{
+						"recipientType": "device",
+						"recipientId":   "dev_old",
+						"wrapAlgorithm": "p256-hkdf-aes256gcm",
+						"wrappedKey":    "unused",
+					}},
+				}},
+			})
+		case "/v1/secrets/secv_current_missing/wrapped-keys":
+			rewrapSeen = true
+			var body map[string][]map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if len(body["wrappedKeys"]) != 1 || body["wrappedKeys"][0]["recipientId"] != "dev_remote" {
+				t.Fatalf("current device rewrap used wrong recipient: %#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "secv_current_missing", "status": "active"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.BindWorkspacePrefix("oclan-co", "org_remote", "oclan-co"); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"rewrap", "--workspace", "oclan-co"}); code != 0 {
+		t.Fatalf("rewrap failed with code %d stderr=%s", code, errb.String())
+	}
+	if !rewrapSeen {
+		t.Fatal("expected current device rewrap endpoint")
+	}
+	if !strings.Contains(out.String(), "Rewrapped 1") {
+		t.Fatalf("rewrap output missing success count: %s", out.String())
+	}
+}
+
+func TestRecoverySetupShowsKeyOnceAndWrapsRemoteSecrets(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	secretPushSeen := false
+	recoveryCreateSeen := false
+	var recoveryCreateBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_recovery",
+				"userCode":                "RECV-1234",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=RECV-1234",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_recovery",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_recovery",
+				"accessToken":      "at_recovery",
+				"refreshToken":     "rt_recovery",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/sync/write-options":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"requestedWorkspaceSlug": "oclan-co",
+				"activeWorkspace": map[string]any{
+					"id":       "org_recovery",
+					"slug":     "oclan-co",
+					"canWrite": true,
+					"paths": []map[string]any{{
+						"fullPath": "oclan-co/local/asiri/API_KEY",
+						"canWrite": true,
+					}},
+				},
+			})
+		case "/v1/secrets":
+			if r.Method == http.MethodPost {
+				secretPushSeen = true
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				wrapped, ok := body["wrappedKeys"].([]any)
+				if !ok || len(wrapped) != 1 {
+					t.Fatalf("initial push should contain only the device wrapped key: %#v", body["wrappedKeys"])
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": "secv_recovery", "status": "active"})
+				return
+			}
+			if r.Method != http.MethodGet {
+				http.NotFound(w, r)
+				return
+			}
+			if r.URL.Query().Get("orgId") != "org_recovery" {
+				t.Fatalf("unexpected secrets query: %s", r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"secrets": []map[string]any{{
+					"id":      "secv_recovery",
+					"orgId":   "org_recovery",
+					"scope":   "oclan-co/local/asiri",
+					"name":    "API_KEY",
+					"version": 1,
+					"status":  "active",
+					"wrappedKeys": []map[string]any{{
+						"recipientType": "device",
+						"recipientId":   "dev_recovery",
+						"wrapAlgorithm": "p256-hkdf-aes256gcm",
+						"wrappedKey":    "wrapped",
+					}},
+				}},
+			})
+		case "/v1/secrets/encrypted":
+			if r.Method != http.MethodGet {
+				http.NotFound(w, r)
+				return
+			}
+			if r.URL.Query().Get("orgId") != "org_recovery" {
+				t.Fatalf("unexpected secrets query: %s", r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"secrets": []map[string]any{{
+					"id":      "secv_recovery",
+					"orgId":   "org_recovery",
+					"scope":   "oclan-co/local/asiri",
+					"name":    "API_KEY",
+					"version": 1,
+					"status":  "active",
+					"wrappedKeys": []map[string]any{{
+						"recipientType": "device",
+						"recipientId":   "dev_recovery",
+						"wrapAlgorithm": "p256-hkdf-aes256gcm",
+						"wrappedKey":    "wrapped",
+					}},
+				}},
+			})
+		case "/v1/recovery-recipient":
+			recoveryCreateSeen = true
+			if r.Method != http.MethodPost {
+				http.NotFound(w, r)
+				return
+			}
+			if r.Header.Get("authorization") != "Bearer at_recovery" {
+				t.Fatalf("unexpected recovery recipient auth header: %s", r.Header.Get("authorization"))
+			}
+			if err := json.NewDecoder(r.Body).Decode(&recoveryCreateBody); err != nil {
+				t.Fatal(err)
+			}
+			recipientID, _ := recoveryCreateBody["recipientId"].(string)
+			publicKey, _ := recoveryCreateBody["publicKey"].(string)
+			fingerprint, _ := recoveryCreateBody["publicKeyFingerprint"].(string)
+			if recoveryCreateBody["orgId"] != "org_recovery" || !strings.HasPrefix(recipientID, "rec_") || publicKey == "" || fingerprint == "" {
+				t.Fatalf("unexpected recovery recipient registration body: %#v", recoveryCreateBody)
+			}
+			if _, ok := recoveryCreateBody["key"]; ok {
+				t.Fatalf("registration body should not include raw key: %#v", recoveryCreateBody)
+			}
+			replacements, ok := recoveryCreateBody["replacements"].([]any)
+			if !ok || len(replacements) != 1 {
+				t.Fatalf("expected one recovery replacement: %#v", recoveryCreateBody["replacements"])
+			}
+			replacement, _ := replacements[0].(map[string]any)
+			wrapped, _ := replacement["wrappedKey"].(map[string]any)
+			if wrapped["recipientType"] != "recovery" || wrapped["wrapAlgorithm"] != "recovery-hkdf-aes256gcm" || !strings.HasPrefix(fmt.Sprint(wrapped["recipientId"]), "rec_") {
+				t.Fatalf("unexpected recovery wrapped key: %#v", wrapped)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"recipientId":          recoveryCreateBody["recipientId"],
+				"publicKeyFingerprint": recoveryCreateBody["publicKeyFingerprint"],
+				"status":               "active",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
+		{"login", "--origin", server.URL},
+		{"push", "--workspace", "oclan-co"},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	recoveryKeyPath := filepath.Join(tmp, "recovery.key")
+	if code := app.Run([]string{"recovery", "setup", "--workspace", "oclan-co", "--output-file", recoveryKeyPath}); code != 0 {
+		t.Fatalf("recovery setup failed: %s", errb.String())
+	}
+	if !secretPushSeen || !recoveryCreateSeen {
+		t.Fatal("expected push and recovery create endpoints")
+	}
+	all := out.String()
+	if !strings.Contains(all, "Recovery key written") || !strings.Contains(all, "Added recovery wrapping to 1 remote secret") {
+		t.Fatalf("recovery output missing expected copy or wrapping result: %s", all)
+	}
+	keyBytes, err := os.ReadFile(recoveryKeyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveryKey := strings.TrimSpace(string(keyBytes))
+	if recoveryKey == "" {
+		t.Fatalf("recovery setup did not write a recovery key: %s", all)
+	}
+	if strings.Contains(all, recoveryKey) {
+		t.Fatal("recovery setup printed raw recovery key")
+	}
+	if strings.Contains(fmt.Sprint(recoveryCreateBody), recoveryKey) {
+		t.Fatal("recovery registration sent raw recovery key")
+	}
+	bytes, err := os.ReadFile(filepath.Join(tmp, "local-state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(bytes), recoveryKey) {
+		t.Fatal("local state persisted raw recovery key")
+	}
+}
+
+func TestRecoverySetupFreshLinkedWorkspaceSendsEmptyReplacements(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	recoveryCreateSeen := false
+	remoteSecretListSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_empty_recovery",
+				"userCode":                "RNEW-1234",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=RNEW-1234",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_empty_recovery",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_empty_recovery",
+				"accessToken":      "at_empty_recovery",
+				"refreshToken":     "rt_empty_recovery",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/secrets/encrypted":
+			remoteSecretListSeen = true
+			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{}})
+		case "/v1/recovery-recipient":
+			if r.Method == http.MethodGet {
+				http.NotFound(w, r)
+				return
+			}
+			if r.Method != http.MethodPost {
+				http.NotFound(w, r)
+				return
+			}
+			recoveryCreateSeen = true
+			if r.Header.Get("authorization") != "Bearer at_empty_recovery" {
+				t.Fatalf("unexpected recovery recipient auth header: %s", r.Header.Get("authorization"))
+			}
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			replacements, ok := body["replacements"].([]any)
+			if !ok || len(replacements) != 0 {
+				t.Fatalf("fresh workspace should send empty recovery replacements array: %#v", body["replacements"])
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"recipientId":          body["recipientId"],
+				"publicKeyFingerprint": body["publicKeyFingerprint"],
+				"status":               "active",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	staleStore, err := store.Load(filepath.Join(tmp, "local-state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleSetup, err := staleStore.SetupRecovery(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := staleStore.Save(); err != nil {
+		t.Fatal(err)
+	}
+	recoveryKeyPath := filepath.Join(tmp, "recovery.key")
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"recovery", "setup", "--workspace", "oclan-co", "--output-file", recoveryKeyPath}); code != 0 {
+		t.Fatalf("fresh workspace recovery setup failed: %s", errb.String())
+	}
+	if !recoveryCreateSeen {
+		t.Fatal("expected recovery create endpoint")
+	}
+	if remoteSecretListSeen {
+		t.Fatal("fresh workspace without a remote binding should not list remote secrets")
+	}
+	if keyBytes, err := os.ReadFile(recoveryKeyPath); err != nil {
+		t.Fatal(err)
+	} else if strings.TrimSpace(string(keyBytes)) == "" {
+		t.Fatal("recovery setup should write the recovery key")
+	}
+	st, err := store.Load(filepath.Join(tmp, "local-state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovery := st.ActiveRecovery(); recovery == nil {
+		t.Fatal("fresh workspace recovery setup should commit local recovery metadata")
+	} else if recovery.RecipientID == staleSetup.RecipientID {
+		t.Fatal("fresh workspace recovery setup should replace stale local recovery metadata after server success")
+	}
+}
+
+func TestRecoveryStatusPreservesSameRecipientLocalWrappingCounters(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	var activeRecovery *asiri.RecoveryConfig
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_status_recovery",
+				"userCode":                "RSTS-1234",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=RSTS-1234",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_status_recovery",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_status_recovery",
+				"accessToken":      "at_status_recovery",
+				"refreshToken":     "rt_status_recovery",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/orgs":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"activeOrgId": "org_status_recovery",
+				"organizations": []map[string]any{
+					{"id": "org_status_recovery", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true},
+				},
+			})
+		case "/v1/recovery-recipient":
+			if r.Method != http.MethodGet {
+				http.NotFound(w, r)
+				return
+			}
+			if r.Header.Get("authorization") != "Bearer at_status_recovery" {
+				t.Fatalf("unexpected recovery status auth header: %s", r.Header.Get("authorization"))
+			}
+			if activeRecovery == nil {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"recipientId":          activeRecovery.RecipientID,
+				"publicKey":            activeRecovery.PublicKey,
+				"publicKeyFingerprint": activeRecovery.PublicKeyFingerprint,
+				"status":               "active",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SetupRecovery(false); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkRecoveryWrapped("oclan-co", 3); err != nil {
+		t.Fatal(err)
+	}
+	recovery := st.ActiveRecovery()
+	if recovery == nil {
+		t.Fatal("expected local recovery metadata")
+	}
+	activeRecovery = recovery
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"recovery", "status"}); code != 0 {
+		t.Fatalf("recovery status failed: %s", errb.String())
+	}
+	statusFields := strings.Fields(out.String())
+	if !strings.Contains(out.String(), "oclan-co") || !strings.Contains(out.String(), "configured") || !containsString(statusFields, "3") {
+		t.Fatalf("recovery status should preserve local wrapping count, got: %s", out.String())
+	}
+	reloaded, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count := reloaded.RecoveryWrappedCountForPrefix("oclan-co"); count != 3 {
+		t.Fatalf("recovery status should persist local wrapping count, got %d", count)
+	}
+}
+
+func TestRecoverySetupSkipsWrappingWhenRemoteRegistrationFails(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	recoveryCreateSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_recovery_registration_fail",
+				"userCode":                "RFAIL-1234",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=RFAIL-1234",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_recovery",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_recovery",
+				"accessToken":      "at_recovery",
+				"refreshToken":     "rt_recovery",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/sync/write-options":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"requestedWorkspaceSlug": "oclan-co",
+				"activeWorkspace": map[string]any{
+					"id":       "org_recovery",
+					"slug":     "oclan-co",
+					"canWrite": true,
+					"paths": []map[string]any{{
+						"fullPath": "oclan-co/local/asiri/API_KEY",
+						"canWrite": true,
+					}},
+				},
+			})
+		case "/v1/secrets":
+			if r.Method == http.MethodPost {
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": "secv_recovery", "status": "active"})
+				return
+			}
+			http.NotFound(w, r)
+		case "/v1/secrets/encrypted":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"secrets": []map[string]any{{
+					"id":      "secv_recovery",
+					"orgId":   "org_recovery",
+					"scope":   "oclan-co/local/asiri",
+					"name":    "API_KEY",
+					"version": 1,
+					"status":  "active",
+					"wrappedKeys": []map[string]any{{
+						"recipientType": "device",
+						"recipientId":   "dev_recovery",
+						"wrapAlgorithm": "p256-hkdf-aes256gcm",
+						"wrappedKey":    "wrapped",
+					}},
+				}},
+			})
+		case "/v1/recovery-recipient":
+			if r.Method == http.MethodGet {
+				http.NotFound(w, r)
+				return
+			}
+			if r.Method != http.MethodPost {
+				http.NotFound(w, r)
+				return
+			}
+			recoveryCreateSeen = true
+			http.Error(w, `{"error":"owner required"}`, http.StatusForbidden)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
+		{"login", "--origin", server.URL},
+		{"push", "--workspace", "oclan-co"},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	recoveryKeyPath := filepath.Join(tmp, "recovery.key")
+	if code := app.Run([]string{"recovery", "setup", "--workspace", "oclan-co", "--output-file", recoveryKeyPath}); code == 0 {
+		t.Fatal("recovery setup should fail when remote registration fails")
+	}
+	if !recoveryCreateSeen {
+		t.Fatal("expected recovery registration endpoint")
+	}
+	if !strings.Contains(errb.String(), "recovery key delivered, but remote registration failed") {
+		t.Fatalf("expected registration failure warning, got %s", errb.String())
+	}
+	if keyBytes, err := os.ReadFile(recoveryKeyPath); err != nil {
+		t.Fatal(err)
+	} else if strings.TrimSpace(string(keyBytes)) == "" {
+		t.Fatal("recovery key should remain available after delivery")
+	}
+	st, err := store.Load(filepath.Join(tmp, "local-state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.ActiveRecovery() != nil {
+		t.Fatalf("local recovery config should not be active after remote registration failure: %#v", st.State.Recoveries)
+	}
+}
+
+func TestRecoverySetupFailsWhenRemoteReplacementFails(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	recoveryReplaceSeen := false
+	remoteRecoveryActive := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_recovery_wrap_fail",
+				"userCode":                "RWFL-1234",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=RWFL-1234",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_recovery",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_recovery",
+				"accessToken":      "at_recovery",
+				"refreshToken":     "rt_recovery",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/sync/write-options":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"requestedWorkspaceSlug": "oclan-co",
+				"activeWorkspace": map[string]any{
+					"id":       "org_recovery",
+					"slug":     "oclan-co",
+					"canWrite": true,
+					"paths": []map[string]any{{
+						"fullPath": "oclan-co/local/asiri/API_KEY",
+						"canWrite": true,
+					}},
+				},
+			})
+		case "/v1/secrets":
+			if r.Method == http.MethodPost {
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": "secv_recovery", "status": "active"})
+				return
+			}
+			http.NotFound(w, r)
+		case "/v1/secrets/encrypted":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"secrets": []map[string]any{{
+					"id":      "secv_recovery",
+					"orgId":   "org_recovery",
+					"scope":   "oclan-co/local/asiri",
+					"name":    "API_KEY",
+					"version": 1,
+					"status":  "active",
+					"wrappedKeys": []map[string]any{{
+						"recipientType": "device",
+						"recipientId":   "dev_recovery",
+						"wrapAlgorithm": "p256-hkdf-aes256gcm",
+						"wrappedKey":    "wrapped",
+					}},
+				}},
+			})
+		case "/v1/recovery-recipient":
+			if r.Method != http.MethodGet || !remoteRecoveryActive {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"recipientId":          "rec_existing",
+				"publicKey":            "remote-public-key",
+				"publicKeyFingerprint": "remote-fingerprint",
+				"status":               "active",
+			})
+		case "/v1/recovery-recipient/replace":
+			recoveryReplaceSeen = true
+			http.Error(w, `{"error":"replacement failed"}`, http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
+		{"login", "--origin", server.URL},
+		{"push", "--workspace", "oclan-co"},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	remoteRecoveryActive = true
+	out.Reset()
+	errb.Reset()
+	recoveryKeyPath := filepath.Join(tmp, "recovery.key")
+	if code := app.Run([]string{"recovery", "setup", "--workspace", "oclan-co", "--force", "--output-file", recoveryKeyPath}); code == 0 {
+		t.Fatal("recovery setup should fail when remote replacement fails")
+	}
+	if !recoveryReplaceSeen {
+		t.Fatal("expected recovery replacement endpoint")
+	}
+	if !strings.Contains(errb.String(), "recovery key delivered, but remote replacement failed") {
+		t.Fatalf("expected replacement failure, got %s", errb.String())
+	}
+	if keyBytes, err := os.ReadFile(recoveryKeyPath); err != nil {
+		t.Fatal(err)
+	} else if strings.TrimSpace(string(keyBytes)) == "" {
+		t.Fatal("recovery key should remain available after delivery")
+	}
+	st, err := store.Load(filepath.Join(tmp, "local-state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.ActiveRecovery() != nil {
+		t.Fatalf("local recovery config should not be active after remote wrapping failure: %#v", st.State.Recoveries)
+	}
+}
+
+func TestRecoverySetupForceCommitsWhenPreviousRecipientIsRetired(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	var registeredRecipients []string
+	replacementCount := 0
+	staleRecoveryListRejected := false
+	unscopedRecoveryListSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_recovery_force",
+				"userCode":                "RFOR-1234",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=RFOR-1234",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_recovery",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_recovery",
+				"accessToken":      "at_recovery",
+				"refreshToken":     "rt_recovery",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/sync/write-options":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"requestedWorkspaceSlug": "oclan-co",
+				"activeWorkspace": map[string]any{
+					"id":       "org_recovery",
+					"slug":     "oclan-co",
+					"canWrite": true,
+					"paths": []map[string]any{{
+						"fullPath": "oclan-co/local/asiri/API_KEY",
+						"canWrite": true,
+					}},
+				},
+			})
+		case "/v1/secrets":
+			if r.Method == http.MethodPost {
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": "secv_recovery", "status": "active"})
+				return
+			}
+			http.NotFound(w, r)
+		case "/v1/recovery-recipient":
+			if r.Method == http.MethodGet {
+				if len(registeredRecipients) == 0 {
+					http.NotFound(w, r)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"recipientId":          registeredRecipients[len(registeredRecipients)-1],
+					"publicKey":            "remote-public-key",
+					"publicKeyFingerprint": "remote-fingerprint",
+					"status":               "active",
+				})
+				return
+			}
+			if r.Method != http.MethodPost {
+				http.NotFound(w, r)
+				return
+			}
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			recipientID, _ := body["recipientId"].(string)
+			registeredRecipients = append(registeredRecipients, recipientID)
+			replacements, ok := body["replacements"].([]any)
+			if !ok || len(replacements) != 1 {
+				t.Fatalf("expected one replacement in initial setup: %#v", body["replacements"])
+			}
+			replacementCount += 1
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"recipientId":          recipientID,
+				"publicKeyFingerprint": body["publicKeyFingerprint"],
+				"status":               "active",
+			})
+		case "/v1/recovery-recipient/replace":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			recipientID, _ := body["recipientId"].(string)
+			registeredRecipients = append(registeredRecipients, recipientID)
+			replacements, ok := body["replacements"].([]any)
+			if !ok || len(replacements) != 1 {
+				t.Fatalf("expected one replacement in forced setup: %#v", body["replacements"])
+			}
+			replacementCount += 1
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"recipientId":          recipientID,
+				"publicKeyFingerprint": body["publicKeyFingerprint"],
+				"status":               "active",
+			})
+		case "/v1/secrets/encrypted":
+			if r.URL.Query().Get("orgId") != "org_recovery" {
+				t.Fatalf("unexpected secrets query: %s", r.URL.RawQuery)
+			}
+			recoveryRecipientID := r.URL.Query().Get("recoveryRecipientId")
+			if len(registeredRecipients) >= 1 && recoveryRecipientID == registeredRecipients[0] {
+				staleRecoveryListRejected = true
+				http.Error(w, `{"error":"recovery recipient is not registered for this workspace"}`, http.StatusForbidden)
+				return
+			}
+			if len(registeredRecipients) >= 1 && recoveryRecipientID == "" {
+				unscopedRecoveryListSeen = true
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"secrets": []map[string]any{{
+					"id":      "secv_recovery",
+					"orgId":   "org_recovery",
+					"scope":   "oclan-co/local/asiri",
+					"name":    "API_KEY",
+					"version": 1,
+					"status":  "active",
+					"wrappedKeys": []map[string]any{{
+						"recipientType": "device",
+						"recipientId":   "dev_recovery",
+						"wrapAlgorithm": "p256-hkdf-aes256gcm",
+						"wrappedKey":    "wrapped",
+					}},
+				}},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
+		{"login", "--origin", server.URL},
+		{"push", "--workspace", "oclan-co"},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	for _, step := range [][]string{
+		{"recovery", "setup", "--workspace", "oclan-co", "--output-file", filepath.Join(tmp, "recovery-1.key")},
+		{"recovery", "setup", "--workspace", "oclan-co", "--force", "--output-file", filepath.Join(tmp, "recovery-2.key")},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	if len(registeredRecipients) != 2 || registeredRecipients[0] == registeredRecipients[1] {
+		t.Fatalf("expected two distinct recovery registrations: %#v", registeredRecipients)
+	}
+	if replacementCount != 2 {
+		t.Fatalf("expected both setup runs to replace recovery wrapping, got %d", replacementCount)
+	}
+	if !staleRecoveryListRejected || !unscopedRecoveryListSeen {
+		t.Fatalf("forced setup should fall back after stale recovery recipient rejection, rejected=%v unscoped=%v", staleRecoveryListRejected, unscopedRecoveryListSeen)
+	}
+	st, err := store.Load(filepath.Join(tmp, "local-state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovery := st.ActiveRecovery(); recovery == nil || recovery.RecipientID != registeredRecipients[1] {
+		t.Fatalf("forced replacement should commit the new local recovery config: %#v", st.State.Recoveries)
+	}
+}
+
+func TestRecoveryRestoreUsesSuppliedKeyWhenLocalMetadataIsStale(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	remoteListSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_recovery_restore",
+				"userCode":                "REST-1234",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=REST-1234",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_recovery",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_recovery",
+				"accessToken":      "at_recovery",
+				"refreshToken":     "rt_recovery",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/secrets/encrypted":
+			remoteListSeen = true
+			if got := r.URL.Query().Get("recoveryRecipientId"); !strings.HasPrefix(got, "rec_") {
+				t.Fatalf("restore should list by supplied recovery key identity, got %q", got)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []any{}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	st, err := store.Load(filepath.Join(tmp, "local-state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSetup, err := st.SetupRecovery(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SetupRecovery(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(tmp, "old-recovery.key")
+	if err := os.WriteFile(keyPath, []byte(oldSetup.Key+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"recovery", "restore", "--workspace", "oclan-co", "--key-file", keyPath}); code != 0 {
+		t.Fatalf("restore should let the server decide whether the supplied key is active: %s", errb.String())
+	}
+	if !remoteListSeen {
+		t.Fatal("restore should ask the server about the supplied recovery key")
+	}
+	if !strings.Contains(out.String(), "No remote active secrets to restore") {
+		t.Fatalf("unexpected restore output: %s", out.String())
+	}
+	st, err = store.Load(filepath.Join(tmp, "local-state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovery := st.ActiveRecovery(); recovery == nil || recovery.RecipientID != oldSetup.RecipientID {
+		t.Fatalf("restore should refresh local recovery metadata from the supplied key: %#v", st.State.Recoveries)
+	}
+}
+
+func TestRecoverySetupDoesNotPersistWhenKeyDeliveryFails(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	remoteReplacementSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_recovery_fail",
+				"userCode":                "FAIL-1234",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=FAIL-1234",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_recovery",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_recovery",
+				"accessToken":      "at_recovery",
+				"refreshToken":     "rt_recovery",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/secrets/encrypted":
+			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{}})
+		case "/v1/recovery-recipient/replace":
+			remoteReplacementSeen = true
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "active"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed: %s", step, errb.String())
+		}
+	}
+	existingKeyPath := filepath.Join(tmp, "recovery.key")
+	if err := os.WriteFile(existingKeyPath, []byte("existing\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"recovery", "setup", "--workspace", "oclan-co", "--output-file", existingKeyPath}); code == 0 {
+		t.Fatal("recovery setup should fail when key output cannot be created")
+	}
+	if remoteReplacementSeen {
+		t.Fatal("remote recovery replacement should not run when key delivery fails")
+	}
+	st, err := store.Load(filepath.Join(tmp, "local-state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.State.Recoveries) != 0 {
+		t.Fatalf("workspace recovery config persisted after key delivery failure: %#v", st.State.Recoveries)
+	}
+}
+
+func TestRawReadDoesNotPrintSecretWhenAuditSaveFails(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "do_not_print")},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed: %s", step, errb.String())
+		}
+	}
+	statePath := filepath.Join(tmp, "local-state.json")
+	if err := os.Chmod(statePath, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(statePath, 0o600) })
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"get", "--workspace", "oclan-co", "local/asiri/API_KEY"}); code == 0 {
+		t.Fatal("expected raw read to fail when audit save fails")
+	}
+	if strings.Contains(out.String(), "do_not_print") {
+		t.Fatalf("secret printed despite audit save failure: %s", out.String())
+	}
+}
+
+func TestPushOffersConfirmedWorkspacePrefixRenameWhenSourceWorkspaceIsNotVisible(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	writeOptionsSeen := false
+	secretPushSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_remap",
+				"userCode":                "REMP-1234",
+				"verificationUri":         serverURL(r) + "/auth/device",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=REMP-1234",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      "at_oclan",
+				"refreshToken":     "rt_oclan",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/sync/write-options":
+			writeOptionsSeen = true
+			var body map[string][]map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if len(body["entries"]) != 1 || body["entries"][0]["scope"] != "google-com/recipe-app" || body["entries"][0]["name"] != "API_KEY" {
+				t.Fatalf("unexpected write options body: %#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"requestedWorkspaceSlug": "google-com",
+				"activeWorkspace": map[string]any{
+					"id":       "org_oclan",
+					"slug":     "oclan-co",
+					"canWrite": true,
+					"paths": []map[string]any{{
+						"scope":              "oclan-co/recipe-app",
+						"name":               "API_KEY",
+						"fullPath":           "oclan-co/recipe-app/API_KEY",
+						"requiredCapability": "secret:create",
+						"canWrite":           true,
+					}},
+				},
+				"writableWorkspaces": []map[string]any{{
+					"id":       "org_oclan",
+					"slug":     "oclan-co",
+					"canWrite": true,
+					"paths": []map[string]any{{
+						"fullPath": "oclan-co/recipe-app/API_KEY",
+					}},
+				}},
+			})
+		case "/v1/secrets":
+			secretPushSeen = true
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["orgId"] != "org_oclan" || body["scope"] != "oclan-co/recipe-app" || body["name"] != "API_KEY" {
+				t.Fatalf("unexpected remapped push body: %#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "secv_remap", "status": "active"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "google-com", "recipe-app/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"push"}); code == 0 {
+		t.Fatalf("push should require an explicit workspace")
+	}
+	if writeOptionsSeen || secretPushSeen {
+		t.Fatal("push without workspace should fail before remote calls")
+	}
+	if !strings.Contains(errb.String(), "push requires --workspace") {
+		t.Fatalf("push did not explain required workspace: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.RemoteBindingForPrefix("oclan-co"); ok {
+		t.Fatalf("push without workspace should not bind any prefix: %#v", st.State.RemoteBindings)
+	}
+	if _, _, err := st.GetSecret("google-com/recipe-app/API_KEY"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPushListsWritableAlternativesWhenActiveWorkspaceCannotWrite(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	secretPushSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_alt",
+				"userCode":                "ALTS-1234",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=ALTS-1234",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      "at_oclan",
+				"refreshToken":     "rt_oclan",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/sync/write-options":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"requestedWorkspaceSlug": "oclan-co",
+				"activeWorkspace": map[string]any{
+					"id":       "org_oclan",
+					"slug":     "oclan-co",
+					"canWrite": false,
+					"paths": []map[string]any{{
+						"fullPath": "oclan-co/recipe-app/API_KEY",
+						"canWrite": false,
+					}},
+				},
+				"writableWorkspaces": []map[string]any{{
+					"id":       "org_personal",
+					"slug":     "peter-dev",
+					"canWrite": true,
+					"paths": []map[string]any{{
+						"fullPath": "peter-dev/recipe-app/API_KEY",
+						"canWrite": true,
+					}},
+				}},
+			})
+		case "/v1/secrets":
+			secretPushSeen = true
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "oclan-co", "recipe-app/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"push", "--workspace", "oclan-co"}); code == 0 {
+		t.Fatalf("push should fail when the target workspace cannot write")
+	}
+	if secretPushSeen {
+		t.Fatal("push should not upload when the target workspace cannot write")
+	}
+	if !strings.Contains(errb.String(), "workspace oclan-co cannot write") {
+		t.Fatalf("push did not explain workspace write failure: %s", errb.String())
+	}
+}
+
+func TestPushRefusesToMoveVisibleReadOnlyWorkspaceSecrets(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	secretPushSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_readonly",
+				"userCode":                "READ-1234",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=READ-1234",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_member",
+				"deviceId":         "dev_member",
+				"accessToken":      "at_member",
+				"refreshToken":     "rt_member",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/sync/write-options":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"requestedWorkspaceSlug": "google-com",
+				"sourceWorkspace": map[string]any{
+					"id":       "org_google",
+					"slug":     "google-com",
+					"canWrite": false,
+					"paths": []map[string]any{{
+						"fullPath": "google-com/recipe-app/API_KEY",
+						"canWrite": false,
+					}},
+				},
+				"activeWorkspace": map[string]any{
+					"id":       "org_oclan",
+					"slug":     "oclan-co",
+					"canWrite": true,
+					"paths": []map[string]any{{
+						"fullPath": "oclan-co/recipe-app/API_KEY",
+						"canWrite": true,
+					}},
+				},
+				"writableWorkspaces": []map[string]any{{
+					"id":       "org_oclan",
+					"slug":     "oclan-co",
+					"canWrite": true,
+					"paths": []map[string]any{{
+						"fullPath": "oclan-co/recipe-app/API_KEY",
+						"canWrite": true,
+					}},
+				}},
+			})
+		case "/v1/secrets":
+			secretPushSeen = true
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "google-com", "recipe-app/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"push", "--workspace", "oclan-co"}); code == 0 {
+		t.Fatalf("push should fail when local prefixes do not match the requested workspace")
+	}
+	if secretPushSeen {
+		t.Fatal("push should not upload mismatched workspace material")
+	}
+	if !strings.Contains(errb.String(), "no local active secrets under workspace oclan-co") || !strings.Contains(errb.String(), "google-com") {
+		t.Fatalf("push did not explain workspace prefix mismatch: %s", errb.String())
+	}
+}
+
+func TestListMergesActiveWorkspaceRemoteSecrets(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	visibleListSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_list",
+				"userCode":                "LIST-1234",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=LIST-1234",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      "at_list",
+				"refreshToken":     "rt_list",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/secrets/visible":
+			visibleListSeen = true
+			if r.Header.Get("authorization") != "Bearer at_list" {
+				t.Fatalf("unexpected visible list auth header: %s", r.Header.Get("authorization"))
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"secrets": []map[string]any{
+					{"id": "sec_synced", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "PUSHED", "version": 1, "status": "active", "canWrite": true},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "oclan-co", "local/asiri/PUSHED", "--value-file", testSecretFile(t, "secret_value")},
+		{"add", "--workspace", "oclan-co", "local/asiri/UNPUSHED", "--value-file", testSecretFile(t, "secret_value")},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"list"}); code != 0 {
+		t.Fatalf("list failed: %s", errb.String())
+	}
+	if !visibleListSeen {
+		t.Fatal("expected visible remote secrets endpoint")
+	}
+	all := out.String()
+	for _, expected := range []string{"oclan-co", "local/asiri/PUSHED", "synced,writable", "local/asiri/UNPUSHED", "local-only"} {
+		if !strings.Contains(all, expected) {
+			t.Fatalf("list output missing %q: %s", expected, all)
+		}
+	}
+	if strings.Contains(all, "REMOTE_ONLY") || strings.Contains(all, "remote-only,read-only") {
+		t.Fatalf("list output included filtered workspace remote secret: %s", all)
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"list", "--workspace", "peter-dev"}); code != 0 {
+		t.Fatalf("workspace-filtered list failed: %s", errb.String())
+	}
+	if strings.Contains(out.String(), "REMOTE_ONLY") || strings.Contains(out.String(), "local/asiri") {
+		t.Fatalf("workspace filter output unexpected: %s", out.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"list", "--local"}); code != 0 {
+		t.Fatalf("local-filtered list failed: %s", errb.String())
+	}
+	if strings.Contains(out.String(), "REMOTE_ONLY") || !strings.Contains(out.String(), "UNPUSHED") {
+		t.Fatalf("local filter output unexpected: %s", out.String())
+	}
+}
+
+func TestListLocalDoesNotRequireRemoteAuth(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	remoteCallsAfterLogin := 0
+	loginComplete := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		if loginComplete {
+			remoteCallsAfterLogin++
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "expired"})
+			return
+		}
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_local_list",
+				"userCode":                "LLST-123",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=LLST-123",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			loginComplete = true
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      "at_local_list",
+				"refreshToken":     "rt_local_list",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"list", "--local"}); code != 0 {
+		t.Fatalf("local list failed: %s", errb.String())
+	}
+	if remoteCallsAfterLogin != 0 {
+		t.Fatalf("local list should not call remote endpoints, got %d call(s)", remoteCallsAfterLogin)
+	}
+	if !strings.Contains(out.String(), "No local secrets found.") {
+		t.Fatalf("local list output did not explain empty local vault: %s", out.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"list", "--local", "--workspace", "org_oclan"}); code == 0 {
+		t.Fatal("local list should reject workspace ids without remote lookup")
+	}
+	if remoteCallsAfterLogin != 0 {
+		t.Fatalf("local list with invalid workspace should not call remote endpoints, got %d call(s)", remoteCallsAfterLogin)
+	}
+}
+
+func TestLocalWipeDoesNotCallRemoteAPIs(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	remoteCallsAfterLogin := 0
+	loginComplete := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		if loginComplete {
+			remoteCallsAfterLogin++
+			http.NotFound(w, r)
+			return
+		}
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_local_wipe",
+				"userCode":                "WIPE-123",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=WIPE-123",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			loginComplete = true
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      "at_local_wipe",
+				"refreshToken":     "rt_local_wipe",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"local", "wipe", "--yes"}); code != 0 {
+		t.Fatalf("local wipe failed: %s", errb.String())
+	}
+	if remoteCallsAfterLogin != 0 {
+		t.Fatalf("local wipe should not call remote endpoints, got %d call(s)", remoteCallsAfterLogin)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, ".asiri", "local-state.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("local wipe should remove state file, stat err=%v", err)
+	}
+}
+
+func TestRemoteSecretDeleteMarksActiveRemoteVersionDeleted(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	visibleSeen := false
+	deleteSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_delete",
+				"userCode":                "DEL-1234",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=DEL-1234",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      "at_delete",
+				"refreshToken":     "rt_delete",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/secrets/visible":
+			visibleSeen = true
+			if r.Header.Get("authorization") != "Bearer at_delete" {
+				t.Fatalf("unexpected visible list auth header: %s", r.Header.Get("authorization"))
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"secrets": []map[string]any{
+					{"id": "sec_delete", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "PUSHED", "version": 2, "status": "active", "canWrite": true},
+					{"id": "sec_other", "orgId": "org_other", "workspaceSlug": "other-co", "scope": "other-co/local/asiri", "name": "PUSHED", "version": 1, "status": "active", "canWrite": true},
+				},
+			})
+		case "/v1/secrets/sec_delete/delete":
+			deleteSeen = true
+			if r.Method != http.MethodPost {
+				t.Fatalf("expected POST delete, got %s", r.Method)
+			}
+			if r.Header.Get("authorization") != "Bearer at_delete" {
+				t.Fatalf("unexpected delete auth header: %s", r.Header.Get("authorization"))
+			}
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["createdByDeviceId"] != "dev_oclan" {
+				t.Fatalf("delete request used wrong device id: %#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "sec_delete", "orgId": "org_oclan", "scope": "oclan-co/local/asiri", "name": "PUSHED", "version": 2, "status": "deleted",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "oclan-co", "local/asiri/PUSHED", "--value-file", testSecretFile(t, "secret_value")},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "local/asiri/PUSHED", "--yes"}); code != 0 {
+		t.Fatalf("remote secret delete failed: %s", errb.String())
+	}
+	if !visibleSeen || !deleteSeen {
+		t.Fatalf("expected visible lookup and delete request, visible=%v delete=%v", visibleSeen, deleteSeen)
+	}
+	for _, expected := range []string{"Marked remote secret", "local/asiri/PUSHED", "oclan-co", "v2"} {
+		if !strings.Contains(out.String(), expected) {
+			t.Fatalf("delete output missing %q: %s", expected, out.String())
+		}
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.State.Secrets[store.SecretKey("oclan-co/local/asiri", "PUSHED")]; !ok {
+		t.Fatal("remote delete should not remove the local secret")
+	}
+}
+
+func TestRemoteSecretDeleteConfirmationAndPathGuards(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	visibleCount := 0
+	deleteCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_confirm_delete",
+				"userCode":                "CDEL-123",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=CDEL-123",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      "at_confirm_delete",
+				"refreshToken":     "rt_confirm_delete",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/secrets/visible":
+			visibleCount++
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"secrets": []map[string]any{
+					{"id": "sec_confirm", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "PUSHED", "version": 1, "status": "active", "canWrite": true},
+				},
+			})
+		case "/v1/secrets/sec_confirm/delete":
+			deleteCount++
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "sec_confirm", "orgId": "org_oclan", "scope": "oclan-co/local/asiri", "name": "PUSHED", "version": 1, "status": "deleted",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "oclan-co/local/asiri/PUSHED", "--yes"}); code == 0 {
+		t.Fatal("workspace-prefixed remote delete path should fail")
+	}
+	if !strings.Contains(errb.String(), "accepts short paths") {
+		t.Fatalf("prefixed path error was not clear: %s", errb.String())
+	}
+	if visibleCount != 0 || deleteCount != 0 {
+		t.Fatalf("prefixed path should fail before remote lookup, visible=%d delete=%d", visibleCount, deleteCount)
+	}
+	app.In = strings.NewReader("wrong\n")
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "local/asiri/PUSHED"}); code == 0 {
+		t.Fatal("remote delete should fail when confirmation does not match")
+	}
+	if !strings.Contains(errb.String(), "confirmation did not match") {
+		t.Fatalf("confirmation error was not clear: %s", errb.String())
+	}
+	if deleteCount != 0 {
+		t.Fatalf("confirmation mismatch should not delete, deleteCount=%d", deleteCount)
+	}
+	app.In = strings.NewReader("local/asiri/PUSHED \n")
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "local/asiri/PUSHED"}); code == 0 {
+		t.Fatal("remote delete should fail when confirmation has trailing whitespace")
+	}
+	if !strings.Contains(errb.String(), "confirmation did not match") {
+		t.Fatalf("whitespace confirmation error was not clear: %s", errb.String())
+	}
+	if deleteCount != 0 {
+		t.Fatalf("whitespace confirmation mismatch should not delete, deleteCount=%d", deleteCount)
+	}
+	app.In = strings.NewReader("local/asiri/PUSHED\n")
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "local/asiri/PUSHED"}); code != 0 {
+		t.Fatalf("confirmed remote delete failed: %s", errb.String())
+	}
+	if deleteCount != 1 {
+		t.Fatalf("expected one confirmed delete, got %d", deleteCount)
+	}
+}
+
+func TestRemoteSecretDeleteFailureModes(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		secrets    []map[string]any
+		deleteCode int
+		deleteBody map[string]any
+		want       string
+	}{
+		{
+			name: "missing active remote secret",
+			secrets: []map[string]any{
+				{"id": "sec_stale", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "PUSHED", "version": 1, "status": "stale", "canWrite": true},
+			},
+			want: "no active remote secret found",
+		},
+		{
+			name: "permission failure",
+			secrets: []map[string]any{
+				{"id": "sec_forbidden", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "PUSHED", "version": 1, "status": "active", "canWrite": true},
+			},
+			deleteCode: http.StatusForbidden,
+			deleteBody: map[string]any{"error": "forbidden", "message": "secret delete denied"},
+			want:       "secret delete denied",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			old := os.Getenv("ASIRI_HOME")
+			t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+			if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+				t.Fatal(err)
+			}
+			deleteSeen := false
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("content-type", "application/json")
+				switch r.URL.Path {
+				case "/v1/auth/device-code/start":
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"deviceCode":              "dc_fail_delete",
+						"userCode":                "FDEL-123",
+						"verificationUriComplete": serverURL(r) + "/auth/device?code=FDEL-123",
+						"expiresIn":               30,
+						"interval":                0,
+					})
+				case "/v1/auth/device-code/token":
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"status":           "approved",
+						"orgId":            "org_oclan",
+						"workspaceSlug":    "oclan-co",
+						"userId":           "usr_owner",
+						"deviceId":         "dev_oclan",
+						"accessToken":      "at_fail_delete",
+						"refreshToken":     "rt_fail_delete",
+						"expiresIn":        3600,
+						"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+					})
+				case "/v1/secrets/visible":
+					_ = json.NewEncoder(w).Encode(map[string]any{"secrets": tc.secrets})
+				case "/v1/secrets/sec_forbidden/delete":
+					deleteSeen = true
+					w.WriteHeader(tc.deleteCode)
+					_ = json.NewEncoder(w).Encode(tc.deleteBody)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			var out bytes.Buffer
+			var errb bytes.Buffer
+			app := New(&out, &errb)
+			for _, step := range [][]string{
+				{"init", "--device", "qa-laptop"},
+				{"login", "--origin", server.URL},
+			} {
+				out.Reset()
+				errb.Reset()
+				if code := app.Run(step); code != 0 {
+					t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+				}
+			}
+			out.Reset()
+			errb.Reset()
+			if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "local/asiri/PUSHED", "--yes"}); code == 0 {
+				t.Fatal("remote delete failure mode should fail")
+			}
+			if !strings.Contains(errb.String(), tc.want) {
+				t.Fatalf("error missing %q: %s", tc.want, errb.String())
+			}
+			if tc.deleteCode == 0 && deleteSeen {
+				t.Fatal("missing active secret should not call delete")
+			}
+			if tc.deleteCode != 0 && !deleteSeen {
+				t.Fatal("permission failure should call delete endpoint")
+			}
+		})
+	}
+}
+
+func TestRemoteSecretBulkDeleteOnlyRemoteOnlyUnwrapped(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	deletedIDs := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_bulk_delete",
+				"userCode":                "BDEL-123",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=BDEL-123",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      "at_bulk_delete",
+				"refreshToken":     "rt_bulk_delete",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/secrets/visible":
+			wrapped := true
+			unwrapped := false
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"secrets": []map[string]any{
+					{"id": "sec_candidate_a", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "GHOST_A", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": unwrapped},
+					{"id": "sec_candidate_b", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/prod", "name": "GHOST_B", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": unwrapped},
+					{"id": "sec_wrapped", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/prod", "name": "WRAPPED", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": wrapped},
+					{"id": "sec_stale", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/prod", "name": "STALE", "version": 1, "status": "stale", "canWrite": true, "wrappedToCurrentDevice": unwrapped},
+					{"id": "sec_other", "orgId": "org_other", "workspaceSlug": "other-co", "scope": "other-co/prod", "name": "GHOST", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": unwrapped},
+					{"id": "sec_local", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "LOCAL_COPY", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": unwrapped},
+				},
+			})
+		case "/v1/secrets/sec_candidate_a/delete", "/v1/secrets/sec_candidate_b/delete":
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["createdByDeviceId"] != "dev_oclan" {
+				t.Fatalf("bulk delete used wrong device id: %#v", body)
+			}
+			id := strings.TrimPrefix(strings.TrimSuffix(r.URL.Path, "/delete"), "/v1/secrets/")
+			deletedIDs = append(deletedIDs, id)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": id, "orgId": "org_oclan", "scope": "oclan-co/prod", "name": "GHOST", "version": 1, "status": "deleted",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "oclan-co", "local/asiri/LOCAL_COPY", "--value-file", testSecretFile(t, "secret_value")},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "--remote-only-unwrapped", "--yes"}); code != 0 {
+		t.Fatalf("bulk remote delete failed: %s", errb.String())
+	}
+	sort.Strings(deletedIDs)
+	if got := strings.Join(deletedIDs, ","); got != "sec_candidate_a,sec_candidate_b" {
+		t.Fatalf("bulk delete selected wrong ids: %s", got)
+	}
+	if !strings.Contains(out.String(), "Marked 2 remote-only unwrapped active secret") {
+		t.Fatalf("bulk delete output missing count: %s", out.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.State.Secrets[store.SecretKey("oclan-co/local/asiri", "LOCAL_COPY")]; !ok {
+		t.Fatal("bulk remote delete should not remove local secrets")
+	}
+}
+
+func TestRemoteSecretBulkDeleteConfirmation(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	deleteCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_bulk_confirm",
+				"userCode":                "BCONF-123",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=BCONF-123",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      "at_bulk_confirm",
+				"refreshToken":     "rt_bulk_confirm",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/secrets/visible":
+			unwrapped := false
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"secrets": []map[string]any{
+					{"id": "sec_confirm_bulk", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/prod", "name": "GHOST", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": unwrapped},
+				},
+			})
+		case "/v1/secrets/sec_confirm_bulk/delete":
+			deleteCount++
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "sec_confirm_bulk", "orgId": "org_oclan", "scope": "oclan-co/prod", "name": "GHOST", "version": 1, "status": "deleted",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	app.In = strings.NewReader("delete oclan-co 2\n")
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "--remote-only-unwrapped"}); code == 0 {
+		t.Fatal("bulk remote delete should fail when confirmation does not match")
+	}
+	if !strings.Contains(out.String(), "prod/GHOST") {
+		t.Fatalf("bulk confirmation should print affected paths: %s", out.String())
+	}
+	if !strings.Contains(errb.String(), "confirmation did not match") {
+		t.Fatalf("bulk confirmation mismatch was not clear: %s", errb.String())
+	}
+	if deleteCount != 0 {
+		t.Fatalf("bulk confirmation mismatch should not delete, got %d delete(s)", deleteCount)
+	}
+	app.In = strings.NewReader("delete oclan-co 1\n")
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "--remote-only-unwrapped"}); code != 0 {
+		t.Fatalf("confirmed bulk remote delete failed: %s", errb.String())
+	}
+	if deleteCount != 1 {
+		t.Fatalf("expected one confirmed bulk delete, got %d", deleteCount)
+	}
+}
+
+func TestWorkspaceListAndUseDoesNotBindLocalPrefixBeforePushOrSync(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	switchSeen := false
+	switchBackSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_workspace",
+				"userCode":                "WORK-1234",
+				"verificationUri":         serverURL(r) + "/auth/device",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=WORK-1234",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      "at_oclan",
+				"refreshToken":     "rt_oclan",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/orgs":
+			auth := r.Header.Get("authorization")
+			if auth != "Bearer at_oclan" && auth != "Bearer at_personal" && auth != "Bearer at_oclan2" {
+				t.Fatalf("unexpected org list auth header: %s", auth)
+			}
+			active := "org_oclan"
+			if auth == "Bearer at_personal" {
+				active = "org_personal"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"activeOrgId": active,
+				"organizations": []map[string]any{
+					{"id": "org_oclan", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true},
+					{"id": "org_personal", "name": "Peter Dev", "slug": "peter-dev", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true},
+				},
+			})
+		case "/v1/auth/session/switch":
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["deviceName"] != "qa-laptop" || body["encryptionPublicKey"] == "" || body["signingPublicKey"] == "" {
+				t.Fatalf("unexpected switch body: %#v", body)
+			}
+			switch body["workspace"] {
+			case "peter-dev":
+				switchSeen = true
+				if r.Header.Get("authorization") != "Bearer at_oclan" {
+					t.Fatalf("unexpected switch auth header: %s", r.Header.Get("authorization"))
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"status":           "approved",
+					"orgId":            "org_personal",
+					"workspaceSlug":    "peter-dev",
+					"userId":           "usr_owner",
+					"deviceId":         "dev_personal",
+					"accessToken":      "at_personal",
+					"refreshToken":     "rt_personal",
+					"expiresIn":        3600,
+					"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+				})
+			case "oclan-co":
+				switchBackSeen = true
+				if r.Header.Get("authorization") != "Bearer at_personal" {
+					t.Fatalf("unexpected switch-back auth header: %s", r.Header.Get("authorization"))
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"status":           "approved",
+					"orgId":            "org_oclan",
+					"workspaceSlug":    "oclan-co",
+					"userId":           "usr_owner",
+					"deviceId":         "dev_oclan",
+					"accessToken":      "at_oclan2",
+					"refreshToken":     "rt_oclan2",
+					"expiresIn":        3600,
+					"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+				})
+			default:
+				t.Fatalf("unexpected workspace switch target: %#v", body)
+			}
+		case "/v1/sync/write-options":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"requestedWorkspaceSlug": "oclan-co",
+				"sourceWorkspace": map[string]any{
+					"id":       "org_oclan",
+					"slug":     "oclan-co",
+					"canWrite": true,
+					"paths": []map[string]any{{
+						"fullPath": "oclan-co/local/asiri/API_KEY",
+						"canWrite": true,
+					}},
+				},
+				"activeWorkspace": map[string]any{
+					"id":       "org_personal",
+					"slug":     "peter-dev",
+					"canWrite": false,
+					"paths": []map[string]any{{
+						"fullPath": "peter-dev/local/asiri/API_KEY",
+						"canWrite": false,
+					}},
+				},
+				"writableWorkspaces": []map[string]any{{
+					"id":       "org_oclan",
+					"slug":     "oclan-co",
+					"canWrite": true,
+					"paths": []map[string]any{{
+						"fullPath": "oclan-co/local/asiri/API_KEY",
+						"canWrite": true,
+					}},
+				}},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.RemoteBindingForPrefix("oclan-co"); ok {
+		t.Fatalf("login should not bind local prefix before push or pull: %#v", st.State.RemoteBindings)
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"add", "--workspace", "oclan-co", "peter-dev/local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")}); code == 0 {
+		t.Fatal("visible workspace-prefixed path should fail")
+	}
+	if !strings.Contains(errb.String(), "add accepts short paths") {
+		t.Fatalf("expected short-path guidance for visible workspace prefix, got %s", errb.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"workspace", "list"}); code != 0 {
+		t.Fatalf("workspace list failed: %s", errb.String())
+	}
+	if strings.Contains(out.String(), "ACTIVE") || strings.Contains(out.String(), "PULL") || !strings.Contains(out.String(), "WORKSPACE") || !strings.Contains(out.String(), "THIS DEVICE") || !strings.Contains(out.String(), "ACCOUNT WRITE") || !strings.Contains(out.String(), "oclan-co") || !strings.Contains(out.String(), "owner") || !strings.Contains(out.String(), "trusted") || !strings.Contains(out.String(), "peter-dev") {
+		t.Fatalf("workspace list output missing expected workspaces: %s", out.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"workspace", "use", "peter-dev"}); code == 0 {
+		t.Fatalf("workspace use should be removed")
+	}
+	if switchSeen || !strings.Contains(errb.String(), "--workspace") {
+		t.Fatalf("workspace use should not switch sessions: stdout=%s stderr=%s", out.String(), errb.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"push"}); code == 0 {
+		t.Fatalf("push should require explicit workspace")
+	}
+	if switchBackSeen || !strings.Contains(errb.String(), "push requires --workspace") {
+		t.Fatalf("push block did not explain explicit workspace requirement: %s", errb.String())
+	}
+	st, err = store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.RemoteBindingForPrefix("oclan-co"); ok || st.State.ControlPlane == nil || st.State.ControlPlane.WorkspaceID != "org_oclan" {
+		t.Fatalf("prefix binding or control-plane transport changed unexpectedly: %#v", st.State)
+	}
+}
+
+func TestPushExplainsMissingWorkspaceDeviceTrust(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	switchSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_push_trust",
+				"userCode":                "TRUST-123",
+				"verificationUri":         serverURL(r) + "/auth/device",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=TRUST-123",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      "at_oclan",
+				"refreshToken":     "rt_oclan",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/orgs":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"activeOrgId": "org_oclan",
+				"organizations": []map[string]any{
+					{"id": "org_oclan", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true},
+					{"id": "org_asiri", "name": "Asiri Dev", "slug": "asiri-dev", "ownerUserId": "usr_owner", "role": "owner", "canPull": false, "canWrite": true},
+				},
+			})
+		case "/v1/auth/session/switch":
+			switchSeen = true
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["workspace"] != "org_asiri" {
+				t.Fatalf("unexpected switch target: %#v", body)
+			}
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":   "request_failed",
+				"message": "trusted matching device required; approve this device in the target workspace first",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "asiri-dev", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"push", "--workspace", "asiri-dev", "--yes"}); code == 0 {
+		t.Fatal("push should fail when the target workspace does not trust this device")
+	}
+	if switchSeen {
+		t.Fatal("push should fail before attempting a workspace switch")
+	}
+	for _, expected := range []string{"this device is not trusted for workspace asiri-dev", "device qa-laptop", "asiri device trust --workspace asiri-dev --origin " + server.URL} {
+		if !strings.Contains(errb.String(), expected) {
+			t.Fatalf("push error missing %q: %s", expected, errb.String())
+		}
+	}
+}
+
+func TestDeviceStatusShowsTrustAndKeyCoverage(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_status",
+				"userCode":                "STAT-123",
+				"verificationUri":         serverURL(r) + "/auth/device",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=STAT-123",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      "at_oclan",
+				"refreshToken":     "rt_oclan",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/auth/session/refresh":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      "at_refreshed",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/orgs":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"activeOrgId": "org_oclan",
+				"organizations": []map[string]any{
+					{"id": "org_oclan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan", "canWrite": true, "canApproveDevice": true},
+					{"id": "org_asiri", "slug": "asiri-dev", "ownerUserId": "usr_owner", "role": "owner", "canPull": false, "currentDeviceTrusted": false, "canWrite": true, "canApproveDevice": true},
+					{"id": "org_recall", "slug": "recallstack-com", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_recall", "canWrite": true, "canApproveDevice": true},
+				},
+			})
+		case "/v1/secrets/visible":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"secrets": []map[string]any{
+					{"id": "sec_ready", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local", "name": "READY", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": true},
+					{"id": "sec_needs", "orgId": "org_recall", "workspaceSlug": "recallstack-com", "scope": "recallstack-com/prod", "name": "OLD", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": false},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"device", "status"}); code != 0 {
+		t.Fatalf("device status failed: %s", errb.String())
+	}
+	status := out.String()
+	for _, expected := range []string{"This device: qa-laptop", "WORKSPACE", "THIS DEVICE", "ACCOUNT WRITE", "KEYS", "NEXT", "oclan-co", "ready", "asiri-dev", "not trusted", "asiri device trust --workspace asiri-dev --origin " + server.URL, "recallstack-com", "needs cleanup", "asiri secret delete --workspace recallstack-com --remote-only-unwrapped"} {
+		if !strings.Contains(status, expected) {
+			t.Fatalf("device status output missing %q: %s", expected, status)
+		}
+	}
+}
+
+func TestDeviceTrustAllStartsTargetedApprovals(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	targetedStarts := []string{}
+	restoreSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			workspaceSlug := body["workspaceSlug"]
+			targetedStarts = append(targetedStarts, workspaceSlug)
+			if workspaceSlug == "asiri-dev" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"deviceCode":              "dc_asiri",
+					"userCode":                "ASIR-123",
+					"verificationUri":         serverURL(r) + "/auth/device",
+					"verificationUriComplete": serverURL(r) + "/auth/device?code=ASIR-123",
+					"expiresIn":               30,
+					"interval":                0,
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_login",
+				"userCode":                "LOGN-123",
+				"verificationUri":         serverURL(r) + "/auth/device",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=LOGN-123",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["deviceCode"] == "dc_asiri" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"status":           "approved",
+					"orgId":            "org_asiri",
+					"workspaceSlug":    "asiri-dev",
+					"userId":           "usr_owner",
+					"deviceId":         "dev_asiri",
+					"accessToken":      "at_asiri",
+					"refreshToken":     "rt_asiri",
+					"expiresIn":        3600,
+					"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      "at_oclan",
+				"refreshToken":     "rt_oclan",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/auth/session/refresh":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      "at_refreshed",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/orgs":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"activeOrgId": "org_oclan",
+				"organizations": []map[string]any{
+					{"id": "org_oclan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan", "canWrite": true, "canApproveDevice": true},
+					{"id": "org_asiri", "slug": "asiri-dev", "ownerUserId": "usr_owner", "role": "owner", "canPull": false, "currentDeviceTrusted": false, "canWrite": true, "canApproveDevice": true},
+					{"id": "org_recall", "slug": "recallstack-com", "ownerUserId": "usr_other", "role": "member", "canPull": false, "currentDeviceTrusted": false, "canWrite": true, "canApproveDevice": false},
+				},
+			})
+		case "/v1/auth/session/switch":
+			restoreSeen = true
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["workspace"] != "org_oclan" {
+				t.Fatalf("unexpected restore target: %#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      "at_oclan_restored",
+				"refreshToken":     "rt_oclan_restored",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"device", "trust", "--all"}); code != 0 {
+		t.Fatalf("device trust --all failed: %s", errb.String())
+	}
+	if !reflect.DeepEqual(targetedStarts, []string{"", "asiri-dev"}) {
+		t.Fatalf("unexpected device-code targets: %#v", targetedStarts)
+	}
+	if !restoreSeen {
+		t.Fatal("expected original workspace session to be restored")
+	}
+	output := out.String()
+	for _, expected := range []string{"oclan-co", "trusted", "asiri-dev", "eligible", "recallstack-com", "ask owner to approve", "Trust this device for workspace asiri-dev", "✓ This device is trusted for workspace asiri-dev"} {
+		if !strings.Contains(output, expected) {
+			t.Fatalf("device trust --all output missing %q: %s", expected, output)
+		}
+	}
+}
+
+func TestPullAllPrintsRowsSkipsIneligibleAndRestoresWorkspace(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	switchRecallSeen := false
+	switchAsiriSeen := false
+	restoreSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_pull_all",
+				"userCode":                "PULL-ALL",
+				"verificationUri":         serverURL(r) + "/auth/device",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=PULL-ALL",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      "at_oclan",
+				"refreshToken":     "rt_oclan",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/auth/session/refresh":
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			token := "at_oclan_refreshed"
+			if body["refreshToken"] == "rt_oclan2" {
+				token = "at_oclan_refreshed2"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      token,
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/orgs":
+			auth := r.Header.Get("authorization")
+			if auth != "Bearer at_oclan_refreshed" && auth != "Bearer at_oclan_refreshed2" {
+				t.Fatalf("unexpected org list auth header: %s", auth)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"activeOrgId": "org_oclan",
+				"organizations": []map[string]any{
+					{"id": "org_oclan", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true},
+					{"id": "org_asiri", "name": "Asiri Dev", "slug": "asiri-dev", "ownerUserId": "usr_owner", "role": "owner", "canPull": false, "canWrite": true},
+					{"id": "org_recall", "name": "Recallstack", "slug": "recallstack-com", "ownerUserId": "usr_other", "role": "member", "canPull": true, "canWrite": false},
+				},
+			})
+		case "/v1/auth/session/switch":
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			switch body["workspace"] {
+			case "org_recall":
+				switchRecallSeen = true
+				if r.Header.Get("authorization") != "Bearer at_oclan_refreshed" {
+					t.Fatalf("unexpected recall switch auth header: %s", r.Header.Get("authorization"))
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"status":           "approved",
+					"orgId":            "org_recall",
+					"workspaceSlug":    "recallstack-com",
+					"userId":           "usr_owner",
+					"deviceId":         "dev_recall",
+					"accessToken":      "at_recall",
+					"refreshToken":     "rt_recall",
+					"expiresIn":        3600,
+					"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+				})
+			case "org_asiri":
+				switchAsiriSeen = true
+				t.Fatal("ineligible workspace should not be switched to during pull")
+			case "org_oclan":
+				restoreSeen = true
+				if r.Header.Get("authorization") != "Bearer at_recall" {
+					t.Fatalf("unexpected restore auth header: %s", r.Header.Get("authorization"))
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"status":           "approved",
+					"orgId":            "org_oclan",
+					"workspaceSlug":    "oclan-co",
+					"userId":           "usr_owner",
+					"deviceId":         "dev_oclan",
+					"accessToken":      "at_oclan2",
+					"refreshToken":     "rt_oclan2",
+					"expiresIn":        3600,
+					"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+				})
+			default:
+				t.Fatalf("unexpected switch target: %#v", body)
+			}
+		case "/v1/sync":
+			auth := r.Header.Get("authorization")
+			orgID := r.URL.Query().Get("orgId")
+			deviceID := r.URL.Query().Get("deviceId")
+			if orgID == "org_oclan" {
+				if auth != "Bearer at_oclan_refreshed" || deviceID != "dev_oclan" {
+					t.Fatalf("unexpected active sync request auth=%s query=%s", auth, r.URL.RawQuery)
+				}
+			} else if orgID == "org_recall" {
+				if auth != "Bearer at_recall" || deviceID != "dev_recall" {
+					t.Fatalf("unexpected recall sync request auth=%s query=%s", auth, r.URL.RawQuery)
+				}
+			} else {
+				t.Fatalf("unexpected sync org: %s", orgID)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"orgId":            orgID,
+				"deviceId":         deviceID,
+				"issuedAt":         time.Now().UTC().Format(time.RFC3339),
+				"encryptedSecrets": []map[string]any{},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"pull"}); code != 0 {
+		t.Fatalf("pull failed with code %d stderr=%s stdout=%s", code, errb.String(), out.String())
+	}
+	allOutput := out.String()
+	for _, expected := range []string{"WORKSPACE", "oclan-co", "pulled", "asiri-dev", "skipped", "this device is not trusted for this workspace", "recallstack-com"} {
+		if !strings.Contains(allOutput, expected) {
+			t.Fatalf("pull output missing %q: %s", expected, allOutput)
+		}
+	}
+	if !switchRecallSeen || switchAsiriSeen || restoreSeen {
+		t.Fatalf("unexpected switch behavior: recall=%v asiri=%v restore=%v", switchRecallSeen, switchAsiriSeen, restoreSeen)
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"pull", "--workspace", "asiri-dev"}); code != 0 {
+		t.Fatalf("explicit ineligible pull should exit zero, stderr=%s stdout=%s", errb.String(), out.String())
+	}
+	if !strings.Contains(out.String(), "asiri-dev") || !strings.Contains(out.String(), "failed") {
+		t.Fatalf("explicit ineligible pull output unexpected: %s", out.String())
+	}
+}
+
+func TestRunDirectAsiriRefUsesCommandBasenamePolicy(t *testing.T) {
+	tmp := t.TempDir()
+	oldHome := os.Getenv("ASIRI_HOME")
+	oldPath := os.Getenv("PATH")
+	t.Cleanup(func() {
+		_ = os.Setenv("ASIRI_HOME", oldHome)
+		_ = os.Setenv("PATH", oldPath)
+	})
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	marker := filepath.Join(tmp, "ran")
+	wranglerPath := binDir + "/wrangler"
+	if err := os.WriteFile(wranglerPath, []byte("#!/bin/sh\nif [ \"$3\" != \"cf_prod_token\" ]; then echo bad-token >&2; exit 7; fi\ntouch \""+marker+"\"\necho unsafe-argv-ok\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	helpToolPath := binDir + "/help-tool"
+	if err := os.WriteFile(helpToolPath, []byte("#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then echo child-help-ok; exit 0; fi\necho missing-help >&2; exit 9\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("PATH", binDir+string(os.PathListSeparator)+oldPath); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	steps := [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "qa", "cloudflare/prod-token", "--value-file", testSecretFile(t, "cf_prod_token")},
+		{"grant", "--workspace", "qa", "wrangler", "cloudflare/prod-token", "--inject-only"},
+	}
+	for _, step := range steps {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"run", "wrangler", "deploy", "--token", "asiri://cloudflare/prod-token"}); code == 0 {
+		t.Fatalf("expected missing workspace denial, stdout=%s", out.String())
+	}
+	if !strings.Contains(errb.String(), "requires --workspace") {
+		t.Fatalf("missing clear workspace denial stderr: %s", errb.String())
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("denied direct run executed child command; marker err=%v", err)
+	}
+	if strings.Contains(out.String(), "cf_prod_token") || strings.Contains(errb.String(), "cf_prod_token") {
+		t.Fatalf("denial leaked secret stdout=%q stderr=%q", out.String(), errb.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"run", "--workspace", "qa", "wrangler", "deploy", "--token", "asiri://cloudflare/prod-token"}); code == 0 {
+		t.Fatalf("expected explicit mode denial, stdout=%s", out.String())
+	}
+	if !strings.Contains(errb.String(), "argument substitution is disabled") {
+		t.Fatalf("missing clear substitution denial stderr: %s", errb.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"run", "--workspace", "qa", "--unsafe-argv", "help-tool", "--help"}); code != 0 {
+		t.Fatalf("expected unsafe argv child --help to pass through, stderr=%s", errb.String())
+	}
+	if !strings.Contains(out.String(), "child-help-ok") {
+		t.Fatalf("unsafe argv child --help was not executed: stdout=%s stderr=%s", out.String(), errb.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"run", "--workspace", "qa", "--unsafe-argv", "asiri://cloudflare/prod-token"}); code == 0 {
+		t.Fatalf("expected command-name substitution denial, stdout=%s", out.String())
+	}
+	if !strings.Contains(errb.String(), "not allowed in the command name") {
+		t.Fatalf("missing command-name denial stderr: %s", errb.String())
+	}
+	if strings.Contains(out.String(), "cf_prod_token") || strings.Contains(errb.String(), "cf_prod_token") {
+		t.Fatalf("command-name denial leaked secret stdout=%q stderr=%q", out.String(), errb.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"run", "--workspace", "qa", "--unsafe-argv", "wrangler", "deploy", "--token", "asiri://cloudflare/prod-token"}); code != 0 {
+		t.Fatalf("expected unsafe argv substitution to run, stderr=%s", errb.String())
+	}
+	if !strings.Contains(out.String(), "unsafe-argv-ok") {
+		t.Fatalf("unsafe argv command did not run: stdout=%s", out.String())
+	}
+	if strings.Contains(out.String(), "cf_prod_token") || strings.Contains(errb.String(), "cf_prod_token") {
+		t.Fatalf("unsafe argv leaked secret through asiri output stdout=%q stderr=%q", out.String(), errb.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"audit", "tail", "--limit", "5"}); code != 0 {
+		t.Fatalf("audit failed: %s", errb.String())
+	}
+	if !strings.Contains(out.String(), "secret_unsafe_argv_injected") || !strings.Contains(out.String(), "unsafe argv materialization") {
+		t.Fatalf("audit missing unsafe argv event: %s", out.String())
+	}
+}
+
+func TestRunExplicitEnvMappingUsesCommandBasenamePolicy(t *testing.T) {
+	tmp := t.TempDir()
+	oldHome := os.Getenv("ASIRI_HOME")
+	oldPath := os.Getenv("PATH")
+	t.Cleanup(func() {
+		_ = os.Setenv("ASIRI_HOME", oldHome)
+		_ = os.Setenv("PATH", oldPath)
+	})
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	wranglerPath := binDir + "/wrangler"
+	if err := os.WriteFile(wranglerPath, []byte("#!/bin/sh\ntest \"$WRANGLER_SECRET\" = env_secret\necho explicit-env-ok\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("PATH", binDir+string(os.PathListSeparator)+oldPath); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	steps := [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")},
+		{"grant", "--workspace", "qa", "wrangler", "cloudflare/WRANGLER_SECRET", "--inject-only"},
+		{"run", "--workspace", "qa", "--env", "WRANGLER_SECRET=cloudflare/WRANGLER_SECRET", "--", "wrangler", "deploy"},
+	}
+	for _, step := range steps {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	if !strings.Contains(out.String(), "explicit-env-ok") {
+		t.Fatalf("explicit env mapping did not execute fake wrangler: stdout=%s", out.String())
+	}
+	if strings.Contains(out.String(), "env_secret") || strings.Contains(errb.String(), "env_secret") {
+		t.Fatalf("asiri output leaked injected secret stdout=%q stderr=%q", out.String(), errb.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"audit", "tail", "--limit", "5"}); code != 0 {
+		t.Fatalf("audit failed: %s", errb.String())
+	}
+	if !strings.Contains(out.String(), "wrangler") || !strings.Contains(out.String(), "secret_injected") {
+		t.Fatalf("audit missing explicit env mapping injection event: %s", out.String())
+	}
+}
+
+func TestRuntimeAuditSyncReportsRuntimeLabelMetadata(t *testing.T) {
+	tmp := t.TempDir()
+	oldHome := os.Getenv("ASIRI_HOME")
+	oldPath := os.Getenv("PATH")
+	t.Cleanup(func() {
+		_ = os.Setenv("ASIRI_HOME", oldHome)
+		_ = os.Setenv("PATH", oldPath)
+	})
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	marker := filepath.Join(tmp, "ran")
+	wranglerPath := filepath.Join(binDir, "wrangler")
+	if err := os.WriteFile(wranglerPath, []byte(fmt.Sprintf("#!/bin/sh\ntest \"$WRANGLER_SECRET\" = env_secret\ntouch %q\necho runtime-sync-ok\n", marker)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("PATH", binDir+string(os.PathListSeparator)+oldPath); err != nil {
+		t.Fatal(err)
+	}
+
+	var uploaded []runtimeAuditBatchRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/auth/session/refresh":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_runtime",
+				"workspaceSlug":    "runtime-ws",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_remote",
+				"accessToken":      "at_refreshed",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/audit/batch":
+			if r.Header.Get("authorization") != "Bearer at_runtime" {
+				t.Fatalf("unexpected audit auth header: %s", r.Header.Get("authorization"))
+			}
+			var batch runtimeAuditBatchRequest
+			if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+				t.Fatal(err)
+			}
+			uploaded = append(uploaded, batch)
+			w.WriteHeader(http.StatusCreated)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")},
+		{"grant", "--workspace", "qa", "wrangler", "cloudflare/WRANGLER_SECRET", "--inject-only"},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkControlPlaneForDevice(server.URL, "org_runtime", "runtime-ws", "usr_owner", "dev_remote", device.ID, "at_runtime", "rt_runtime", 3600, time.Now().UTC().Add(7*24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	st.State.RemoteBindings["qa"] = asiri.RemoteWorkspaceBinding{WorkspaceID: "org_runtime", WorkspaceSlug: "runtime-ws", BoundAt: time.Now().UTC()}
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"run", "--workspace", "qa", "--env", "WRANGLER_SECRET=cloudflare/WRANGLER_SECRET", "--", "wrangler", "deploy"}); code != 0 {
+		t.Fatalf("runtime command failed: %s", errb.String())
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("runtime command marker missing: %v", err)
+	}
+	if len(uploaded) != 1 || len(uploaded[0].Events) != 1 {
+		t.Fatalf("expected one uploaded runtime audit event, got %#v", uploaded)
+	}
+	event := uploaded[0].Events[0]
+	if event.OrgID != "org_runtime" || event.Action != "secret_injected" || event.Result != "allowed" {
+		t.Fatalf("unexpected uploaded event: %#v", event)
+	}
+	if event.Metadata["runtimeLabel"] != "wrangler" || event.Metadata["runtimeLabelType"] != "process" || event.Metadata["workspaceId"] != "org_runtime" || event.Metadata["workspaceSlug"] != "runtime-ws" || event.Metadata["localAuditId"] == "" || event.Metadata["reportedCreatedAt"] == "" {
+		t.Fatalf("runtime label metadata missing: %#v", event.Metadata)
+	}
+	raw, err := json.Marshal(uploaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "env_secret") {
+		t.Fatalf("uploaded audit leaked secret value: %s", string(raw))
+	}
+	st, err = store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	synced := false
+	for _, item := range st.State.Audit {
+		if item.Action == "secret_injected" && item.Metadata["runtimeLabel"] == "wrangler" {
+			synced = item.RemoteSyncedAt != nil
+			break
+		}
+	}
+	if !synced {
+		t.Fatalf("local runtime audit event was not marked synced")
+	}
+}
+
+func TestRuntimeAuditSyncFailureDoesNotBlockLocalUse(t *testing.T) {
+	tmp := t.TempDir()
+	oldHome := os.Getenv("ASIRI_HOME")
+	oldPath := os.Getenv("PATH")
+	oldAuditSyncTimeout := runtimeAuditSyncTimeout
+	t.Cleanup(func() {
+		_ = os.Setenv("ASIRI_HOME", oldHome)
+		_ = os.Setenv("PATH", oldPath)
+		runtimeAuditSyncTimeout = oldAuditSyncTimeout
+	})
+	runtimeAuditSyncTimeout = 25 * time.Millisecond
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	marker := filepath.Join(tmp, "ran")
+	wranglerPath := filepath.Join(binDir, "wrangler")
+	if err := os.WriteFile(wranglerPath, []byte(fmt.Sprintf("#!/bin/sh\ntest \"$WRANGLER_SECRET\" = env_secret\ntouch %q\necho runtime-offline-ok\n", marker)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("PATH", binDir+string(os.PathListSeparator)+oldPath); err != nil {
+		t.Fatal(err)
+	}
+
+	auditAttempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/auth/session/refresh":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_runtime",
+				"workspaceSlug":    "runtime-ws",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_remote",
+				"accessToken":      "at_refreshed",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/audit/batch":
+			auditAttempts++
+			time.Sleep(150 * time.Millisecond)
+			http.Error(w, "offline", http.StatusServiceUnavailable)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")},
+		{"grant", "--workspace", "qa", "wrangler", "cloudflare/WRANGLER_SECRET", "--inject-only"},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkControlPlaneForDevice(server.URL, "org_runtime", "runtime-ws", "usr_owner", "dev_remote", device.ID, "at_runtime", "rt_runtime", 3600, time.Now().UTC().Add(7*24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	st.State.RemoteBindings["qa"] = asiri.RemoteWorkspaceBinding{WorkspaceID: "org_runtime", WorkspaceSlug: "runtime-ws", BoundAt: time.Now().UTC()}
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"run", "--workspace", "qa", "--env", "WRANGLER_SECRET=cloudflare/WRANGLER_SECRET", "--", "wrangler", "deploy"}); code != 0 {
+		t.Fatalf("runtime command should ignore audit upload failure: %s", errb.String())
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("runtime command marker missing: %v", err)
+	}
+	if auditAttempts == 0 {
+		t.Fatalf("expected an audit upload attempt")
+	}
+	st, err = store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	startedAt := time.Now()
+	app.syncRuntimeAuditBestEffort(st)
+	if elapsed := time.Since(startedAt); elapsed > 250*time.Millisecond {
+		t.Fatalf("audit sync timeout was not bounded: %s", elapsed)
+	}
+	foundPending := false
+	for _, item := range st.State.Audit {
+		if item.Action == "secret_injected" && item.Metadata["runtimeLabel"] == "wrangler" {
+			foundPending = item.RemoteSyncedAt == nil
+			break
+		}
+	}
+	if !foundPending {
+		t.Fatalf("failed upload should leave runtime audit event pending")
+	}
+}
+
+func TestPendingRuntimeAuditEventsStayInOriginalWorkspace(t *testing.T) {
+	createdAt := time.Now().UTC()
+	st := &store.FileStore{State: asiri.State{
+		ControlPlane: &asiri.ControlPlaneLink{
+			WorkspaceID:   "org_two",
+			WorkspaceSlug: "two",
+		},
+		RemoteBindings: map[string]asiri.RemoteWorkspaceBinding{
+			"one": {WorkspaceID: "org_one", WorkspaceSlug: "one", BoundAt: createdAt},
+		},
+	}}
+	metadata := runtimeAuditMetadata(st, "one/cloudflare", "wrangler", "process", nil)
+	if metadata["workspaceId"] != "org_one" || metadata["workspaceSlug"] != "one" {
+		t.Fatalf("runtime audit metadata should use bound scope workspace: %#v", metadata)
+	}
+	st.State.Audit = []asiri.AuditEvent{
+		{
+			ID:             "aud_one",
+			Actor:          "wrangler",
+			Action:         "secret_injected",
+			Result:         "allowed",
+			Scope:          "one/cloudflare",
+			SecretNameHash: "hash_one",
+			Reason:         "explicit env mapping",
+			Metadata:       metadata,
+			CreatedAt:      createdAt,
+		},
+		{
+			ID:             "aud_legacy",
+			Actor:          "wrangler",
+			Action:         "secret_injected",
+			Result:         "allowed",
+			Scope:          "one/cloudflare",
+			SecretNameHash: "hash_legacy",
+			Reason:         "explicit env mapping",
+			Metadata: map[string]string{
+				"runtimeLabel":     "wrangler",
+				"runtimeLabelType": "process",
+			},
+			CreatedAt: createdAt,
+		},
+	}
+
+	ids, events := pendingRuntimeAuditEvents(st)
+	if len(ids) != 0 || len(events) != 0 {
+		t.Fatalf("event from original workspace should not upload while linked to another workspace: ids=%#v events=%#v", ids, events)
+	}
+
+	st.State.ControlPlane.WorkspaceID = "org_one"
+	st.State.ControlPlane.WorkspaceSlug = "one"
+	ids, events = pendingRuntimeAuditEvents(st)
+	if len(ids) != 1 || ids[0] != "aud_one" || len(events) != 1 {
+		t.Fatalf("expected only explicitly attributed original workspace event to become uploadable: ids=%#v events=%#v", ids, events)
+	}
+	if events[0].OrgID != "org_one" || events[0].Metadata["workspaceId"] != "org_one" || events[0].Metadata["workspaceSlug"] != "one" {
+		t.Fatalf("uploaded event should keep original workspace attribution: %#v", events[0])
+	}
+}
+
+func TestRunExplicitEnvMappingDeniesMissingDerivedCommandGrant(t *testing.T) {
+	tmp := t.TempDir()
+	oldHome := os.Getenv("ASIRI_HOME")
+	oldPath := os.Getenv("PATH")
+	t.Cleanup(func() {
+		_ = os.Setenv("ASIRI_HOME", oldHome)
+		_ = os.Setenv("PATH", oldPath)
+	})
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	marker := filepath.Join(tmp, "ran")
+	wranglerPath := binDir + "/wrangler"
+	if err := os.WriteFile(wranglerPath, []byte("#!/bin/sh\ntouch \""+marker+"\"\necho should-not-run\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("PATH", binDir+string(os.PathListSeparator)+oldPath); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"run", "--workspace", "qa", "--env", "WRANGLER_SECRET=cloudflare/WRANGLER_SECRET", "--", "wrangler", "deploy"}); code == 0 {
+		t.Fatalf("expected explicit env mapping denial, stdout=%s", out.String())
+	}
+	if !strings.Contains(errb.String(), "wrangler cannot inject qa/cloudflare/WRANGLER_SECRET") {
+		t.Fatalf("missing clear denial stderr: %s", errb.String())
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("denied explicit env mapping executed child command; marker err=%v", err)
+	}
+	if strings.Contains(out.String(), "env_secret") || strings.Contains(errb.String(), "env_secret") {
+		t.Fatalf("denial leaked secret stdout=%q stderr=%q", out.String(), errb.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"audit", "tail", "--limit", "5"}); code != 0 {
+		t.Fatalf("audit failed: %s", errb.String())
+	}
+	if !strings.Contains(out.String(), "wrangler") || !strings.Contains(out.String(), "secret_injected") || !strings.Contains(out.String(), "denied") {
+		t.Fatalf("audit missing explicit env mapping denial event: %s", out.String())
+	}
+}
+
+func TestRunDirectAsiriRefSupportsExplicitAgentAndEmbeddedRefs(t *testing.T) {
+	tmp := t.TempDir()
+	oldHome := os.Getenv("ASIRI_HOME")
+	oldPath := os.Getenv("PATH")
+	t.Cleanup(func() {
+		_ = os.Setenv("ASIRI_HOME", oldHome)
+		_ = os.Setenv("PATH", oldPath)
+	})
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	marker := filepath.Join(tmp, "ran")
+	toolPath := binDir + "/custom-tool"
+	if err := os.WriteFile(toolPath, []byte("#!/bin/sh\nif [ \"$1\" != \"token=embedded_token\" ]; then echo bad-token >&2; exit 7; fi\ntouch \""+marker+"\"\necho embedded-unsafe-ok\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("PATH", binDir+string(os.PathListSeparator)+oldPath); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	steps := [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "org", "team/cloudflare/prod-token", "--value-file", testSecretFile(t, "embedded_token")},
+		{"grant", "--workspace", "org", "release-bot", "team/cloudflare/prod-token", "--inject-only"},
+	}
+	for _, step := range steps {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"run", "--agent", "release-bot", "custom-tool", "token=asiri://team/cloudflare/prod-token"}); code == 0 {
+		t.Fatalf("expected missing workspace denial, stdout=%s", out.String())
+	}
+	if !strings.Contains(errb.String(), "requires --workspace") {
+		t.Fatalf("missing clear workspace denial stderr: %s", errb.String())
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("denied direct run executed child command; marker err=%v", err)
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"run", "--workspace", "org", "--agent", "release-bot", "custom-tool", "token=asiri://team/cloudflare/prod-token"}); code == 0 {
+		t.Fatalf("expected explicit mode denial, stdout=%s", out.String())
+	}
+	if !strings.Contains(errb.String(), "argument substitution is disabled") {
+		t.Fatalf("missing clear substitution denial stderr: %s", errb.String())
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("denied direct run executed child command; marker err=%v", err)
+	}
+	if strings.Contains(out.String(), "embedded_token") || strings.Contains(errb.String(), "embedded_token") {
+		t.Fatalf("denial leaked secret stdout=%q stderr=%q", out.String(), errb.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"run", "--workspace", "org", "--agent", "release-bot", "--unsafe-argv", "custom-tool", "token=asiri://team/cloudflare/prod-token"}); code != 0 {
+		t.Fatalf("expected unsafe argv substitution to run, stderr=%s", errb.String())
+	}
+	if !strings.Contains(out.String(), "embedded-unsafe-ok") {
+		t.Fatalf("unsafe argv command did not run: stdout=%s", out.String())
+	}
+	if strings.Contains(out.String(), "embedded_token") || strings.Contains(errb.String(), "embedded_token") {
+		t.Fatalf("unsafe argv leaked secret through asiri output stdout=%q stderr=%q", out.String(), errb.String())
+	}
+}
+
+func TestRunDirectAsiriRefDeniesMissingGrantBeforeExecuting(t *testing.T) {
+	tmp := t.TempDir()
+	oldHome := os.Getenv("ASIRI_HOME")
+	oldPath := os.Getenv("PATH")
+	t.Cleanup(func() {
+		_ = os.Setenv("ASIRI_HOME", oldHome)
+		_ = os.Setenv("PATH", oldPath)
+	})
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	marker := tmp + "/ran"
+	wranglerPath := binDir + "/wrangler"
+	if err := os.WriteFile(wranglerPath, []byte("#!/bin/sh\ntouch \""+marker+"\"\necho should-not-run\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("PATH", binDir+string(os.PathListSeparator)+oldPath); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "qa", "cloudflare/prod-token", "--value-file", testSecretFile(t, "cf_prod_token")},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"run", "--workspace", "qa", "--unsafe-argv", "wrangler", "deploy", "--token", "asiri://cloudflare/prod-token"}); code == 0 {
+		t.Fatalf("expected direct run denial, stdout=%s", out.String())
+	}
+	if !strings.Contains(errb.String(), "wrangler cannot inject qa/cloudflare/prod-token") {
+		t.Fatalf("missing clear denial stderr: %s", errb.String())
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("denied direct run executed child command; marker err=%v", err)
+	}
+	if strings.Contains(out.String(), "cf_prod_token") || strings.Contains(errb.String(), "cf_prod_token") {
+		t.Fatalf("denial leaked secret stdout=%q stderr=%q", out.String(), errb.String())
+	}
+}
+
+func TestEnvSingleSecretExport(t *testing.T) {
+	tmp := t.TempDir()
+	oldHome := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", oldHome) })
+	_ = os.Setenv("ASIRI_HOME", tmp)
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")},
+		{"grant", "--workspace", "qa", "sh", "cloudflare/WRANGLER_SECRET", "--inject-only"},
+		{"env", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--", "sh", "-c", "test \"$WRANGLER_SECRET\" = env_secret"},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed code=%d stderr=%s", step, code, errb.String())
+		}
+	}
+	if strings.Contains(out.String(), "env_secret") || strings.Contains(errb.String(), "env_secret") {
+		t.Fatalf("env leaked secret stdout=%q stderr=%q", out.String(), errb.String())
+	}
+}
+
+func TestEnvDirectScopeExport(t *testing.T) {
+	tmp := t.TempDir()
+	oldHome := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", oldHome) })
+	_ = os.Setenv("ASIRI_HOME", tmp)
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	steps := [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")},
+		{"add", "--workspace", "qa", "cloudflare/CLOUDFLARE_ACCOUNT_ID", "--value-file", testSecretFile(t, "acct_123")},
+		{"add", "--workspace", "qa", "cloudflare/nested/IGNORED", "--value-file", testSecretFile(t, "ignored")},
+		{"grant", "--workspace", "qa", "sh", "cloudflare/WRANGLER_SECRET", "--inject-only"},
+		{"grant", "--workspace", "qa", "sh", "cloudflare/CLOUDFLARE_ACCOUNT_ID", "--inject-only"},
+		{"env", "--workspace", "qa", "cloudflare", "--", "sh", "-c", "test \"$WRANGLER_SECRET\" = env_secret && test \"$CLOUDFLARE_ACCOUNT_ID\" = acct_123 && test -z \"${IGNORED:-}\""},
+	}
+	for _, step := range steps {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed code=%d stderr=%s", step, code, errb.String())
+		}
+	}
+}
+
+func TestEnvInvalidNameAndMissingGrantDoNotExecute(t *testing.T) {
+	tmp := t.TempDir()
+	oldHome := os.Getenv("ASIRI_HOME")
+	oldPath := os.Getenv("PATH")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", oldHome); _ = os.Setenv("PATH", oldPath) })
+	_ = os.Setenv("ASIRI_HOME", tmp)
+	binDir := t.TempDir()
+	marker := filepath.Join(tmp, "ran")
+	tool := filepath.Join(binDir, "tool")
+	if err := os.WriteFile(tool, []byte("#!/bin/sh\ntouch '"+marker+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Setenv("PATH", binDir+string(os.PathListSeparator)+oldPath)
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	setup := [][]string{{"init", "--device", "qa-laptop"}, {"add", "--workspace", "qa", "cloudflare/BAD-NAME", "--value-file", testSecretFile(t, "bad_secret")}, {"grant", "--workspace", "qa", "tool", "cloudflare/BAD-NAME", "--inject-only"}, {"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")}}
+	for _, step := range setup {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed code=%d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"env", "--workspace", "qa", "cloudflare/BAD-NAME", "--", "tool"}); code == 0 {
+		t.Fatal("expected invalid env name failure")
+	}
+	if !strings.Contains(errb.String(), "not a valid environment variable") {
+		t.Fatalf("unexpected invalid-name stderr=%s", errb.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"env", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--", "tool"}); code == 0 {
+		t.Fatal("expected missing grant failure")
+	}
+	if !strings.Contains(errb.String(), "tool cannot inject qa/cloudflare/WRANGLER_SECRET") {
+		t.Fatalf("unexpected missing-grant stderr=%s", errb.String())
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("child executed despite env preflight failure: %v", err)
+	}
+	if strings.Contains(out.String(), "env_secret") || strings.Contains(errb.String(), "env_secret") {
+		t.Fatalf("env failure leaked secret stdout=%q stderr=%q", out.String(), errb.String())
+	}
+}
+
+func TestMountSingleSecretFileAndCleanup(t *testing.T) {
+	tmp := t.TempDir()
+	oldHome := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", oldHome) })
+	_ = os.Setenv("ASIRI_HOME", tmp)
+	mountDir := filepath.Join(tmp, "secrets")
+	modeFile := filepath.Join(tmp, "mode")
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	steps := [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "mounted_secret")},
+		{"grant", "--workspace", "qa", "sh", "cloudflare/WRANGLER_SECRET", "--mount"},
+		{"mount", "--workspace", "qa", "--dir", mountDir, "cloudflare/WRANGLER_SECRET", "--", "sh", "-c", "test \"$(cat \"$ASIRI_SECRETS_DIR/WRANGLER_SECRET\")\" = mounted_secret && (stat -c %a \"$ASIRI_SECRETS_DIR/WRANGLER_SECRET\" 2>/dev/null || stat -f %Lp \"$ASIRI_SECRETS_DIR/WRANGLER_SECRET\") > '" + modeFile + "'"},
+	}
+	for _, step := range steps {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed code=%d stderr=%s", step, code, errb.String())
+		}
+	}
+	if b, err := os.ReadFile(modeFile); err != nil || strings.TrimSpace(string(b)) != "600" {
+		t.Fatalf("expected mode 600, got %q err=%v", string(b), err)
+	}
+	if _, err := os.Stat(filepath.Join(mountDir, "WRANGLER_SECRET")); !os.IsNotExist(err) {
+		t.Fatalf("mount file not cleaned up: %v", err)
+	}
+	if strings.Contains(out.String(), "mounted_secret") || strings.Contains(errb.String(), "mounted_secret") {
+		t.Fatalf("mount leaked secret stdout=%q stderr=%q", out.String(), errb.String())
+	}
+}
+
+func TestMountChildDirArgumentDoesNotChangeMountDirectory(t *testing.T) {
+	tmp := t.TempDir()
+	oldHome := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", oldHome) })
+	_ = os.Setenv("ASIRI_HOME", tmp)
+	childDir := filepath.Join(tmp, "child-dir")
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	steps := [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "mounted_secret")},
+		{"grant", "--workspace", "qa", "sh", "cloudflare/WRANGLER_SECRET", "--mount"},
+		{"mount", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--", "sh", "-c", "test \"$ASIRI_SECRETS_DIR\" != \"$1\" && test \"$(cat \"$ASIRI_SECRETS_DIR/WRANGLER_SECRET\")\" = mounted_secret", "sh", childDir, "--dir", childDir},
+	}
+	for _, step := range steps {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed code=%d stderr=%s", step, code, errb.String())
+		}
+	}
+	if _, err := os.Stat(filepath.Join(childDir, "WRANGLER_SECRET")); !os.IsNotExist(err) {
+		t.Fatalf("child --dir argument was used as mount directory: %v", err)
+	}
+}
+
+func TestMountDirectScopeFiles(t *testing.T) {
+	tmp := t.TempDir()
+	oldHome := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", oldHome) })
+	_ = os.Setenv("ASIRI_HOME", tmp)
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	steps := [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "mounted_secret")},
+		{"add", "--workspace", "qa", "cloudflare/CLOUDFLARE_ACCOUNT_ID", "--value-file", testSecretFile(t, "acct_123")},
+		{"grant", "--workspace", "qa", "sh", "cloudflare/WRANGLER_SECRET", "--mount"},
+		{"grant", "--workspace", "qa", "sh", "cloudflare/CLOUDFLARE_ACCOUNT_ID", "--mount"},
+		{"mount", "--workspace", "qa", "cloudflare", "--", "sh", "-c", "test \"$(cat \"$ASIRI_SECRETS_DIR/WRANGLER_SECRET\")\" = mounted_secret && test \"$(cat \"$ASIRI_SECRETS_DIR/CLOUDFLARE_ACCOUNT_ID\")\" = acct_123"},
+	}
+	for _, step := range steps {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed code=%d stderr=%s", step, code, errb.String())
+		}
+	}
+}
+
+func TestMountMissingGrantAndUnsafeDestinationDoNotExecute(t *testing.T) {
+	tmp := t.TempDir()
+	oldHome := os.Getenv("ASIRI_HOME")
+	oldPath := os.Getenv("PATH")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", oldHome); _ = os.Setenv("PATH", oldPath) })
+	_ = os.Setenv("ASIRI_HOME", tmp)
+	binDir := t.TempDir()
+	marker := filepath.Join(tmp, "ran")
+	tool := filepath.Join(binDir, "tool")
+	if err := os.WriteFile(tool, []byte("#!/bin/sh\ntouch '"+marker+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Setenv("PATH", binDir+string(os.PathListSeparator)+oldPath)
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{{"init", "--device", "qa-laptop"}, {"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "mounted_secret")}} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed code=%d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"mount", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--", "tool"}); code == 0 {
+		t.Fatal("expected missing mount grant failure")
+	}
+	if !strings.Contains(errb.String(), "tool cannot mount qa/cloudflare/WRANGLER_SECRET") {
+		t.Fatalf("unexpected missing-grant stderr=%s", errb.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"grant", "--workspace", "qa", "tool", "cloudflare/WRANGLER_SECRET", "--mount"}); code != 0 {
+		t.Fatalf("grant failed: %s", errb.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"mount", "--workspace", "qa", "cloudflare/WRANGLER_SECRET:../bad", "--", "tool"}); code == 0 {
+		t.Fatal("expected unsafe destination failure")
+	}
+	if !strings.Contains(errb.String(), "path traversal") {
+		t.Fatalf("unexpected unsafe-dest stderr=%s", errb.String())
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("child executed despite mount preflight failure: %v", err)
+	}
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}

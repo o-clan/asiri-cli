@@ -1,0 +1,5346 @@
+package cli
+
+import (
+	"bufio"
+	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"text/tabwriter"
+	"time"
+
+	"github.com/o-clan/asiri/cli/internal/asiri"
+	"github.com/o-clan/asiri/cli/internal/broker"
+	"github.com/o-clan/asiri/cli/internal/keystore"
+	"github.com/o-clan/asiri/cli/internal/store"
+	"golang.org/x/term"
+)
+
+type App struct {
+	Out io.Writer
+	Err io.Writer
+	In  io.Reader
+}
+
+var Version = "0.1.12"
+
+var defaultControlPlaneOrigin = "http://127.0.0.1:4173"
+
+var envNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+var asiriRefPattern = regexp.MustCompile(`asiri://[A-Za-z0-9][A-Za-z0-9/_-]{1,96}/[A-Za-z0-9][A-Za-z0-9_.-]{1,96}`)
+
+func New(out, err io.Writer) App {
+	return App{Out: out, Err: err, In: os.Stdin}
+}
+
+func (a App) Run(args []string) int {
+	if len(args) == 0 || args[0] == "--help" || args[0] == "help" {
+		if len(args) > 1 && args[0] == "help" {
+			return a.helpFor(args[1:])
+		}
+		a.help()
+		return 0
+	}
+	if commandHelpRequested(args) {
+		return a.helpFor(commandHelpPath(args))
+	}
+	if args[0] == "--version" || args[0] == "version" {
+		fmt.Fprintf(a.Out, "asiri %s\n", Version)
+		return 0
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		return a.fail(err)
+	}
+	cmd := args[0]
+	args = args[1:]
+	switch cmd {
+	case "init":
+		return a.initLocal(st, args)
+	case "login":
+		return a.login(st, args)
+	case "logout":
+		return a.logout(st, args)
+	case "whoami":
+		return a.whoami(st, args)
+	case "workspace":
+		return a.workspace(st, args)
+	case "workload":
+		return a.workload(st, args)
+	case "push":
+		return a.push(st, args)
+	case "pull":
+		return a.pull(st, args)
+	case "rewrap":
+		return a.rewrap(st, args)
+	case "rekey":
+		return a.rekey(st, args)
+	case "recovery":
+		return a.recovery(st, args)
+	case "device":
+		return a.device(st, args)
+	case "secret":
+		return a.secret(st, args)
+	case "local":
+		return a.local(st, args)
+	case "add":
+		return a.add(st, args)
+	case "get":
+		return a.get(st, args)
+	case "list":
+		return a.list(st, args)
+	case "rotate":
+		return a.rotate(st, args)
+	case "rm":
+		return a.remove(st, args)
+	case "grant":
+		return a.grant(st, args)
+	case "deny":
+		return a.deny(st, args)
+	case "policy":
+		return a.policy(st, args)
+	case "run":
+		return a.run(st, args)
+	case "env":
+		return a.env(st, args)
+	case "mount":
+		return a.mount(st, args)
+	case "broker":
+		return a.broker(st, args)
+	case "audit":
+		return a.audit(st, args)
+	case "cache":
+		return a.cache(st, args)
+	default:
+		return a.fail(fmt.Errorf("unknown command %q", cmd))
+	}
+}
+
+func (a App) help() {
+	fmt.Fprintf(a.Out, `Asiri local secrets runtime
+
+Usage:
+  asiri <command> [options]
+
+Commands:
+  init        Create a local encrypted vault and trusted local device.
+  login       Link this device to the hosted control plane.
+  logout      Remove the hosted control-plane session from this device.
+  workspace   List visible control-plane workspaces.
+  workload    Link this device with workload OIDC.
+  push        Upload encrypted local-only secrets to a specified workspace.
+  pull        Pull encrypted remote secrets into the local vault.
+  rewrap      Add missing trusted-device recipients to remote secret versions.
+  rekey       Re-encrypt local secrets with fresh scoped data keys, then push.
+  recovery    Configure or use workspace recovery keys.
+  device      Trust, inspect, list, or revoke devices.
+  secret      Manage remote control-plane secrets.
+  local       Manage local machine state.
+  whoami      Show the signed-in control-plane user.
+  add         Add a local secret from stdin or a value file.
+  get         Read a local secret if policy allows raw read.
+  list        Show local and visible remote secret metadata.
+  rotate      Add a new local version for an existing secret.
+  rm          Mark a local secret as deleted.
+  grant       Allow a subject to use a secret through policy.
+  deny        Deny a subject at a scope.
+  policy      List local policy rules.
+  run         Run a command with injected secrets.
+  env         Run a command with one scope or secret injected.
+  mount       Run a command with temporary secret files.
+  broker      Start the local broker. Example: asiri broker start.
+  audit       Read local audit events.
+  cache       Wipe local Asiri cache and control-plane keys.
+
+Run "asiri <command> --help" for command-specific help.
+
+Secrets are encrypted locally. Device trust is the security boundary; agent and process names are policy labels.
+`)
+}
+
+func commandHelpRequested(args []string) bool {
+	if len(args) < 2 {
+		return false
+	}
+	if args[1] == "--help" || args[1] == "-h" {
+		return true
+	}
+	if args[0] == "run" {
+		return false
+	}
+	for _, arg := range args[2:] {
+		if arg == "--" {
+			return false
+		}
+		if arg == "--help" || arg == "-h" {
+			return true
+		}
+	}
+	return false
+}
+
+func commandHelpPath(args []string) []string {
+	path := []string{args[0]}
+	for _, arg := range args[1:] {
+		if arg == "--" || strings.HasPrefix(arg, "-") {
+			break
+		}
+		path = append(path, arg)
+		if len(path) == 2 {
+			break
+		}
+	}
+	return path
+}
+
+func (a App) helpFor(path []string) int {
+	if len(path) == 0 {
+		a.help()
+		return 0
+	}
+	topic := path[0]
+	if len(path) > 1 {
+		topic += " " + path[1]
+	}
+	switch topic {
+	case "init":
+		fmt.Fprint(a.Out, "Usage: asiri init [--device <device>]\n\nCreates a local encrypted vault and a trusted local device. Local vaults do not have workspace slugs.\n")
+	case "version":
+		fmt.Fprint(a.Out, "Usage: asiri version\n       asiri --version\n\nPrints the CLI version.\n")
+	case "login":
+		fmt.Fprintf(a.Out, "Usage: asiri login [--origin <url>] [--force]\n\nLinks this local device to the control plane. Default origin: %s.\n", defaultControlPlaneOrigin)
+	case "logout":
+		fmt.Fprint(a.Out, "Usage: asiri logout\n\nRevokes the local control-plane session and removes local session tokens.\n")
+	case "whoami":
+		fmt.Fprint(a.Out, "Usage: asiri whoami\n\nShows the signed-in control-plane user, active workspace session, and current local device.\n")
+	case "workspace":
+		fmt.Fprint(a.Out, "Usage: asiri workspace <command>\n\nCommands:\n  list   Show visible workspaces, role, device trust, account write access, and id.\n")
+	case "workspace list":
+		fmt.Fprint(a.Out, "Usage: asiri workspace list\n\nShows visible workspaces as a table. This device controls pull and workspace-scoped push. Account write means the user owns the workspace or has effective secret-write capability.\n")
+	case "workload":
+		fmt.Fprint(a.Out, "Usage: asiri workload <command>\n\nCommands:\n  login   Exchange a platform OIDC token for a short-lived workload session.\n")
+	case "workload login":
+		fmt.Fprintf(a.Out, "Usage: asiri workload login --provider github|generic [--token <jwt>|--token-file <path>] [--audience <aud>] [--origin <url>]\n\nLinks this local device to the control plane as a workload. Default origin: %s.\n", defaultControlPlaneOrigin)
+	case "push":
+		fmt.Fprint(a.Out, "Usage: asiri push --workspace <slug> [--yes]\n\nUploads encrypted local-only secret versions for the specified workspace. The target workspace must trust this device. Use `asiri device trust --workspace <slug>` to approve this device first.\n")
+	case "pull":
+		fmt.Fprint(a.Out, "Usage: asiri pull [--force] [--workspace <slug>...]\n\nPulls encrypted remote secret versions into the local vault. Pull is import-only; it never uploads local-only secrets. Without --workspace, all eligible visible workspaces are pulled and ineligible workspaces are reported as skipped.\n")
+	case "rewrap":
+		fmt.Fprint(a.Out, "Usage: asiri rewrap --workspace <slug>\n\nAdds missing wrapped-key recipients for trusted devices in the specified workspace.\n")
+	case "rekey":
+		fmt.Fprint(a.Out, "Usage: asiri rekey --workspace <slug> [--yes]\n\nRe-encrypts local secrets in the specified workspace with fresh scoped data keys, then pushes the new versions.\n")
+	case "recovery":
+		fmt.Fprint(a.Out, "Usage: asiri recovery <command>\n\nCommands:\n  setup    Create or replace a workspace recovery key.\n  restore  Restore recoverable workspace secrets to this trusted device.\n  status   Show recovery status for visible workspaces.\n")
+	case "recovery setup":
+		fmt.Fprint(a.Out, "Usage: asiri recovery setup --workspace <slug> [--force] [--output-file <path>]\n\nCreates a recovery key for the specified workspace and stores recovery recipient metadata remotely.\n")
+	case "recovery restore":
+		fmt.Fprint(a.Out, "Usage: asiri recovery restore --workspace <slug> --stdin|--key-file <path> [--force]\n\nUses a recovery key to add this trusted device as a recipient for recoverable remote secrets in the specified workspace.\n")
+	case "recovery status":
+		fmt.Fprint(a.Out, "Usage: asiri recovery status [--workspace <slug>...]\n\nShows whether recovery is configured for visible workspaces.\n")
+	case "device":
+		fmt.Fprint(a.Out, "Usage: asiri device <command>\n\nCommands:\n  name    Print the current local device name.\n  enroll  Add a local device record.\n  status  Show current-device trust and key coverage.\n  trust   Trust this device in one or more workspaces.\n  list    Show local or remote devices.\n  revoke  Revoke a local or remote device.\n")
+	case "device name":
+		fmt.Fprint(a.Out, "Usage: asiri device name\n\nPrints the current local device name.\n")
+	case "device enroll":
+		fmt.Fprint(a.Out, "Usage: asiri device enroll --name <device>\n\nCreates a new local device keypair and local trusted-device record.\n")
+	case "device list":
+		fmt.Fprint(a.Out, "Usage: asiri device list [--remote] [--workspace <slug>...]\n\nLists local devices, or remote devices in visible workspaces with --remote.\n")
+	case "device status":
+		fmt.Fprint(a.Out, "Usage: asiri device status [--workspace <slug>...]\n\nShows whether this device is trusted in visible workspaces and whether visible remote secrets are wrapped to it.\n")
+	case "device trust":
+		fmt.Fprint(a.Out, "Usage: asiri device trust --workspace <slug> [--origin <url>]\n       asiri device trust --all\n\nStarts browser approval to trust this device in a workspace. --all walks every visible workspace where this account can approve devices.\n")
+	case "device revoke":
+		fmt.Fprint(a.Out, "Usage: asiri device revoke <device>\n       asiri device revoke --remote --workspace <slug> <device>\n\nRevokes a local device record, or revokes a remote trusted device in the specified workspace.\n")
+	case "secret":
+		fmt.Fprint(a.Out, "Usage: asiri secret <command>\n\nCommands:\n  delete  Mark the active remote secret version as deleted.\n")
+	case "secret delete":
+		fmt.Fprint(a.Out, "Usage: asiri secret delete --workspace <slug> <scope/name> [--yes]\n       asiri secret delete --workspace <slug> --remote-only-unwrapped [--yes]\n\nMarks active remote secret versions as deleted in the control plane. Use short paths without the workspace prefix. --remote-only-unwrapped deletes only active visible remote secrets that are remote-only locally and not wrapped to this device. Without --yes, type the requested confirmation text.\n")
+	case "local":
+		fmt.Fprint(a.Out, "Usage: asiri local <command>\n\nCommands:\n  wipe  Delete local state and platform-stored Asiri keys.\n")
+	case "local wipe":
+		fmt.Fprint(a.Out, "Usage: asiri local wipe [--yes]\n\nDeletes local state and platform-stored Asiri keys for this machine. This never calls remote APIs. Without --yes, type `wipe local` to confirm.\n")
+	case "add":
+		fmt.Fprint(a.Out, "Usage: asiri add --workspace <slug> <scope/name> --stdin|--value-file <path>\n\nAdds a local encrypted secret. Use short paths without the workspace prefix. Values are accepted only through stdin or a file to avoid shell history exposure.\n")
+	case "get":
+		fmt.Fprint(a.Out, "Usage: asiri get --workspace <slug> <scope/name> [--agent <agent>]\n\nReads a local secret when policy allows raw read for the human user or named agent label. Use short paths without the workspace prefix.\n")
+	case "list":
+		fmt.Fprint(a.Out, "Usage: asiri list [filter] [--workspace <slug>...] [--local|--remote] [--status <status>]\n\nShows secret metadata only. Values are never printed by list. Without --workspace, visible workspaces are included.\n")
+	case "rotate":
+		fmt.Fprint(a.Out, "Usage: asiri rotate --workspace <slug> <scope/name> --stdin|--value-file <path>\n\nAdds a new local encrypted version for an existing secret. Use short paths without the workspace prefix.\n")
+	case "rm":
+		fmt.Fprint(a.Out, "Usage: asiri rm --workspace <slug> <scope/name>\n\nMarks a local secret as deleted. Use short paths without the workspace prefix.\n")
+	case "grant":
+		fmt.Fprint(a.Out, "Usage: asiri grant --workspace <slug> <subject-label> <scope/name> --inject-only|--read|--mount\n\nAdds a local policy rule allowing a non-human subject label to use a secret. Use short paths without the workspace prefix.\n")
+	case "deny":
+		fmt.Fprint(a.Out, "Usage: asiri deny --workspace <slug> <subject-label> <scope/*>\n\nAdds a local policy rule denying a subject label at a scope. Use short paths without the workspace prefix.\n")
+	case "policy":
+		fmt.Fprint(a.Out, "Usage: asiri policy list [--workspace <slug>...]\n\nLists local policy rules.\n")
+	case "policy list":
+		fmt.Fprint(a.Out, "Usage: asiri policy list [--workspace <slug>...]\n\nLists local allow and deny policy rules.\n")
+	case "run":
+		fmt.Fprint(a.Out, "Usage: asiri run --workspace <slug> [--agent <subject-label>] --env NAME=<scope/name> -- <command...>\n       asiri run --workspace <slug> [--agent <subject-label>] --unsafe-argv <command... asiri://scope/name>\n\nRuns a command with secrets injected through environment variables or explicit unsafe argument substitution. Use short paths without the workspace prefix.\n")
+	case "env":
+		fmt.Fprint(a.Out, "Usage: asiri env --workspace <slug> [--agent <subject-label>] <scope-or-secret> -- <command...>\n\nRuns a command with secrets from one scope or one secret injected into the environment. Use short paths without the workspace prefix.\n")
+	case "mount":
+		fmt.Fprint(a.Out, "Usage: asiri mount --workspace <slug> [--agent <subject-label>] [--dir <dir>] <scope-or-secret[:dest]> -- <command...>\n\nRuns a command with temporary secret files mounted under a private directory. Use short paths without the workspace prefix.\n")
+	case "broker":
+		fmt.Fprint(a.Out, "Usage: asiri broker start [--once]\n\nStarts the local broker that serves approved local secret access requests.\n")
+	case "broker start":
+		fmt.Fprint(a.Out, "Usage: asiri broker start [--once]\n\nStarts the local broker. With --once, handles one request and exits.\n")
+	case "audit":
+		fmt.Fprint(a.Out, "Usage: asiri audit tail [--limit N] [--workspace <slug>...]\n\nShows recent local audit events.\n")
+	case "audit tail":
+		fmt.Fprint(a.Out, "Usage: asiri audit tail [--limit N] [--workspace <slug>...]\n\nShows the most recent local audit events, newest first.\n")
+	case "cache":
+		fmt.Fprint(a.Out, "Usage: asiri cache wipe\n\nAlias for local wipe. Deletes local state and platform-stored Asiri keys for this machine.\n")
+	case "cache wipe":
+		fmt.Fprint(a.Out, "Usage: asiri cache wipe\n\nAlias for local wipe. Deletes local state and platform-stored Asiri keys for this machine.\n")
+	default:
+		return a.fail(fmt.Errorf("unknown help topic %q", topic))
+	}
+	return 0
+}
+
+func (a App) initLocal(st *store.FileStore, args []string) int {
+	deviceName, err := parseInitArgs(args)
+	if err != nil {
+		return a.fail(err)
+	}
+	if deviceName == "" {
+		hostname, hostErr := os.Hostname()
+		if hostErr != nil || hostname == "" {
+			deviceName = "local-device"
+		} else {
+			deviceName = hostname
+		}
+	}
+	if err := st.InitializeLocal(); err != nil {
+		return a.fail(err)
+	}
+	device, refs, err := createDevice(deviceName)
+	if err != nil {
+		_ = st.DeletePlatformKeys()
+		_ = os.Remove(st.Path)
+		return a.fail(err)
+	}
+	st.State.Devices = append(st.State.Devices, device)
+	st.State.LocalDeviceID = device.ID
+	for _, ref := range refs {
+		st.AddKeyRef(ref.Purpose, ref.Account)
+	}
+	st.Audit(st.State.UserID, "device_enrolled", "allowed", "", "", "local device trusted", map[string]string{"device": deviceName})
+	if err := st.Save(); err != nil {
+		_ = st.DeletePlatformKeys()
+		_ = os.Remove(st.Path)
+		return a.fail(err)
+	}
+	fmt.Fprintf(a.Out, "✓ Initialized local Asiri vault with trusted device %s\n", deviceName)
+	return 0
+}
+
+func parseInitArgs(args []string) (string, error) {
+	deviceName := ""
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--device":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return "", errors.New("--device requires a value")
+			}
+			deviceName = args[i+1]
+			i++
+		case "--workspace":
+			return "", errors.New("asiri init no longer accepts --workspace; local vaults do not have workspace slugs")
+		default:
+			return "", fmt.Errorf("unknown init argument %q", args[i])
+		}
+	}
+	return deviceName, nil
+}
+
+func (a App) login(st *store.FileStore, args []string) int {
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	force := hasFlag(args, "--force")
+	origin := loginOrigin(args, st)
+	if err := validateControlPlaneOrigin(origin); err != nil {
+		return a.fail(err)
+	}
+	if st.State.ControlPlane != nil && !force {
+		if st.State.ControlPlane.Source == "oidc" {
+			return a.fail(errors.New("workload session active; run asiri logout first, or asiri login --force to replace it"))
+		}
+		result, status, err := refreshDeviceSession(origin, st)
+		if err == nil && status == http.StatusOK {
+			if err := st.RefreshControlPlane(result.AccessToken, result.ExpiresIn, result.RefreshExpiresAt); err != nil {
+				return a.fail(err)
+			}
+			fmt.Fprintf(a.Out, "✓ Control-plane session refreshed for workspace %s\n", st.State.ControlPlane.WorkspaceSlug)
+			return 0
+		}
+		if err == nil && remoteDeviceNotTrusted(status, result.Error) {
+			if err := st.QuarantineLocalKeys("remote device is no longer trusted"); err != nil {
+				return a.fail(fmt.Errorf("remote device is no longer trusted, but local key cleanup failed: %w", err))
+			}
+			return a.fail(errors.New("remote device is no longer trusted; local key material was cleared"))
+		}
+		if err != nil || (status != http.StatusUnauthorized && status != http.StatusForbidden) {
+			if err != nil {
+				return a.fail(err)
+			}
+			return a.fail(fmt.Errorf("control plane returned HTTP %d", status))
+		}
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		return a.fail(err)
+	}
+	start, err := startDeviceCodeLogin(origin, "", *device)
+	if err != nil {
+		return a.fail(err)
+	}
+	fmt.Fprintf(a.Out, "Open %s\n", start.VerificationURIComplete)
+	fmt.Fprintf(a.Out, "Code: %s\n", start.UserCode)
+	result, err := pollDeviceCodeLogin(st, origin, start)
+	if err != nil {
+		return a.fail(err)
+	}
+	if err := st.LinkControlPlaneForDevice(origin, result.OrgID, result.WorkspaceSlug, result.UserID, result.DeviceID, device.ID, result.AccessToken, result.RefreshToken, result.ExpiresIn, result.RefreshExpiresAt); err != nil {
+		return a.fail(err)
+	}
+	fmt.Fprintf(a.Out, "✓ Linked local device to workspace %s\n", result.WorkspaceSlug)
+	return 0
+}
+
+func loginOrigin(args []string, st *store.FileStore) string {
+	if origin := strings.TrimRight(flagValue(args, "--origin", ""), "/"); origin != "" {
+		return origin
+	}
+	if origin := strings.TrimRight(os.Getenv("ASIRI_CONTROL_PLANE_ORIGIN"), "/"); origin != "" {
+		return origin
+	}
+	if st.State.ControlPlane != nil && !hasFlag(args, "--force") {
+		return st.State.ControlPlane.Origin
+	}
+	return defaultControlPlaneOrigin
+}
+
+func (a App) workload(st *store.FileStore, args []string) int {
+	if len(args) == 0 {
+		return a.fail(errors.New("workload subcommand required"))
+	}
+	switch args[0] {
+	case "login":
+		return a.workloadLogin(st, args[1:])
+	default:
+		return a.fail(fmt.Errorf("unknown workload command %q", args[0]))
+	}
+}
+
+type workloadLoginOptions struct {
+	Provider  string
+	Token     string
+	TokenFile string
+	Audience  string
+	Origin    string
+}
+
+func parseWorkloadLoginArgs(args []string) (workloadLoginOptions, error) {
+	options := workloadLoginOptions{Provider: "github", Audience: "asiri"}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--provider":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--provider requires github or generic")
+			}
+			options.Provider = args[i+1]
+			i++
+		case "--token":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--token requires a JWT")
+			}
+			options.Token = args[i+1]
+			i++
+		case "--token-file":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--token-file requires a path")
+			}
+			options.TokenFile = args[i+1]
+			i++
+		case "--audience":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--audience requires a value")
+			}
+			options.Audience = args[i+1]
+			i++
+		case "--origin":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--origin requires a URL")
+			}
+			options.Origin = strings.TrimRight(args[i+1], "/")
+			i++
+		default:
+			return options, fmt.Errorf("unknown workload login argument %q", args[i])
+		}
+	}
+	if options.Provider != "github" && options.Provider != "generic" {
+		return options, errors.New("--provider must be github or generic")
+	}
+	if options.Token != "" && options.TokenFile != "" {
+		return options, errors.New("use either --token or --token-file, not both")
+	}
+	return options, nil
+}
+
+func (a App) workloadLogin(st *store.FileStore, args []string) int {
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	options, err := parseWorkloadLoginArgs(args)
+	if err != nil {
+		return a.fail(err)
+	}
+	origin := options.Origin
+	if origin == "" {
+		origin = loginOrigin(nil, st)
+	}
+	if err := validateControlPlaneOrigin(origin); err != nil {
+		return a.fail(err)
+	}
+	token, err := workloadOidcToken(options)
+	if err != nil {
+		return a.fail(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		return a.fail(err)
+	}
+	result, err := exchangeWorkloadOidc(origin, options.Provider, token, *device)
+	if err != nil {
+		return a.fail(err)
+	}
+	if err := st.LinkWorkloadControlPlane(origin, result.OrgID, result.WorkspaceSlug, result.UserID, result.WorkloadID, result.WorkloadSlug, result.DeviceID, device.ID, result.AccessToken, result.ExpiresIn); err != nil {
+		return a.fail(err)
+	}
+	fmt.Fprintf(a.Out, "✓ Linked workload %s to workspace %s\n", result.WorkloadSlug, result.WorkspaceSlug)
+	return 0
+}
+
+func workloadOidcToken(options workloadLoginOptions) (string, error) {
+	if options.Token != "" {
+		return strings.TrimSpace(options.Token), nil
+	}
+	if options.TokenFile != "" {
+		value, err := os.ReadFile(options.TokenFile)
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(value)), nil
+	}
+	if envToken := strings.TrimSpace(os.Getenv("ASIRI_OIDC_TOKEN")); envToken != "" {
+		return envToken, nil
+	}
+	if options.Provider == "github" {
+		return githubActionsOidcToken(options.Audience)
+	}
+	return "", errors.New("OIDC token is required; pass --token, --token-file, or ASIRI_OIDC_TOKEN")
+}
+
+func githubActionsOidcToken(audience string) (string, error) {
+	requestURL := os.Getenv("ACTIONS_ID_TOKEN_REQUEST_URL")
+	requestToken := os.Getenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+	if requestURL == "" || requestToken == "" {
+		return "", errors.New("GitHub Actions OIDC environment is not available; pass --token or --token-file")
+	}
+	endpoint, err := url.Parse(requestURL)
+	if err != nil {
+		return "", err
+	}
+	query := endpoint.Query()
+	if audience != "" {
+		query.Set("audience", audience)
+	}
+	endpoint.RawQuery = query.Encode()
+	request, err := http.NewRequest(http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("authorization", "Bearer "+requestToken)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	var result struct {
+		Value string `json:"value"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 || result.Value == "" {
+		return "", fmt.Errorf("GitHub OIDC token request failed with HTTP %d", response.StatusCode)
+	}
+	return result.Value, nil
+}
+
+func (a App) logout(st *store.FileStore, args []string) int {
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	if st.State.ControlPlane == nil {
+		fmt.Fprintln(a.Out, "✓ Already logged out")
+		return 0
+	}
+	refreshToken, err := st.ControlPlaneRefreshToken()
+	if err == nil {
+		_ = logoutDeviceSession(st, st.State.ControlPlane.Origin, refreshToken)
+	}
+	if err := st.ClearControlPlane(); err != nil {
+		return a.fail(err)
+	}
+	fmt.Fprintln(a.Out, "✓ Logged out")
+	return 0
+}
+
+func (a App) workspace(st *store.FileStore, args []string) int {
+	if len(args) == 0 {
+		return a.fail(errors.New("workspace subcommand required"))
+	}
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	if st.State.ControlPlane == nil {
+		return a.fail(errors.New("asiri is not linked to a control plane"))
+	}
+	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	if err != nil {
+		return a.fail(err)
+	}
+	switch args[0] {
+	case "list":
+		workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken)
+		if err != nil {
+			return a.fail(err)
+		}
+		var remoteSecrets []visibleRemoteSecretRecord
+		var secretsErr error
+		secretsKnown := false
+		if st.State.ControlPlane.Source != "oidc" {
+			remoteSecrets, secretsErr = listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken)
+			secretsKnown = secretsErr == nil
+		}
+		keySummaries := workspaceKeySummaries(st, workspaces, remoteSecrets, st.State.ControlPlane.WorkspaceID, secretsKnown)
+		tw := tabwriter.NewWriter(a.Out, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "WORKSPACE\tROLE\tTHIS DEVICE\tACCOUNT WRITE\tKEYS\tNEXT\tID")
+		hasUntrusted := false
+		for _, workspace := range workspaces {
+			if !workspaceDeviceTrusted(workspace, st.State.ControlPlane.WorkspaceID) {
+				hasUntrusted = true
+			}
+			keySummary := keySummaries[workspace.Slug]
+			accountWrite := boolPointerLabel(workspace.CanWrite)
+			if st.State.ControlPlane.Source == "oidc" {
+				accountWrite = "no"
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", workspace.Slug, workspaceRoleLabel(workspace, st.State.UserID), deviceTrustLabelForWorkspace(workspace, st.State.ControlPlane.WorkspaceID), accountWrite, keySummary.Keys, keySummary.Next, workspace.ID)
+		}
+		if err := tw.Flush(); err != nil {
+			return a.fail(err)
+		}
+		if hasUntrusted {
+			fmt.Fprintln(a.Out, "\nThis device controls pull and workspace-scoped push. Use the NEXT command to trust it where needed.")
+		}
+		if secretsErr != nil {
+			fmt.Fprintf(a.Err, "asiri: remote key coverage unavailable: %s\n", secretsErr)
+		}
+		return 0
+	case "use":
+		return a.fail(errors.New("workspace use has been removed; pass --workspace <slug> to workspace-scoped commands"))
+	default:
+		return a.fail(fmt.Errorf("unknown workspace command %q", args[0]))
+	}
+}
+
+func (a App) push(st *store.FileStore, args []string) int {
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	if st.State.ControlPlane == nil {
+		return a.fail(errors.New("asiri is not linked to a control plane"))
+	}
+	if err := rejectWorkloadControlPlaneMutation(st); err != nil {
+		return a.fail(err)
+	}
+	workspaceArg, remaining, err := splitWorkspaceFlag(args, "push", true)
+	if err != nil {
+		return a.fail(err)
+	}
+	if err := rejectUnknownArgs(remaining, "--yes"); err != nil {
+		return a.fail(err)
+	}
+	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	if err != nil {
+		return a.fail(err)
+	}
+	target, accessToken, err := a.pushWorkspaceTarget(st, accessToken, workspaceArg)
+	if err != nil {
+		return a.fail(err)
+	}
+	refs := st.ActiveSecretRefs()
+	if len(refs) == 0 {
+		fmt.Fprintln(a.Out, "No local active secrets to push")
+		return 0
+	}
+	selectedRefs := make([]store.LocalSecretRef, 0, len(refs))
+	for _, ref := range refs {
+		if store.WorkspacePrefix(ref.Scope) == target.Slug {
+			selectedRefs = append(selectedRefs, ref)
+		}
+	}
+	if len(selectedRefs) == 0 {
+		return a.fail(fmt.Errorf("no local active secrets under workspace %s; local prefixes are %s", target.Slug, strings.Join(localSecretWorkspacePrefixes(refs), ", ")))
+	}
+	if binding, ok := st.RemoteBindingForPrefix(target.Slug); ok && binding.WorkspaceID != target.ID {
+		return a.fail(fmt.Errorf("workspace prefix %s is bound to another control-plane workspace", target.Slug))
+	}
+	options, err := remoteWriteOptions(st, st.State.ControlPlane.Origin, accessToken, selectedRefs)
+	if err != nil {
+		return a.fail(err)
+	}
+	if !options.ActiveWorkspace.CanWrite {
+		return a.fail(fmt.Errorf("workspace %s cannot write %s", target.Slug, fullPathList(options.ActiveWorkspace.Paths)))
+	}
+	if err := st.BindWorkspacePrefix(target.Slug, target.ID, target.Slug); err != nil {
+		return a.fail(err)
+	}
+	recovery, err := getActiveRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, target.ID, accessToken)
+	if err != nil {
+		return a.fail(err)
+	}
+	versions, err := st.RemoteSecretVersionsForPrefixWithRecovery(target.Slug, recovery)
+	if err != nil {
+		return a.fail(err)
+	}
+	for _, version := range versions {
+		if err := postJSONBearer(st, st.State.ControlPlane.Origin+"/v1/secrets", accessToken, version, nil); err != nil {
+			return a.fail(err)
+		}
+	}
+	if recovery != nil {
+		if st.State.Recoveries == nil {
+			st.State.Recoveries = map[string]asiri.RecoveryConfig{}
+		}
+		st.State.Recoveries[target.ID] = *recovery
+		if err := st.MarkRecoveryWrapped(target.Slug, len(versions)); err != nil {
+			return a.fail(err)
+		}
+	} else if st.ActiveRecovery() != nil {
+		delete(st.State.Recoveries, target.ID)
+	}
+	st.Audit(st.State.UserID, "control_plane_push", "allowed", "", "", "pushed encrypted local secret versions", map[string]string{"count": fmt.Sprintf("%d", len(versions)), "workspace": target.Slug})
+	if err := st.Save(); err != nil {
+		return a.fail(err)
+	}
+	if len(selectedRefs) != len(refs) {
+		fmt.Fprintf(a.Out, "✓ Pushed %d encrypted secret version(s) under %s to workspace %s; other local prefixes were left unchanged\n", len(versions), target.Slug, target.Slug)
+	} else {
+		fmt.Fprintf(a.Out, "✓ Pushed %d encrypted secret version(s) to workspace %s\n", len(versions), target.Slug)
+	}
+	return 0
+}
+
+func (a App) pull(st *store.FileStore, args []string) int {
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	if st.State.ControlPlane == nil {
+		return a.fail(errors.New("asiri is not linked to a control plane"))
+	}
+	options, err := parsePullArgs(args)
+	if err != nil {
+		return a.fail(err)
+	}
+	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	if err != nil {
+		return a.fail(err)
+	}
+	workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken)
+	if err != nil {
+		return a.fail(err)
+	}
+	targets, results := pullTargets(st.State.ControlPlane, workspaces, options)
+	currentAccessToken := accessToken
+	activeWorkspaceID := st.State.ControlPlane.WorkspaceID
+	for _, target := range targets {
+		if !pullWorkspaceCanPull(target.Workspace, activeWorkspaceID) {
+			result := "skipped"
+			if target.Explicit {
+				result = "failed"
+			}
+			results = append(results, pullResult{Workspace: target.Workspace.Slug, Result: result, Note: "this device is not trusted for this workspace"})
+			continue
+		}
+		imported, remote, token, err := a.pullOneWorkspace(st, currentAccessToken, target.Workspace, options.Force)
+		if token != "" {
+			currentAccessToken = token
+		}
+		if err != nil {
+			results = append(results, pullResult{Workspace: target.Workspace.Slug, Result: "failed", Note: err.Error()})
+			continue
+		}
+		results = append(results, pullResult{Workspace: target.Workspace.Slug, Result: "pulled", Imported: imported, Remote: remote})
+	}
+	writePullResults(a.Out, results)
+	return 0
+}
+
+func (a App) pullOneWorkspace(st *store.FileStore, accessToken string, workspace remoteWorkspaceResponse, force bool) (int, int, string, error) {
+	nextToken := ""
+	if workspace.ID != st.State.ControlPlane.WorkspaceID {
+		if st.State.ControlPlane.Source == "oidc" {
+			return 0, 0, "", errors.New("OIDC workload sessions cannot switch workspace")
+		}
+		device, err := st.ActiveDevice()
+		if err != nil {
+			return 0, 0, "", err
+		}
+		result, err := switchRemoteWorkspace(st, st.State.ControlPlane.Origin, accessToken, workspace.ID, *device)
+		if err != nil {
+			return 0, 0, "", err
+		}
+		if err := st.LinkControlPlaneForDevice(st.State.ControlPlane.Origin, result.OrgID, result.WorkspaceSlug, result.UserID, result.DeviceID, device.ID, result.AccessToken, result.RefreshToken, result.ExpiresIn, result.RefreshExpiresAt); err != nil {
+			return 0, 0, "", err
+		}
+		nextToken = result.AccessToken
+		accessToken = result.AccessToken
+	}
+	var bundle syncBundleResponse
+	endpoint := fmt.Sprintf("%s/v1/sync?orgId=%s&deviceId=%s", strings.TrimRight(st.State.ControlPlane.Origin, "/"), url.QueryEscape(st.State.ControlPlane.WorkspaceID), url.QueryEscape(st.State.ControlPlane.DeviceID))
+	if err := getJSONBearer(st, endpoint, accessToken, &bundle); err != nil {
+		return 0, 0, nextToken, err
+	}
+	imported, err := a.importRemoteVersions(st, bundle.EncryptedSecrets, force)
+	if err != nil {
+		var partial *store.RemoteImportPartialError
+		if !errors.As(err, &partial) {
+			return 0, 0, nextToken, err
+		}
+		if imported == 0 {
+			return 0, 0, nextToken, err
+		}
+		fmt.Fprintf(a.Err, "Warning: %s\n", partial.Error())
+	}
+	importWorkloadSyncPolicies(st, bundle.Policies)
+	st.Audit(st.State.UserID, "control_plane_sync", "allowed", "", "", "fetched encrypted pull bundle", map[string]string{"secrets": fmt.Sprintf("%d", len(bundle.EncryptedSecrets)), "workspace": st.State.ControlPlane.WorkspaceSlug})
+	if err := st.Save(); err != nil {
+		return 0, 0, nextToken, err
+	}
+	return imported, len(bundle.EncryptedSecrets), nextToken, nil
+}
+
+type pullOptions struct {
+	Force      bool
+	Workspaces []string
+}
+
+type pullTarget struct {
+	Workspace remoteWorkspaceResponse
+	Explicit  bool
+}
+
+type pullResult struct {
+	Workspace string
+	Result    string
+	Imported  int
+	Remote    int
+	Note      string
+}
+
+func parsePullArgs(args []string) (pullOptions, error) {
+	var options pullOptions
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--force":
+			options.Force = true
+		case "--workspace", "-w":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+				return options, errors.New("pull --workspace requires a workspace slug")
+			}
+			options.Workspaces = append(options.Workspaces, args[i+1])
+			i++
+		default:
+			return options, fmt.Errorf("unknown pull option %q", args[i])
+		}
+	}
+	return options, nil
+}
+
+func pullTargets(active *asiri.ControlPlaneLink, workspaces []remoteWorkspaceResponse, options pullOptions) ([]pullTarget, []pullResult) {
+	if active == nil {
+		return nil, []pullResult{{Workspace: "-", Result: "failed", Note: "asiri is not linked to a control plane"}}
+	}
+	if active.Source == "oidc" {
+		activeWorkspace := remoteWorkspaceResponse{ID: active.WorkspaceID, Slug: active.WorkspaceSlug, CurrentDeviceTrusted: boolPtr(true), CanPull: boolPtr(true)}
+		for _, workspace := range workspaces {
+			if workspace.ID == active.WorkspaceID || workspace.Slug == active.WorkspaceSlug {
+				activeWorkspace = workspace
+				break
+			}
+		}
+		if len(options.Workspaces) == 0 {
+			return []pullTarget{{Workspace: activeWorkspace}}, nil
+		}
+		targets := []pullTarget{}
+		results := []pullResult{}
+		for _, requested := range options.Workspaces {
+			if requested != active.WorkspaceSlug && requested != active.WorkspaceID {
+				results = append(results, pullResult{Workspace: requested, Result: "failed", Note: "OIDC workload sessions cannot switch workspace"})
+				continue
+			}
+			targets = append(targets, pullTarget{Workspace: activeWorkspace, Explicit: true})
+		}
+		return targets, results
+	}
+	if len(options.Workspaces) > 0 {
+		targets := make([]pullTarget, 0, len(options.Workspaces))
+		results := []pullResult{}
+		for _, requested := range options.Workspaces {
+			if active.Source == "oidc" && requested != active.WorkspaceSlug {
+				results = append(results, pullResult{Workspace: requested, Result: "failed", Note: "OIDC workload sessions cannot switch workspace"})
+				continue
+			}
+			workspace, ok := findWorkspace(workspaces, requested)
+			if !ok {
+				results = append(results, pullResult{Workspace: requested, Result: "failed", Note: "workspace is not visible"})
+				continue
+			}
+			targets = append(targets, pullTarget{Workspace: workspace, Explicit: true})
+		}
+		return targets, results
+	}
+	if active.Source == "oidc" {
+		if workspace, ok := findWorkspace(workspaces, active.WorkspaceSlug); ok {
+			return []pullTarget{{Workspace: workspace}}, nil
+		}
+		return []pullTarget{{Workspace: remoteWorkspaceResponse{ID: active.WorkspaceID, Slug: active.WorkspaceSlug, CanPull: boolPtr(true), CurrentDeviceTrusted: boolPtr(true)}}}, nil
+	}
+	targets := make([]pullTarget, 0, len(workspaces))
+	for _, workspace := range workspaces {
+		targets = append(targets, pullTarget{Workspace: workspace})
+	}
+	return targets, nil
+}
+
+func findWorkspace(workspaces []remoteWorkspaceResponse, value string) (remoteWorkspaceResponse, bool) {
+	for _, workspace := range workspaces {
+		if workspace.Slug == value {
+			return workspace, true
+		}
+	}
+	return remoteWorkspaceResponse{}, false
+}
+
+func pullWorkspaceCanPull(workspace remoteWorkspaceResponse, activeWorkspaceID string) bool {
+	return workspaceDeviceTrusted(workspace, activeWorkspaceID)
+}
+
+func boolPtr(value bool) *bool {
+	return &value
+}
+
+type workspaceKeySummary struct {
+	Keys string
+	Next string
+}
+
+func workspaceKeySummaries(st *store.FileStore, workspaces []remoteWorkspaceResponse, secrets []visibleRemoteSecretRecord, activeWorkspaceID string, secretsKnown bool) map[string]workspaceKeySummary {
+	type counts struct {
+		Total            int
+		Missing          int
+		Repairable       int
+		RemoteOnlyGhosts int
+		Unknown          int
+	}
+	byWorkspace := map[string]counts{}
+	for _, secret := range secrets {
+		item := byWorkspace[secret.WorkspaceSlug]
+		item.Total++
+		if secret.WrappedToCurrentDevice == nil {
+			item.Unknown++
+		} else if !*secret.WrappedToCurrentDevice {
+			item.Missing++
+			if localSecretVersionExists(st, secret.Scope, secret.Name, secret.Version) {
+				item.Repairable++
+			} else if !localActiveSecretExists(st, secret.Scope, secret.Name) {
+				item.RemoteOnlyGhosts++
+			}
+		}
+		byWorkspace[secret.WorkspaceSlug] = item
+	}
+	summaries := map[string]workspaceKeySummary{}
+	for _, workspace := range workspaces {
+		keys := "unknown"
+		if workspaceDeviceTrusted(workspace, activeWorkspaceID) && secretsKnown {
+			item := byWorkspace[workspace.Slug]
+			switch {
+			case item.Total == 0:
+				keys = "no secrets"
+			case item.Unknown > 0:
+				keys = "unknown"
+			case item.Repairable > 0:
+				keys = "needs rewrap"
+			case item.RemoteOnlyGhosts > 0:
+				keys = "needs cleanup"
+			case item.Missing > 0:
+				keys = "unwrapped"
+			default:
+				keys = "ready"
+			}
+		}
+		summaries[workspace.Slug] = workspaceKeySummary{Keys: keys, Next: workspaceNextAction(st, workspace, activeWorkspaceID, keys)}
+	}
+	return summaries
+}
+
+func workspaceNextAction(st *store.FileStore, workspace remoteWorkspaceResponse, activeWorkspaceID, keys string) string {
+	if st.State.ControlPlane != nil && st.State.ControlPlane.Source == "oidc" {
+		return "-"
+	}
+	if !workspaceDeviceTrusted(workspace, activeWorkspaceID) {
+		if workspaceCanApproveDevice(workspace) {
+			return deviceTrustCommand(st, workspace.Slug)
+		}
+		return "ask owner to approve"
+	}
+	if keys == "needs rewrap" {
+		return fmt.Sprintf("asiri rewrap --workspace %s", workspace.Slug)
+	}
+	if keys == "needs cleanup" {
+		return fmt.Sprintf("asiri secret delete --workspace %s --remote-only-unwrapped", workspace.Slug)
+	}
+	return "-"
+}
+
+func workspaceDeviceTrusted(workspace remoteWorkspaceResponse, activeWorkspaceID string) bool {
+	if workspace.CurrentDeviceTrusted != nil {
+		return *workspace.CurrentDeviceTrusted
+	}
+	if workspace.CanPull != nil {
+		return *workspace.CanPull
+	}
+	return workspace.ID != "" && workspace.ID == activeWorkspaceID
+}
+
+func workspaceCanApproveDevice(workspace remoteWorkspaceResponse) bool {
+	if workspace.CanApproveDevice != nil {
+		return *workspace.CanApproveDevice
+	}
+	return workspace.Role == "owner"
+}
+
+func deviceTrustLabelForWorkspace(workspace remoteWorkspaceResponse, activeWorkspaceID string) string {
+	if workspaceDeviceTrusted(workspace, activeWorkspaceID) {
+		return "trusted"
+	}
+	if workspace.CurrentDeviceTrusted == nil && workspace.CanPull == nil {
+		return "unknown"
+	}
+	return "not trusted"
+}
+
+func remoteSecretKeyLabel(st *store.FileStore, secret visibleRemoteSecretRecord) string {
+	if secret.WrappedToCurrentDevice == nil {
+		return "unknown"
+	}
+	if *secret.WrappedToCurrentDevice {
+		return "wrapped"
+	}
+	if localSecretVersionExists(st, secret.Scope, secret.Name, secret.Version) {
+		return "needs rewrap"
+	}
+	if !localActiveSecretExists(st, secret.Scope, secret.Name) {
+		return "unusable"
+	}
+	return "needs rewrap"
+}
+
+func writePullResults(out io.Writer, results []pullResult) {
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "WORKSPACE\tRESULT\tIMPORTED\tREMOTE\tNOTE")
+	for _, result := range results {
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%s\n", result.Workspace, result.Result, result.Imported, result.Remote, result.Note)
+	}
+	_ = tw.Flush()
+}
+
+func (a App) importRemoteVersions(st *store.FileStore, versions []store.RemoteSecretVersion, force bool) (int, error) {
+	if len(versions) == 0 {
+		return 0, nil
+	}
+	return st.ImportRemoteSecretVersions(versions, force)
+}
+
+func importWorkloadSyncPolicies(st *store.FileStore, policies []syncPolicyResponse) {
+	if st == nil || st.State.ControlPlane == nil || st.State.ControlPlane.Source != "oidc" || st.State.ControlPlane.WorkloadSlug == "" {
+		return
+	}
+	workload := store.NormalizeSubjectLabel(st.State.ControlPlane.WorkloadSlug)
+	kept := make([]asiri.Policy, 0, len(st.State.Policies))
+	for _, policy := range st.State.Policies {
+		if store.NormalizeSubjectLabel(policy.Subject) != workload {
+			kept = append(kept, policy)
+		}
+	}
+	for _, policy := range policies {
+		if policy.SubjectType != "service" || store.NormalizeSubjectLabel(policy.SubjectID) != workload || policy.ScopePattern == "" || policy.SecretPattern == "" || len(policy.Actions) == 0 || policy.ApprovalMode != "none" {
+			continue
+		}
+		createdAt := policy.CreatedAt
+		if createdAt.IsZero() {
+			createdAt = time.Now().UTC()
+		}
+		id := policy.ID
+		if id == "" {
+			id = store.NewID("pol")
+		}
+		kept = append(kept, asiri.Policy{
+			ID:            id,
+			Subject:       workload,
+			ScopePattern:  policy.ScopePattern,
+			SecretPattern: policy.SecretPattern,
+			Actions:       policy.Actions,
+			ApprovalMode:  policy.ApprovalMode,
+			CreatedAt:     createdAt,
+			ExpiresAt:     policy.ExpiresAt,
+		})
+	}
+	st.State.Policies = kept
+}
+
+func (a App) rekey(st *store.FileStore, args []string) int {
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	if st.State.ControlPlane == nil {
+		return a.fail(errors.New("asiri is not linked to a control plane"))
+	}
+	if err := rejectWorkloadControlPlaneMutation(st); err != nil {
+		return a.fail(err)
+	}
+	workspaceArg, remaining, err := splitWorkspaceFlag(args, "rekey", true)
+	if err != nil {
+		return a.fail(err)
+	}
+	if err := rejectUnknownArgs(remaining, "--yes"); err != nil {
+		return a.fail(err)
+	}
+	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	if err != nil {
+		return a.fail(err)
+	}
+	target, accessToken, err := a.remoteWorkspaceTarget(st, accessToken, workspaceArg)
+	if err != nil {
+		return a.fail(err)
+	}
+	if binding, ok := st.RemoteBindingForPrefix(target.Slug); !ok || binding.WorkspaceID != target.ID {
+		return a.fail(fmt.Errorf("workspace prefix %s must be pushed or pulled before rekey", target.Slug))
+	}
+	refs := st.ActiveSecretRefs()
+	selectedRefs := make([]store.LocalSecretRef, 0, len(refs))
+	for _, ref := range refs {
+		if store.WorkspacePrefix(ref.Scope) == target.Slug {
+			selectedRefs = append(selectedRefs, ref)
+		}
+	}
+	if len(selectedRefs) == 0 {
+		fmt.Fprintln(a.Out, "No local active secrets to rekey")
+		return 0
+	}
+	options, err := remoteWriteOptions(st, st.State.ControlPlane.Origin, accessToken, selectedRefs)
+	if err != nil {
+		return a.fail(err)
+	}
+	if !options.ActiveWorkspace.CanWrite {
+		return a.fail(fmt.Errorf("workspace %s cannot write %s", target.Slug, fullPathList(options.ActiveWorkspace.Paths)))
+	}
+	if _, err := getActiveRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, target.ID, accessToken); err != nil {
+		return a.fail(err)
+	}
+	rotated, err := st.RotateDataKeysForPrefix(target.Slug)
+	if err != nil {
+		return a.fail(err)
+	}
+	if rotated == 0 {
+		fmt.Fprintln(a.Out, "No local active secrets to rekey")
+		return 0
+	}
+	fmt.Fprintf(a.Out, "✓ Re-encrypted %d local secret(s) with new scoped data keys\n", rotated)
+	return a.push(st, args)
+}
+
+func (a App) rewrap(st *store.FileStore, args []string) int {
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	if st.State.ControlPlane == nil {
+		return a.fail(errors.New("asiri is not linked to a control plane"))
+	}
+	if err := rejectWorkloadControlPlaneMutation(st); err != nil {
+		return a.fail(err)
+	}
+	workspaceArg, remaining, err := splitWorkspaceFlag(args, "rewrap", true)
+	if err != nil {
+		return a.fail(err)
+	}
+	if err := rejectUnknownArgs(remaining); err != nil {
+		return a.fail(err)
+	}
+	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	if err != nil {
+		return a.fail(err)
+	}
+	target, accessToken, err := a.remoteWorkspaceTarget(st, accessToken, workspaceArg)
+	if err != nil {
+		return a.fail(err)
+	}
+	devices, err := listRemoteDevices(st, st.State.ControlPlane.Origin, target.ID, accessToken)
+	if err != nil {
+		return a.fail(err)
+	}
+	secrets, err := listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, "")
+	if err != nil {
+		return a.fail(err)
+	}
+	targets := map[string]remoteDeviceResponse{}
+	for _, device := range devices {
+		if device.Status == "trusted" && device.EncryptionPublicKey != "" {
+			targets[device.ID] = device
+		}
+	}
+	if len(targets) == 0 {
+		fmt.Fprintln(a.Out, "No trusted devices need wrapped keys")
+		return 0
+	}
+	updated := 0
+	added := 0
+	skippedMissingLocal := 0
+	for _, secret := range secrets {
+		if secret.Status != "active" {
+			continue
+		}
+		if !localSecretVersionExists(st, secret.Scope, secret.Name, secret.Version) {
+			skippedMissingLocal++
+			continue
+		}
+		missing := make([]store.RemoteWrappedKey, 0)
+		for _, device := range targets {
+			if remoteSecretHasRecipient(secret, device.ID) {
+				continue
+			}
+			wrapped, err := st.RemoteWrappedKeyForSecretVersionPublicKey(secret.Scope, secret.Name, secret.Version, device.ID, device.EncryptionPublicKey)
+			if err != nil {
+				return a.fail(err)
+			}
+			missing = append(missing, wrapped)
+		}
+		if len(missing) == 0 {
+			continue
+		}
+		if err := addRemoteWrappedKeys(st, st.State.ControlPlane.Origin, secret.ID, accessToken, missing); err != nil {
+			return a.fail(err)
+		}
+		updated++
+		added += len(missing)
+	}
+	st.Audit(st.State.UserID, "control_plane_rewrap", "allowed", "", "", "wrapped local data keys to trusted remote devices", map[string]string{"secrets": fmt.Sprintf("%d", updated), "wrappedKeys": fmt.Sprintf("%d", added), "workspace": target.Slug})
+	if err := st.Save(); err != nil {
+		return a.fail(err)
+	}
+	if added == 0 && skippedMissingLocal > 0 {
+		fmt.Fprintf(a.Out, "No remote secrets can be rewrapped from this machine; %d active remote secret version(s) are missing matching local key material\n", skippedMissingLocal)
+		return 0
+	}
+	fmt.Fprintf(a.Out, "✓ Rewrapped %d key(s) across %d secret version(s) in workspace %s\n", added, updated, target.Slug)
+	return 0
+}
+
+func (a App) recovery(st *store.FileStore, args []string) int {
+	if len(args) == 0 {
+		return a.fail(errors.New("recovery subcommand required"))
+	}
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	switch args[0] {
+	case "status":
+		if st.State.ControlPlane == nil {
+			return a.fail(errors.New("asiri is not linked to a control plane"))
+		}
+		workspaceFilters, remaining, err := splitWorkspaceFilters(args[1:], "recovery status")
+		if err != nil {
+			return a.fail(err)
+		}
+		if err := rejectUnknownArgs(remaining); err != nil {
+			return a.fail(err)
+		}
+		accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+		if err != nil {
+			return a.fail(err)
+		}
+		workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken)
+		if err != nil {
+			return a.fail(err)
+		}
+		targets := make([]remoteWorkspaceResponse, 0, len(workspaces))
+		if len(workspaceFilters) == 0 {
+			targets = append(targets, workspaces...)
+		} else {
+			for _, requested := range workspaceFilters {
+				target, err := requireRemoteWorkspace(workspaces, requested)
+				if err != nil {
+					return a.fail(err)
+				}
+				targets = append(targets, target)
+			}
+		}
+		type recoveryStatusRow struct {
+			Workspace   string
+			Status      string
+			Fingerprint string
+			Wrapped     int
+			Note        string
+		}
+		rows := []recoveryStatusRow{}
+		currentToken := accessToken
+		saveNeeded := false
+		if st.State.Recoveries == nil {
+			st.State.Recoveries = map[string]asiri.RecoveryConfig{}
+		}
+		activeWorkspaceID := st.State.ControlPlane.WorkspaceID
+		for _, target := range targets {
+			if !pullWorkspaceCanPull(target, activeWorkspaceID) {
+				rows = append(rows, recoveryStatusRow{Workspace: target.Slug, Status: "skipped", Note: "this device is not trusted for this workspace"})
+				continue
+			}
+			token, err := a.ensureWorkspaceSession(st, currentToken, target)
+			if err != nil {
+				rows = append(rows, recoveryStatusRow{Workspace: target.Slug, Status: "failed", Note: err.Error()})
+				continue
+			}
+			currentToken = token
+			if st.State.ControlPlane != nil {
+				target.ID = st.State.ControlPlane.WorkspaceID
+				target.Slug = st.State.ControlPlane.WorkspaceSlug
+			}
+			recovery, err := getActiveRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, target.ID, currentToken)
+			if err != nil {
+				rows = append(rows, recoveryStatusRow{Workspace: target.Slug, Status: "failed", Note: err.Error()})
+				continue
+			}
+			if recovery == nil {
+				if _, ok := st.State.Recoveries[target.ID]; ok {
+					delete(st.State.Recoveries, target.ID)
+					saveNeeded = true
+				}
+				rows = append(rows, recoveryStatusRow{Workspace: target.Slug, Status: "not-configured"})
+				continue
+			}
+			if existing, ok := st.State.Recoveries[target.ID]; ok && existing.RecipientID == recovery.RecipientID {
+				recovery.CreatedAt = existing.CreatedAt
+				recovery.LastWrappedAt = existing.LastWrappedAt
+				recovery.WrappedSecretCount = existing.WrappedSecretCount
+			}
+			st.State.Recoveries[target.ID] = *recovery
+			saveNeeded = true
+			rows = append(rows, recoveryStatusRow{Workspace: target.Slug, Status: "configured", Fingerprint: recovery.PublicKeyFingerprint, Wrapped: st.RecoveryWrappedCountForPrefix(target.Slug)})
+		}
+		if saveNeeded {
+			if err := st.Save(); err != nil {
+				return a.fail(err)
+			}
+		}
+		tw := tabwriter.NewWriter(a.Out, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "WORKSPACE\tSTATUS\tFINGERPRINT\tWRAPPED\tNOTE")
+		for _, row := range rows {
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\n", row.Workspace, row.Status, row.Fingerprint, row.Wrapped, row.Note)
+		}
+		if err := tw.Flush(); err != nil {
+			return a.fail(err)
+		}
+		return 0
+	case "setup":
+		if st.State.ControlPlane == nil {
+			return a.fail(errors.New("asiri is not linked to a control plane"))
+		}
+		if err := rejectWorkloadControlPlaneMutation(st); err != nil {
+			return a.fail(err)
+		}
+		workspaceArg, remaining, err := splitWorkspaceFlag(args[1:], "recovery setup", true)
+		if err != nil {
+			return a.fail(err)
+		}
+		if err := rejectUnknownArgs(remaining, "--force", "--output-file"); err != nil {
+			return a.fail(err)
+		}
+		outputPath, hasOutput, err := optionalFlagValue(remaining, "--output-file")
+		if err != nil {
+			return a.fail(err)
+		}
+		outFile, isTerminalOutput := a.Out.(*os.File)
+		if !hasOutput && (!isTerminalOutput || !term.IsTerminal(int(outFile.Fd()))) {
+			return a.fail(errors.New("recovery setup requires --output-file in non-interactive mode"))
+		}
+		accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+		if err != nil {
+			return a.fail(err)
+		}
+		target, accessToken, err := a.remoteWorkspaceTarget(st, accessToken, workspaceArg)
+		if err != nil {
+			return a.fail(err)
+		}
+		force := hasFlag(remaining, "--force")
+		remoteRecovery, err := getActiveRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, target.ID, accessToken)
+		if err != nil {
+			return a.fail(err)
+		}
+		if !force && remoteRecovery != nil {
+			return a.fail(fmt.Errorf("recovery is already configured for workspace %s; use --force to replace it", target.Slug))
+		}
+		setup, err := st.GenerateRecoverySetup()
+		if err != nil {
+			return a.fail(err)
+		}
+		var outputFile *os.File
+		removeOutputOnFailure := false
+		if hasOutput {
+			outputFile, err = reserveExclusiveSecretFile(outputPath)
+			if err != nil {
+				return a.fail(err)
+			}
+			removeOutputOnFailure = true
+			defer func() {
+				_ = outputFile.Close()
+				if removeOutputOnFailure {
+					_ = os.Remove(outputPath)
+				}
+			}()
+		}
+		previousRecipientID := ""
+		if remoteRecovery != nil {
+			previousRecipientID = remoteRecovery.RecipientID
+		}
+		replacements, covered, err := a.prepareRemoteRecoveryReplacementKeys(st, accessToken, setup.Config, previousRecipientID)
+		if err != nil {
+			return a.fail(err)
+		}
+		if hasOutput {
+			if err := writeReservedSecretFile(outputFile, []byte(setup.Key+"\n")); err != nil {
+				return a.fail(err)
+			}
+			removeOutputOnFailure = false
+			fmt.Fprintf(a.Out, "Recovery key written to %s\n", outputPath)
+		} else {
+			fmt.Fprintln(a.Out, "Recovery key:")
+			fmt.Fprintln(a.Out, setup.Key)
+			fmt.Fprintln(a.Out, "Copy this key to a secure place, for example a password app or a printed copy. Asiri will not show it again.")
+		}
+		if remoteRecovery != nil {
+			if err := replaceRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, accessToken, setup, replacements); err != nil {
+				return a.fail(fmt.Errorf("recovery key delivered, but remote replacement failed: %w", err))
+			}
+		} else if err := registerRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, accessToken, setup, replacements); err != nil {
+			return a.fail(fmt.Errorf("recovery key delivered, but remote registration failed: %w", err))
+		}
+		st.CommitRecoverySetup(setup)
+		if covered > 0 {
+			if err := st.MarkRecoveryWrapped(st.State.ControlPlane.WorkspaceSlug, covered); err != nil {
+				return a.fail(err)
+			}
+		} else if err := st.Save(); err != nil {
+			return a.fail(err)
+		}
+		fmt.Fprintf(a.Out, "✓ Recovery configured (%s)\n", setup.Fingerprint)
+		if len(replacements) > 0 {
+			fmt.Fprintf(a.Out, "✓ Added recovery wrapping to %d remote secret(s)\n", len(replacements))
+		}
+		return 0
+	case "restore":
+		return a.recoveryRestore(st, args[1:])
+	default:
+		return a.fail(fmt.Errorf("unknown recovery command %q", args[0]))
+	}
+}
+func (a App) recoveryRestore(st *store.FileStore, args []string) int {
+	if st.State.ControlPlane == nil {
+		return a.fail(errors.New("asiri is not linked to a control plane"))
+	}
+	if err := rejectWorkloadControlPlaneMutation(st); err != nil {
+		return a.fail(err)
+	}
+	workspaceArg, remaining, err := splitWorkspaceFlag(args, "recovery restore", true)
+	if err != nil {
+		return a.fail(err)
+	}
+	if err := rejectUnknownArgs(remaining, "--stdin", "--key-file", "--force"); err != nil {
+		return a.fail(err)
+	}
+	recoveryKey, err := a.readSensitiveInput(remaining, "Recovery key", "--key-file", "--key")
+	if err != nil {
+		return a.fail(err)
+	}
+	identity, err := store.RecoveryKeyIdentityForKey(recoveryKey)
+	if err != nil {
+		return a.fail(err)
+	}
+	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	if err != nil {
+		return a.fail(err)
+	}
+	target, accessToken, err := a.remoteWorkspaceTarget(st, accessToken, workspaceArg)
+	if err != nil {
+		return a.fail(err)
+	}
+	secrets, err := listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, identity.RecipientID)
+	if err != nil {
+		return a.fail(err)
+	}
+	activeVersions := remoteRecordsToVersions(secrets)
+	if len(activeVersions) == 0 {
+		if err := commitRecoveryIdentity(st, identity, 0); err != nil {
+			return a.fail(err)
+		}
+		fmt.Fprintln(a.Out, "No remote active secrets to restore")
+		return 0
+	}
+	imported, identity, err := st.ImportRecoveryRemoteSecretVersions(activeVersions, recoveryKey, hasFlag(remaining, "--force"))
+	if err != nil {
+		return a.fail(err)
+	}
+	rewrapped, err := a.addRecoveredDeviceWrappedKeys(st, accessToken, secrets, identity.RecipientID)
+	if err != nil {
+		return a.fail(err)
+	}
+	if err := commitRecoveryIdentity(st, identity, imported); err != nil {
+		return a.fail(err)
+	}
+	fmt.Fprintf(a.Out, "✓ Restored %d remote secret(s) and registered this device on %d secret(s)\n", imported, rewrapped)
+	return 0
+}
+
+func commitRecoveryIdentity(st *store.FileStore, identity store.RecoveryKeyIdentity, wrappedCount int) error {
+	if st.State.Recoveries == nil {
+		st.State.Recoveries = map[string]asiri.RecoveryConfig{}
+	}
+	now := time.Now().UTC()
+	st.State.Recoveries[st.State.ControlPlane.WorkspaceID] = asiri.RecoveryConfig{
+		RecipientID:          identity.RecipientID,
+		PublicKey:            identity.PublicKey,
+		PublicKeyFingerprint: identity.Fingerprint,
+		CreatedAt:            now,
+		WrappedSecretCount:   wrappedCount,
+		LastWrappedAt:        now,
+	}
+	return st.Save()
+}
+
+func (a App) addRecoveredDeviceWrappedKeys(st *store.FileStore, accessToken string, secrets []remoteSecretRecord, recoveryRecipientID string) (int, error) {
+	device, err := st.ActiveDevice()
+	if err != nil {
+		return 0, err
+	}
+	updated := 0
+	for _, secret := range secrets {
+		if secret.Status != "active" {
+			continue
+		}
+		if !remoteSecretHasRecoveryRecipient(secret, recoveryRecipientID) || remoteSecretHasRecipient(secret, st.State.ControlPlane.DeviceID) {
+			continue
+		}
+		if !localSecretVersionExists(st, secret.Scope, secret.Name, secret.Version) {
+			continue
+		}
+		wrapped, err := st.RemoteWrappedKeyForSecretVersionPublicKey(secret.Scope, secret.Name, secret.Version, st.State.ControlPlane.DeviceID, device.EncryptionPublicKey)
+		if err != nil {
+			return updated, err
+		}
+		if err := addRecoveryRestoredWrappedKeys(st, st.State.ControlPlane.Origin, secret.ID, accessToken, recoveryRecipientID, []store.RemoteWrappedKey{wrapped}); err != nil {
+			return updated, err
+		}
+		updated += 1
+	}
+	return updated, nil
+}
+
+func (a App) prepareRemoteRecoveryReplacementKeys(st *store.FileStore, accessToken string, recovery asiri.RecoveryConfig, previousRecoveryRecipientID string) ([]recoveryRecipientReplacement, int, error) {
+	if st.State.ControlPlane == nil {
+		return nil, 0, nil
+	}
+	if binding, ok := st.RemoteBindingForPrefix(st.State.ControlPlane.WorkspaceSlug); !ok || binding.WorkspaceID != st.State.ControlPlane.WorkspaceID {
+		return nil, 0, nil
+	}
+	secrets, err := listRemoteSecrets(st, st.State.ControlPlane.Origin, st.State.ControlPlane.WorkspaceID, accessToken, previousRecoveryRecipientID)
+	if err != nil {
+		if previousRecoveryRecipientID != "" && strings.Contains(err.Error(), "HTTP 403") {
+			secrets, err = listRemoteSecrets(st, st.State.ControlPlane.Origin, st.State.ControlPlane.WorkspaceID, accessToken, "")
+		}
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+	replacements := make([]recoveryRecipientReplacement, 0, len(secrets))
+	covered := 0
+	for _, secret := range secrets {
+		if secret.Status != "active" || !localSecretVersionExists(st, secret.Scope, secret.Name, secret.Version) {
+			continue
+		}
+		if remoteSecretHasRecoveryRecipient(secret, recovery.RecipientID) {
+			covered += 1
+			continue
+		}
+		key, err := st.RecoveryWrappedKeyForSecretVersionWithConfig(secret.Scope, secret.Name, secret.Version, recovery)
+		if err != nil {
+			return nil, 0, err
+		}
+		replacements = append(replacements, recoveryRecipientReplacement{SecretID: secret.ID, WrappedKey: key})
+		covered += 1
+	}
+	return replacements, covered, nil
+}
+
+type deviceTrustOptions struct {
+	Workspace string
+	All       bool
+	Origin    string
+}
+
+func parseDeviceTrustArgs(args []string) (deviceTrustOptions, error) {
+	options := deviceTrustOptions{}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--workspace":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--workspace requires a slug")
+			}
+			slug, err := localWorkspaceSlug(args[i+1])
+			if err != nil {
+				return options, err
+			}
+			options.Workspace = slug
+			i++
+		case "--all":
+			options.All = true
+		case "--origin":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--origin requires a URL")
+			}
+			options.Origin = strings.TrimRight(args[i+1], "/")
+			i++
+		default:
+			return options, fmt.Errorf("unknown device trust argument %q", args[i])
+		}
+	}
+	if options.All && options.Workspace != "" {
+		return options, errors.New("use either --workspace or --all, not both")
+	}
+	if !options.All && options.Workspace == "" {
+		return options, errors.New("device trust requires --workspace or --all")
+	}
+	return options, nil
+}
+
+func deviceTrustOrigin(st *store.FileStore, explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	if origin := strings.TrimRight(os.Getenv("ASIRI_CONTROL_PLANE_ORIGIN"), "/"); origin != "" {
+		return origin
+	}
+	if st.State.ControlPlane != nil && st.State.ControlPlane.Origin != "" {
+		return st.State.ControlPlane.Origin
+	}
+	return defaultControlPlaneOrigin
+}
+
+func (a App) whoami(st *store.FileStore, args []string) int {
+	if err := rejectUnknownArgs(args); err != nil {
+		return a.fail(err)
+	}
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	if st.State.ControlPlane == nil {
+		return a.fail(errors.New("asiri is not linked to a control plane"))
+	}
+	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	if err != nil {
+		return a.fail(err)
+	}
+	var result remoteWhoamiResponse
+	endpoint := strings.TrimRight(st.State.ControlPlane.Origin, "/") + "/v1/whoami"
+	if err := getJSONBearer(st, endpoint, accessToken, &result); err != nil {
+		return a.fail(err)
+	}
+	localDeviceName := "-"
+	if device, err := st.ActiveDevice(); err == nil && device.Name != "" {
+		localDeviceName = device.Name
+	}
+	workspaceSlug := firstNonEmpty(result.Workspace.Slug, st.State.ControlPlane.WorkspaceSlug)
+	remoteDeviceID := firstNonEmpty(result.Device.ID, result.Session.DeviceID, st.State.ControlPlane.DeviceID)
+	tw := tabwriter.NewWriter(a.Out, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(tw, "USER ID\t%s\n", printable(firstNonEmpty(result.User.ID, st.State.ControlPlane.UserID)))
+	fmt.Fprintf(tw, "EMAIL\t%s\n", printable(result.User.Email))
+	fmt.Fprintf(tw, "NAME\t%s\n", printable(result.User.DisplayName))
+	fmt.Fprintf(tw, "ROLE\t%s\n", printable(result.User.Role))
+	fmt.Fprintf(tw, "STATUS\t%s\n", printable(result.User.Status))
+	fmt.Fprintf(tw, "WORKSPACE\t%s\n", printable(workspaceSlug))
+	if result.Session.WorkloadSlug != "" || st.State.ControlPlane.WorkloadSlug != "" {
+		fmt.Fprintf(tw, "WORKLOAD\t%s\n", printable(firstNonEmpty(result.Session.WorkloadSlug, st.State.ControlPlane.WorkloadSlug)))
+	}
+	fmt.Fprintf(tw, "LOCAL DEVICE\t%s\n", printable(localDeviceName))
+	fmt.Fprintf(tw, "REMOTE DEVICE\t%s\n", printable(remoteDeviceID))
+	fmt.Fprintf(tw, "ORIGIN\t%s\n", printable(st.State.ControlPlane.Origin))
+	if err := tw.Flush(); err != nil {
+		return a.fail(err)
+	}
+	return 0
+}
+
+func (a App) deviceStatus(st *store.FileStore, args []string) int {
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	if st.State.ControlPlane == nil {
+		return a.fail(errors.New("asiri is not linked to a control plane"))
+	}
+	workspaceFilters, remaining, err := splitWorkspaceFilters(args, "device status")
+	if err != nil {
+		return a.fail(err)
+	}
+	if err := rejectUnknownArgs(remaining); err != nil {
+		return a.fail(err)
+	}
+	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	if err != nil {
+		return a.fail(err)
+	}
+	workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken)
+	if err != nil {
+		return a.fail(err)
+	}
+	targets := make([]remoteWorkspaceResponse, 0, len(workspaces))
+	if len(workspaceFilters) == 0 {
+		targets = append(targets, workspaces...)
+	} else {
+		for _, requested := range workspaceFilters {
+			target, err := requireRemoteWorkspace(workspaces, requested)
+			if err != nil {
+				return a.fail(err)
+			}
+			targets = append(targets, target)
+		}
+	}
+	var remoteSecrets []visibleRemoteSecretRecord
+	var secretsErr error
+	secretsKnown := false
+	if st.State.ControlPlane.Source != "oidc" {
+		remoteSecrets, secretsErr = listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken)
+		secretsKnown = secretsErr == nil
+	}
+	keySummaries := workspaceKeySummaries(st, targets, remoteSecrets, st.State.ControlPlane.WorkspaceID, secretsKnown)
+	fmt.Fprintf(a.Out, "This device: %s\n", currentDeviceDescription(st))
+	tw := tabwriter.NewWriter(a.Out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "WORKSPACE\tROLE\tTHIS DEVICE\tACCOUNT WRITE\tKEYS\tNEXT\tREMOTE DEVICE")
+	for _, workspace := range targets {
+		keySummary := keySummaries[workspace.Slug]
+		remoteDevice := workspace.CurrentDeviceID
+		if remoteDevice == "" {
+			remoteDevice = "-"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", workspace.Slug, workspaceRoleLabel(workspace, st.State.UserID), deviceTrustLabelForWorkspace(workspace, st.State.ControlPlane.WorkspaceID), boolPointerLabel(workspace.CanWrite), keySummary.Keys, keySummary.Next, remoteDevice)
+	}
+	if err := tw.Flush(); err != nil {
+		return a.fail(err)
+	}
+	if secretsErr != nil {
+		fmt.Fprintf(a.Err, "asiri: remote key coverage unavailable: %s\n", secretsErr)
+	}
+	return 0
+}
+
+func (a App) deviceTrust(st *store.FileStore, args []string) int {
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	if err := rejectWorkloadControlPlaneMutation(st); err != nil {
+		return a.fail(err)
+	}
+	options, err := parseDeviceTrustArgs(args)
+	if err != nil {
+		return a.fail(err)
+	}
+	origin := deviceTrustOrigin(st, options.Origin)
+	if err := validateControlPlaneOrigin(origin); err != nil {
+		return a.fail(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		return a.fail(err)
+	}
+	if options.All {
+		if st.State.ControlPlane == nil {
+			return a.fail(errors.New("device trust --all requires an existing control-plane session"))
+		}
+		accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+		if err != nil {
+			return a.fail(err)
+		}
+		workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken)
+		if err != nil {
+			return a.fail(err)
+		}
+		original := remoteWorkspaceResponse{ID: st.State.ControlPlane.WorkspaceID, Slug: st.State.ControlPlane.WorkspaceSlug, CurrentDeviceTrusted: boolPtr(true), CanPull: boolPtr(true)}
+		eligible := make([]remoteWorkspaceResponse, 0)
+		tw := tabwriter.NewWriter(a.Out, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "WORKSPACE\tTHIS DEVICE\tAPPROVAL\tNEXT")
+		for _, workspace := range workspaces {
+			switch {
+			case workspaceDeviceTrusted(workspace, st.State.ControlPlane.WorkspaceID):
+				fmt.Fprintf(tw, "%s\ttrusted\tskipped\t-\n", workspace.Slug)
+			case !workspaceCanApproveDevice(workspace):
+				fmt.Fprintf(tw, "%s\tnot trusted\tskipped\task owner to approve\n", workspace.Slug)
+			default:
+				eligible = append(eligible, workspace)
+				fmt.Fprintf(tw, "%s\tnot trusted\teligible\tbrowser approval\n", workspace.Slug)
+			}
+		}
+		if err := tw.Flush(); err != nil {
+			return a.fail(err)
+		}
+		if len(eligible) == 0 {
+			fmt.Fprintln(a.Out, "No eligible workspaces need this device.")
+			return 0
+		}
+		currentToken := accessToken
+		for _, workspace := range eligible {
+			result, err := a.trustDeviceInWorkspace(st, origin, workspace.Slug, *device)
+			if err != nil {
+				return a.fail(err)
+			}
+			currentToken = result.AccessToken
+		}
+		if original.ID != "" && st.State.ControlPlane != nil && st.State.ControlPlane.WorkspaceID != original.ID {
+			if _, err := a.ensureWorkspaceSession(st, currentToken, original); err != nil {
+				fmt.Fprintf(a.Err, "asiri: could not restore original workspace session: %s\n", err)
+			}
+		}
+		return 0
+	}
+	if st.State.ControlPlane != nil {
+		accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+		if err != nil {
+			return a.fail(err)
+		}
+		workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken)
+		if err != nil {
+			return a.fail(err)
+		}
+		if target, ok := findWorkspace(workspaces, options.Workspace); ok {
+			if workspaceDeviceTrusted(target, st.State.ControlPlane.WorkspaceID) {
+				fmt.Fprintf(a.Out, "This device is already trusted for workspace %s\n", options.Workspace)
+				return 0
+			}
+			if !workspaceCanApproveDevice(target) {
+				return a.fail(fmt.Errorf("this account cannot approve devices for workspace %s", options.Workspace))
+			}
+		}
+	}
+	if _, err := a.trustDeviceInWorkspace(st, origin, options.Workspace, *device); err != nil {
+		return a.fail(err)
+	}
+	return 0
+}
+
+func (a App) trustDeviceInWorkspace(st *store.FileStore, origin, workspaceSlug string, device asiri.Device) (deviceCodeTokenResponse, error) {
+	start, err := startDeviceCodeLogin(origin, workspaceSlug, device)
+	if err != nil {
+		return deviceCodeTokenResponse{}, err
+	}
+	fmt.Fprintf(a.Out, "\nTrust this device for workspace %s\n", workspaceSlug)
+	fmt.Fprintf(a.Out, "Open %s\n", start.VerificationURIComplete)
+	fmt.Fprintf(a.Out, "Code: %s\n", start.UserCode)
+	result, err := pollDeviceCodeLogin(st, origin, start)
+	if err != nil {
+		return result, err
+	}
+	if result.WorkspaceSlug != workspaceSlug {
+		return result, fmt.Errorf("control plane approved workspace %s, expected %s", result.WorkspaceSlug, workspaceSlug)
+	}
+	if err := st.LinkControlPlaneForDevice(origin, result.OrgID, result.WorkspaceSlug, result.UserID, result.DeviceID, device.ID, result.AccessToken, result.RefreshToken, result.ExpiresIn, result.RefreshExpiresAt); err != nil {
+		return result, err
+	}
+	fmt.Fprintf(a.Out, "✓ This device is trusted for workspace %s\n", result.WorkspaceSlug)
+	return result, nil
+}
+
+func (a App) device(st *store.FileStore, args []string) int {
+	if len(args) == 0 {
+		return a.fail(errors.New("device subcommand required"))
+	}
+	switch args[0] {
+	case "name":
+		if err := rejectUnknownArgs(args[1:]); err != nil {
+			return a.fail(err)
+		}
+		if err := st.RequireInitialized(); err != nil {
+			return a.fail(err)
+		}
+		device, err := st.ActiveDevice()
+		if err != nil {
+			return a.fail(err)
+		}
+		if device.Name == "" {
+			return a.fail(errors.New("local device has no name"))
+		}
+		fmt.Fprintln(a.Out, device.Name)
+		return 0
+	case "enroll":
+		if err := st.RequireInitialized(); err != nil {
+			return a.fail(err)
+		}
+		if err := rejectWorkloadLocalMutation(st); err != nil {
+			return a.fail(err)
+		}
+		name := flagValue(args[1:], "--name", "")
+		if name == "" {
+			return a.fail(errors.New("--name is required"))
+		}
+		device, refs, err := createDevice(name)
+		if err != nil {
+			return a.fail(err)
+		}
+		st.State.Devices = append(st.State.Devices, device)
+		st.State.LocalDeviceID = device.ID
+		for _, ref := range refs {
+			st.AddKeyRef(ref.Purpose, ref.Account)
+		}
+		st.Audit(st.State.UserID, "device_enrolled", "allowed", "", "", "local device trusted", map[string]string{"device": name})
+		if err := st.Save(); err != nil {
+			return a.fail(err)
+		}
+		fmt.Fprintf(a.Out, "✓ Device %s enrolled and trusted (%s)\n", name, device.ID)
+		return 0
+	case "status":
+		return a.deviceStatus(st, args[1:])
+	case "trust":
+		return a.deviceTrust(st, args[1:])
+	case "list":
+		if err := st.RequireInitialized(); err != nil {
+			return a.fail(err)
+		}
+		workspaceFilters, remaining, err := splitWorkspaceFilters(args[1:], "device list")
+		if err != nil {
+			return a.fail(err)
+		}
+		if err := rejectUnknownArgs(remaining, "--remote"); err != nil {
+			return a.fail(err)
+		}
+		if hasFlag(remaining, "--remote") {
+			if st.State.ControlPlane == nil {
+				return a.fail(errors.New("asiri is not linked to a control plane"))
+			}
+			if err := rejectWorkloadControlPlaneMutation(st); err != nil {
+				return a.fail(err)
+			}
+			accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+			if err != nil {
+				return a.fail(err)
+			}
+			workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken)
+			if err != nil {
+				return a.fail(err)
+			}
+			targets := make([]remoteWorkspaceResponse, 0, len(workspaces))
+			if len(workspaceFilters) == 0 {
+				targets = append(targets, workspaces...)
+			} else {
+				for _, requested := range workspaceFilters {
+					target, err := requireRemoteWorkspace(workspaces, requested)
+					if err != nil {
+						return a.fail(err)
+					}
+					targets = append(targets, target)
+				}
+			}
+			type deviceListRow struct {
+				Workspace string
+				ID        string
+				Name      string
+				Kind      string
+				Status    string
+				Note      string
+			}
+			rows := []deviceListRow{}
+			currentToken := accessToken
+			activeWorkspaceID := st.State.ControlPlane.WorkspaceID
+			for _, target := range targets {
+				if !pullWorkspaceCanPull(target, activeWorkspaceID) {
+					rows = append(rows, deviceListRow{Workspace: target.Slug, Status: "skipped", Note: "this device is not trusted for this workspace"})
+					continue
+				}
+				token, err := a.ensureWorkspaceSession(st, currentToken, target)
+				if err != nil {
+					rows = append(rows, deviceListRow{Workspace: target.Slug, Status: "failed", Note: err.Error()})
+					continue
+				}
+				currentToken = token
+				if st.State.ControlPlane != nil {
+					target.ID = st.State.ControlPlane.WorkspaceID
+					target.Slug = st.State.ControlPlane.WorkspaceSlug
+				}
+				devices, err := listRemoteDevices(st, st.State.ControlPlane.Origin, target.ID, currentToken)
+				if err != nil {
+					rows = append(rows, deviceListRow{Workspace: target.Slug, Status: "failed", Note: err.Error()})
+					continue
+				}
+				for _, device := range devices {
+					rows = append(rows, deviceListRow{Workspace: target.Slug, ID: device.ID, Name: device.Name, Kind: device.Kind, Status: device.Status})
+				}
+			}
+			tw := tabwriter.NewWriter(a.Out, 0, 0, 2, ' ', 0)
+			fmt.Fprintln(tw, "WORKSPACE\tID\tNAME\tKIND\tSTATUS\tNOTE")
+			for _, row := range rows {
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", row.Workspace, row.ID, row.Name, row.Kind, row.Status, row.Note)
+			}
+			if err := tw.Flush(); err != nil {
+				return a.fail(err)
+			}
+			return 0
+		}
+		if len(workspaceFilters) > 0 {
+			return a.fail(errors.New("device list --workspace requires --remote"))
+		}
+		if len(st.State.Devices) == 0 {
+			fmt.Fprintln(a.Out, "No devices enrolled")
+			return 0
+		}
+		for _, device := range st.State.Devices {
+			fmt.Fprintf(a.Out, "%s\t%s\t%s\t%s\n", device.ID, device.Name, device.Kind, device.Status)
+		}
+		return 0
+	case "revoke":
+		remote := hasFlag(args[1:], "--remote")
+		revokeArgs := args[1:]
+		if remote {
+			workspaceArg, remaining, err := splitWorkspaceFlag(revokeArgs, "device revoke", true)
+			if err != nil {
+				return a.fail(err)
+			}
+			if err := rejectUnknownArgs(remaining, "--remote"); err != nil {
+				return a.fail(err)
+			}
+			deviceRef := firstPositional(remaining)
+			if deviceRef == "" {
+				return a.fail(errors.New("device revoke requires a device name or id"))
+			}
+			if err := st.RequireInitialized(); err != nil {
+				return a.fail(err)
+			}
+			if st.State.ControlPlane == nil {
+				return a.fail(errors.New("asiri is not linked to a control plane"))
+			}
+			if err := rejectWorkloadControlPlaneMutation(st); err != nil {
+				return a.fail(err)
+			}
+			accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+			if err != nil {
+				return a.fail(err)
+			}
+			target, accessToken, err := a.remoteWorkspaceTarget(st, accessToken, workspaceArg)
+			if err != nil {
+				return a.fail(err)
+			}
+			device, err := revokeRemoteDevice(st, st.State.ControlPlane.Origin, deviceRef, accessToken)
+			if err != nil {
+				return a.fail(err)
+			}
+			revokedActive := device.ID == st.State.ControlPlane.DeviceID
+			label := device.Name
+			if label == "" {
+				label = device.ID
+			}
+			if revokedActive {
+				if err := st.QuarantineLocalKeys("remote device revoked; local key material cleared"); err != nil {
+					return a.fail(fmt.Errorf("remote device revoked, but local key cleanup failed: %w", err))
+				}
+			}
+			fmt.Fprintf(a.Out, "✓ Remote device %s revoked in workspace %s; rotate affected secrets after suspected compromise\n", label, target.Slug)
+			return 0
+		}
+		if workspaceArg, _, err := splitWorkspaceFlag(revokeArgs, "device revoke", false); err != nil {
+			return a.fail(err)
+		} else if workspaceArg != "" {
+			return a.fail(errors.New("device revoke --workspace requires --remote"))
+		}
+		if err := rejectUnknownArgs(revokeArgs); err != nil {
+			return a.fail(err)
+		}
+		if err := rejectWorkloadLocalMutation(st); err != nil {
+			return a.fail(err)
+		}
+		deviceRef := firstPositional(revokeArgs)
+		if deviceRef == "" {
+			return a.fail(errors.New("device revoke requires a device name or id"))
+		}
+		if err := st.RevokeDevice(deviceRef); err != nil {
+			return a.fail(err)
+		}
+		fmt.Fprintf(a.Out, "✓ Device %s revoked; rotate affected secrets after suspected compromise\n", deviceRef)
+		return 0
+	default:
+		return a.fail(fmt.Errorf("unknown device command %q", args[0]))
+	}
+}
+
+func (a App) add(st *store.FileStore, args []string) int {
+	if err := rejectWorkloadLocalMutation(st); err != nil {
+		return a.fail(err)
+	}
+	workspaceArg, remaining, err := splitWorkspaceFlag(args, "add", true)
+	if err != nil {
+		return a.fail(err)
+	}
+	if len(remaining) == 0 {
+		return a.fail(errors.New("add requires scope/name"))
+	}
+	if err := rejectUnknownArgs(remaining[1:], "--stdin", "--value-file", "--value"); err != nil {
+		return a.fail(err)
+	}
+	target, err := a.workspacePathTarget(st, workspaceArg, "add")
+	if err != nil {
+		return a.fail(err)
+	}
+	fullPath, err := workspacePrefixedPath(target, remaining[0], "add")
+	if err != nil {
+		return a.fail(err)
+	}
+	value, err := a.readSensitiveInput(remaining[1:], "Secret value", "--value-file", "--value")
+	if err != nil {
+		return a.fail(err)
+	}
+	secret, err := st.AddSecret(fullPath, value)
+	if err != nil {
+		return a.fail(err)
+	}
+	fmt.Fprintf(a.Out, "✓ Stored %s in workspace %s as encrypted version %d (%s)\n", shortSecretPath(secret.Scope, secret.Name), target.Slug, secret.ActiveVersion, store.Mask(value))
+	return 0
+}
+
+func (a App) get(st *store.FileStore, args []string) int {
+	workspaceArg, remaining, err := splitWorkspaceFlag(args, "get", true)
+	if err != nil {
+		return a.fail(err)
+	}
+	if len(remaining) == 0 {
+		return a.fail(errors.New("get requires scope/name"))
+	}
+	if err := rejectUnknownArgs(remaining[1:], "--agent"); err != nil {
+		return a.fail(err)
+	}
+	target, err := a.workspacePathTarget(st, workspaceArg, "get")
+	if err != nil {
+		return a.fail(err)
+	}
+	fullPath, err := workspacePrefixedPath(target, remaining[0], "get")
+	if err != nil {
+		return a.fail(err)
+	}
+	agentExplicit := hasFlag(remaining[1:], "--agent")
+	agent, _, err := optionalFlagValue(remaining[1:], "--agent")
+	if err != nil {
+		return a.fail(err)
+	}
+	agent, runtimeType, err := workloadRuntimeSubject(st, agent, "", agentExplicit)
+	if err != nil {
+		return a.fail(err)
+	}
+	if agent != "" {
+		allowed, reason := st.CheckPolicy(agent, fullPath, "read")
+		if !allowed {
+			secret, err := st.SecretMetadata(fullPath)
+			if err == nil {
+				metadata := runtimeAuditMetadata(st, secret.Scope, agent, runtimeType, nil)
+				st.Audit(agent, "secret_read", "denied", secret.Scope, secret.NameHash, reason, metadata)
+			} else {
+				metadata := runtimeAuditMetadata(st, "", agent, runtimeType, nil)
+				st.Audit(agent, "secret_read", "denied", "", "", reason, metadata)
+			}
+			_ = st.Save()
+			a.syncRuntimeAuditBestEffort(st)
+			return a.fail(errors.New(reason))
+		}
+	}
+	value, secret, err := st.GetSecret(fullPath)
+	if err != nil {
+		return a.fail(err)
+	}
+	actor := st.State.UserID
+	if agent != "" {
+		actor = agent
+	}
+	st.Audit(actor, "secret_read", "allowed", secret.Scope, secret.NameHash, "raw read", runtimeAuditMetadata(st, secret.Scope, agent, runtimeType, nil))
+	if err := st.Save(); err != nil {
+		return a.fail(err)
+	}
+	a.syncRuntimeAuditBestEffort(st)
+	fmt.Fprintln(a.Out, value)
+	return 0
+}
+
+func (a App) list(st *store.FileStore, args []string) int {
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	workspaceFilters, remaining, err := splitWorkspaceFilters(args, "list")
+	if err != nil {
+		return a.fail(err)
+	}
+	if err := rejectUnknownArgs(remaining, "--local", "--remote", "--status"); err != nil {
+		return a.fail(err)
+	}
+	statusFilter, _, err := optionalFlagValue(remaining, "--status")
+	if err != nil {
+		return a.fail(err)
+	}
+	if statusFilter != "" && !validListStatus(statusFilter) {
+		return a.fail(fmt.Errorf("unknown list status %q", statusFilter))
+	}
+	localOnly := hasFlag(remaining, "--local")
+	remoteOnly := hasFlag(remaining, "--remote")
+	if localOnly && remoteOnly {
+		return a.fail(errors.New("use either --local or --remote, not both"))
+	}
+	filter := strings.Trim(firstPositionalSkippingFlagValues(remaining, "--status"), "/")
+	var workspaceSet map[string]bool
+	if localOnly {
+		workspaceSet, err = localWorkspaceFilterSet(workspaceFilters, "list")
+	} else {
+		workspaceSet, err = a.workspaceFilterSet(st, workspaceFilters, "list")
+	}
+	if err != nil {
+		return a.fail(err)
+	}
+	if err := a.rejectWorkspacePrefixedFilter(st, filter, workspaceSet, "list", !localOnly); err != nil {
+		return a.fail(err)
+	}
+	rows := make(map[string]listRow)
+	for _, secret := range st.State.Secrets {
+		version := activeVersion(secret)
+		if version == nil {
+			continue
+		}
+		fullPath := store.SecretKey(secret.Scope, secret.Name)
+		workspace := store.WorkspacePrefix(secret.Scope)
+		rows[fullPath] = listRow{
+			Path:         shortSecretPath(secret.Scope, secret.Name),
+			Version:      secret.ActiveVersion,
+			NameHash:     secret.NameHash,
+			Status:       "local-only",
+			Keys:         "local",
+			Workspace:    workspace,
+			WorkspaceID:  boundWorkspaceID(st, workspace),
+			HasLocal:     true,
+			HasRemote:    false,
+			RemoteStatus: "",
+		}
+	}
+	if st.State.ControlPlane != nil && !localOnly && st.State.ControlPlane.Source != "oidc" {
+		accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+		if err != nil {
+			if remoteOnly || len(rows) == 0 {
+				return a.fail(err)
+			}
+			fmt.Fprintf(a.Err, "asiri: remote list unavailable: %s\n", err)
+		} else {
+			remoteSecrets, err := listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken)
+			if err != nil {
+				if remoteOnly || len(rows) == 0 {
+					return a.fail(err)
+				}
+				fmt.Fprintf(a.Err, "asiri: remote list unavailable: %s\n", err)
+			} else {
+				for _, secret := range remoteSecrets {
+					if secret.Status != "active" {
+						continue
+					}
+					fullPath := store.SecretKey(secret.Scope, secret.Name)
+					row := rows[fullPath]
+					if row.Path == "" {
+						row = listRow{Path: shortSecretPath(secret.Scope, secret.Name), NameHash: store.HashSecretName(secret.Scope, secret.Name), Workspace: secret.WorkspaceSlug, WorkspaceID: secret.OrgID}
+					}
+					row.Version = maxInt(row.Version, secret.Version)
+					row.HasRemote = true
+					row.WorkspaceID = secret.OrgID
+					row.Keys = remoteSecretKeyLabel(st, secret)
+					row.RemoteStatus = "read-only"
+					if secret.CanWrite {
+						row.RemoteStatus = "writable"
+					}
+					if row.HasLocal {
+						row.Status = "synced"
+					} else {
+						row.Status = "remote-only"
+					}
+					rows[fullPath] = row
+				}
+			}
+		}
+	}
+	keys := make([]string, 0, len(rows))
+	for key, row := range rows {
+		if !matchesListFilter(row, filter, workspaceSet, statusFilter, localOnly, remoteOnly) {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	if len(keys) == 0 {
+		if localOnly {
+			fmt.Fprintln(a.Out, "No local secrets found.")
+			return 0
+		}
+		fmt.Fprintln(a.Out, "No secrets found.")
+		return 0
+	}
+	w := tabwriter.NewWriter(a.Out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "WORKSPACE\tPATH\tVER\tHASH\tSTATE\tKEYS")
+	for _, key := range keys {
+		row := rows[key]
+		status := row.Status
+		if row.RemoteStatus != "" {
+			status += "," + row.RemoteStatus
+		}
+		fmt.Fprintf(w, "%s\t%s\tv%d\t%s\t%s\t%s\n", row.Workspace, row.Path, row.Version, row.NameHash, status, row.Keys)
+	}
+	if err := w.Flush(); err != nil {
+		return a.fail(err)
+	}
+	return 0
+}
+
+func (a App) rotate(st *store.FileStore, args []string) int {
+	if err := rejectWorkloadLocalMutation(st); err != nil {
+		return a.fail(err)
+	}
+	workspaceArg, remaining, err := splitWorkspaceFlag(args, "rotate", true)
+	if err != nil {
+		return a.fail(err)
+	}
+	if len(remaining) == 0 {
+		return a.fail(errors.New("rotate requires scope/name"))
+	}
+	if err := rejectUnknownArgs(remaining[1:], "--stdin", "--value-file", "--value"); err != nil {
+		return a.fail(err)
+	}
+	target, err := a.workspacePathTarget(st, workspaceArg, "rotate")
+	if err != nil {
+		return a.fail(err)
+	}
+	fullPath, err := workspacePrefixedPath(target, remaining[0], "rotate")
+	if err != nil {
+		return a.fail(err)
+	}
+	value, err := a.readSensitiveInput(remaining[1:], "Secret value", "--value-file", "--value")
+	if err != nil {
+		return a.fail(err)
+	}
+	secret, err := st.AddSecret(fullPath, value)
+	if err != nil {
+		return a.fail(err)
+	}
+	fmt.Fprintf(a.Out, "✓ Rotated %s in workspace %s to encrypted version %d (%s)\n", shortSecretPath(secret.Scope, secret.Name), target.Slug, secret.ActiveVersion, store.Mask(value))
+	return 0
+}
+
+func (a App) remove(st *store.FileStore, args []string) int {
+	if err := rejectWorkloadLocalMutation(st); err != nil {
+		return a.fail(err)
+	}
+	workspaceArg, remaining, err := splitWorkspaceFlag(args, "rm", true)
+	if err != nil {
+		return a.fail(err)
+	}
+	if len(remaining) == 0 {
+		return a.fail(errors.New("rm requires scope/name"))
+	}
+	if err := rejectUnknownArgs(remaining[1:]); err != nil {
+		return a.fail(err)
+	}
+	target, err := a.workspacePathTarget(st, workspaceArg, "rm")
+	if err != nil {
+		return a.fail(err)
+	}
+	fullPath, err := workspacePrefixedPath(target, remaining[0], "rm")
+	if err != nil {
+		return a.fail(err)
+	}
+	if err := st.RemoveSecret(fullPath); err != nil {
+		return a.fail(err)
+	}
+	fmt.Fprintf(a.Out, "✓ Removed %s from workspace %s\n", remaining[0], target.Slug)
+	return 0
+}
+
+func (a App) secret(st *store.FileStore, args []string) int {
+	if len(args) == 0 {
+		return a.fail(errors.New("secret subcommand required"))
+	}
+	switch args[0] {
+	case "delete":
+		return a.remoteSecretDelete(st, args[1:])
+	default:
+		return a.fail(fmt.Errorf("unknown secret command %q", args[0]))
+	}
+}
+
+func (a App) remoteSecretDelete(st *store.FileStore, args []string) int {
+	workspaceArg, remaining, err := splitWorkspaceFlag(args, "secret delete", true)
+	if err != nil {
+		return a.fail(err)
+	}
+	if err := rejectUnknownArgs(remaining, "--yes", "--remote-only-unwrapped"); err != nil {
+		return a.fail(err)
+	}
+	bulkRemoteOnlyUnwrapped := hasFlag(remaining, "--remote-only-unwrapped")
+	positionals := positionalArgs(remaining)
+	if bulkRemoteOnlyUnwrapped && len(positionals) > 0 {
+		return a.fail(errors.New("secret delete --remote-only-unwrapped does not accept scope/name"))
+	}
+	if !bulkRemoteOnlyUnwrapped && len(positionals) == 0 {
+		return a.fail(errors.New("secret delete requires scope/name"))
+	}
+	if !bulkRemoteOnlyUnwrapped && len(positionals) > 1 {
+		return a.fail(errors.New("secret delete accepts one scope/name"))
+	}
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	if st.State.ControlPlane == nil {
+		return a.fail(errors.New("asiri is not linked to a control plane"))
+	}
+	if err := rejectWorkloadControlPlaneMutation(st); err != nil {
+		return a.fail(err)
+	}
+	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	if err != nil {
+		return a.fail(err)
+	}
+	target, accessToken, err := a.remoteWorkspaceTarget(st, accessToken, workspaceArg)
+	if err != nil {
+		return a.fail(err)
+	}
+	if bulkRemoteOnlyUnwrapped {
+		return a.remoteSecretDeleteRemoteOnlyUnwrapped(st, accessToken, target, hasFlag(remaining, "--yes"))
+	}
+	shortPath := strings.Trim(positionals[0], "/")
+	known := knownWorkspaceSlugs(st)
+	known[target.Slug] = true
+	fullPath, err := workspacePrefixedPath(workspacePathTarget{Slug: target.Slug, KnownSlugs: known}, shortPath, "secret delete")
+	if err != nil {
+		return a.fail(err)
+	}
+	scope, name, err := store.ParseSecretPath(fullPath)
+	if err != nil {
+		return a.fail(err)
+	}
+	remoteSecret, err := resolveActiveRemoteSecret(st, st.State.ControlPlane.Origin, accessToken, target, scope, name)
+	if err != nil {
+		return a.fail(err)
+	}
+	if !hasFlag(remaining, "--yes") {
+		if err := a.confirmRemoteSecretDelete(shortPath, target.Slug); err != nil {
+			return a.fail(err)
+		}
+	}
+	deviceID := st.State.ControlPlane.DeviceID
+	if deviceID == "" {
+		return a.fail(errors.New("control-plane session is missing current device id"))
+	}
+	deleted, err := deleteRemoteSecret(st, st.State.ControlPlane.Origin, remoteSecret.ID, deviceID, accessToken)
+	if err != nil {
+		return a.fail(err)
+	}
+	fmt.Fprintf(a.Out, "✓ Marked remote secret %s deleted in workspace %s (v%d)\n", shortPath, target.Slug, deleted.Version)
+	return 0
+}
+
+func (a App) remoteSecretDeleteRemoteOnlyUnwrapped(st *store.FileStore, accessToken string, target remoteWorkspaceResponse, yes bool) int {
+	deviceID := st.State.ControlPlane.DeviceID
+	if deviceID == "" {
+		return a.fail(errors.New("control-plane session is missing current device id"))
+	}
+	secrets, err := listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken)
+	if err != nil {
+		return a.fail(err)
+	}
+	candidates := remoteOnlyUnwrappedDeleteCandidates(st, target, secrets)
+	if len(candidates) == 0 {
+		fmt.Fprintf(a.Out, "No remote-only unwrapped active secrets found in workspace %s\n", target.Slug)
+		return 0
+	}
+	if !yes {
+		fmt.Fprintf(a.Out, "Remote-only unwrapped active secrets in workspace %s:\n", target.Slug)
+		for _, secret := range candidates {
+			fmt.Fprintf(a.Out, "  %s\n", shortSecretPath(secret.Scope, secret.Name))
+		}
+		if err := a.confirmBulkRemoteSecretDelete(target.Slug, len(candidates)); err != nil {
+			return a.fail(err)
+		}
+	}
+	deleted := 0
+	for _, secret := range candidates {
+		if _, err := deleteRemoteSecret(st, st.State.ControlPlane.Origin, secret.ID, deviceID, accessToken); err != nil {
+			return a.fail(fmt.Errorf("failed to delete %s: %w", shortSecretPath(secret.Scope, secret.Name), err))
+		}
+		deleted++
+	}
+	fmt.Fprintf(a.Out, "✓ Marked %d remote-only unwrapped active secret(s) deleted in workspace %s\n", deleted, target.Slug)
+	return 0
+}
+
+func (a App) confirmRemoteSecretDelete(shortPath, workspace string) error {
+	fmt.Fprintf(a.Out, "Type %s to delete remote secret in workspace %s: ", shortPath, workspace)
+	reader := bufio.NewReader(a.In)
+	value, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	value = strings.TrimSuffix(value, "\n")
+	value = strings.TrimSuffix(value, "\r")
+	if value != shortPath {
+		return errors.New("confirmation did not match; remote secret was not deleted")
+	}
+	return nil
+}
+
+func (a App) confirmBulkRemoteSecretDelete(workspace string, count int) error {
+	confirmation := fmt.Sprintf("delete %s %d", workspace, count)
+	fmt.Fprintf(a.Out, "Type %s to delete these remote secrets: ", confirmation)
+	reader := bufio.NewReader(a.In)
+	value, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	value = strings.TrimSuffix(value, "\n")
+	value = strings.TrimSuffix(value, "\r")
+	if value != confirmation {
+		return errors.New("confirmation did not match; remote secrets were not deleted")
+	}
+	return nil
+}
+
+func (a App) grant(st *store.FileStore, args []string) int {
+	if err := rejectWorkloadLocalMutation(st); err != nil {
+		return a.fail(err)
+	}
+	workspaceArg, remaining, err := splitWorkspaceFlag(args, "grant", true)
+	if err != nil {
+		return a.fail(err)
+	}
+	if len(remaining) < 2 {
+		return a.fail(errors.New("grant requires subject and scope/name"))
+	}
+	actions := []string{}
+	if hasFlag(remaining[2:], "--inject-only") {
+		actions = append(actions, "inject")
+	}
+	if hasFlag(remaining[2:], "--read") {
+		actions = append(actions, "read")
+	}
+	if hasFlag(remaining[2:], "--mount") {
+		actions = append(actions, "mount")
+	}
+	if len(actions) == 0 {
+		return a.fail(errors.New("grant requires --inject-only, --read, or --mount"))
+	}
+	if err := rejectUnknownArgs(remaining[2:], "--inject-only", "--read", "--mount"); err != nil {
+		return a.fail(err)
+	}
+	target, err := a.workspacePathTarget(st, workspaceArg, "grant")
+	if err != nil {
+		return a.fail(err)
+	}
+	fullPath, err := workspacePrefixedPath(target, remaining[1], "grant")
+	if err != nil {
+		return a.fail(err)
+	}
+	policy, err := st.Grant(remaining[0], fullPath, actions)
+	if err != nil {
+		return a.fail(err)
+	}
+	fmt.Fprintf(a.Out, "✓ Policy %s grants %s %s on %s/%s\n", policy.ID, policy.Subject, strings.Join(policy.Actions, ","), policy.ScopePattern, policy.SecretPattern)
+	return 0
+}
+
+func (a App) deny(st *store.FileStore, args []string) int {
+	if err := rejectWorkloadLocalMutation(st); err != nil {
+		return a.fail(err)
+	}
+	workspaceArg, remaining, err := splitWorkspaceFlag(args, "deny", true)
+	if err != nil {
+		return a.fail(err)
+	}
+	if len(remaining) < 2 {
+		return a.fail(errors.New("deny requires subject and scope pattern"))
+	}
+	if err := rejectUnknownArgs(remaining[2:]); err != nil {
+		return a.fail(err)
+	}
+	target, err := a.workspacePathTarget(st, workspaceArg, "deny")
+	if err != nil {
+		return a.fail(err)
+	}
+	pattern, err := workspacePrefixedPattern(target, remaining[1], "deny")
+	if err != nil {
+		return a.fail(err)
+	}
+	policy, err := st.Deny(remaining[0], pattern)
+	if err != nil {
+		return a.fail(err)
+	}
+	fmt.Fprintf(a.Out, "✓ Policy %s requires owner approval for %s on %s/%s\n", policy.ID, policy.Subject, policy.ScopePattern, policy.SecretPattern)
+	return 0
+}
+
+func (a App) policy(st *store.FileStore, args []string) int {
+	if len(args) == 0 || args[0] != "list" {
+		return a.fail(errors.New("policy list is the supported policy subcommand"))
+	}
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	workspaceFilters, remaining, err := splitWorkspaceFilters(args[1:], "policy list")
+	if err != nil {
+		return a.fail(err)
+	}
+	if err := rejectUnknownArgs(remaining); err != nil {
+		return a.fail(err)
+	}
+	workspaceSet, err := a.workspaceFilterSet(st, workspaceFilters, "policy list")
+	if err != nil {
+		return a.fail(err)
+	}
+	for _, policy := range st.State.Policies {
+		if len(workspaceSet) > 0 && !workspaceSet[store.WorkspacePrefix(policy.ScopePattern)] {
+			continue
+		}
+		fmt.Fprintf(a.Out, "%s\t%s\t%s/%s\t%s\t%s\n", policy.ID, policy.Subject, policy.ScopePattern, policy.SecretPattern, strings.Join(policy.Actions, ","), policy.ApprovalMode)
+	}
+	return 0
+}
+
+func (a App) run(st *store.FileStore, args []string) int {
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	workspaceArg, remaining, err := splitWorkspaceFlag(args, "run", true)
+	if err != nil {
+		return a.fail(err)
+	}
+	target, err := a.workspacePathTarget(st, workspaceArg, "run")
+	if err != nil {
+		return a.fail(err)
+	}
+	if runUsesUnsafeArgv(remaining) {
+		if runUsesExplicitEnvMapping(remaining) {
+			return a.fail(errors.New("run cannot combine --unsafe-argv with --env"))
+		}
+		return a.runWithUnsafeArgv(st, target, remaining)
+	}
+	if runUsesExplicitEnvMapping(remaining) {
+		return a.runWithEnvMappings(st, target, remaining)
+	}
+	for _, arg := range remaining {
+		if strings.Contains(arg, "asiri://") {
+			return a.fail(errors.New("asiri:// argument substitution is disabled; use --unsafe-argv"))
+		}
+	}
+	return a.fail(errors.New("run requires --env or --unsafe-argv"))
+}
+
+func runUsesUnsafeArgv(args []string) bool {
+	return runHasLeadingOption(args, "--unsafe-argv")
+}
+
+func runUsesExplicitEnvMapping(args []string) bool {
+	return runHasLeadingOption(args, "--env", "--map")
+}
+
+func runHasLeadingOption(args []string, targets ...string) bool {
+	target := map[string]bool{}
+	for _, item := range targets {
+		target[item] = true
+	}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return false
+		}
+		if target[arg] {
+			return true
+		}
+		switch arg {
+		case "--agent", "--env", "--map", "--workspace", "-w":
+			i++
+		case "--unsafe-argv":
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+func (a App) runWithEnvMappings(st *store.FileStore, target workspacePathTarget, remaining []string) int {
+	var mappings []string
+	var agent string
+	agentExplicit := false
+	cmdIndex := -1
+	for i := 0; i < len(remaining); i++ {
+		switch remaining[i] {
+		case "--env", "--map":
+			if i+1 >= len(remaining) {
+				return a.fail(errors.New("--env requires NAME=scope/name"))
+			}
+			mappings = append(mappings, remaining[i+1])
+			i++
+		case "--agent":
+			if i+1 >= len(remaining) {
+				return a.fail(errors.New("--agent requires a subject"))
+			}
+			agentExplicit = true
+			agent = remaining[i+1]
+			i++
+		case "--":
+			cmdIndex = i + 1
+			i = len(remaining)
+		default:
+			if strings.HasPrefix(remaining[i], "--") {
+				return a.fail(fmt.Errorf("unknown run option %s", remaining[i]))
+			}
+		}
+	}
+	if len(mappings) == 0 {
+		return a.fail(errors.New("run requires at least one explicit --env NAME=scope/name mapping"))
+	}
+	if cmdIndex < 0 || cmdIndex >= len(remaining) {
+		return a.fail(errors.New("run requires -- <command...>"))
+	}
+	agent, runtimeType, err := workloadRuntimeSubject(st, agent, filepath.Base(remaining[cmdIndex]), agentExplicit)
+	if err != nil {
+		return a.fail(err)
+	}
+	type envResolvedSecret struct {
+		resolvedSecret
+		EnvName string
+	}
+	env := os.Environ()
+	resolved := []envResolvedSecret{}
+	for _, mapping := range mappings {
+		name, path, ok := strings.Cut(mapping, "=")
+		if !ok || name == "" || path == "" {
+			return a.fail(fmt.Errorf("invalid env mapping %q", mapping))
+		}
+		fullPath, err := workspacePrefixedPath(target, path, "run")
+		if err != nil {
+			return a.fail(err)
+		}
+		allowed, reason := st.CheckPolicy(agent, fullPath, "inject")
+		if !allowed {
+			a.auditDeniedSecretUse(st, agent, runtimeType, fullPath, reason)
+			_ = st.Save()
+			a.syncRuntimeAuditBestEffort(st)
+			return a.fail(fmt.Errorf("%s: %s cannot inject %s", reason, agent, fullPath))
+		}
+		value, secret, err := st.GetSecret(fullPath)
+		if err != nil {
+			return a.fail(err)
+		}
+		env = append(env, name+"="+value)
+		resolved = append(resolved, envResolvedSecret{
+			resolvedSecret: resolvedSecret{Path: fullPath, Scope: secret.Scope, Name: secret.Name, Hash: secret.NameHash, Value: value},
+			EnvName:        name,
+		})
+	}
+	for _, secret := range resolved {
+		st.Audit(agent, "secret_injected", "allowed", secret.Scope, secret.Hash, "explicit env mapping", runtimeAuditMetadata(st, secret.Scope, agent, runtimeType, map[string]string{"env": secret.EnvName}))
+	}
+	if err := st.Save(); err != nil {
+		return a.fail(err)
+	}
+	a.syncRuntimeAuditBestEffort(st)
+	return a.execChild(remaining[cmdIndex], remaining[cmdIndex+1:], env)
+}
+
+func (a App) runWithUnsafeArgv(st *store.FileStore, target workspacePathTarget, remaining []string) int {
+	agent, agentExplicit, commandArgs, err := parseUnsafeArgvArgs(remaining)
+	if err != nil {
+		return a.fail(err)
+	}
+	agent, runtimeType, err := workloadRuntimeSubject(st, agent, filepath.Base(commandArgs[0]), agentExplicit)
+	if err != nil {
+		return a.fail(err)
+	}
+	resolvedArgs := make([]string, len(commandArgs))
+	resolvedArgs[0] = commandArgs[0]
+	if strings.Contains(commandArgs[0], "asiri://") {
+		return a.fail(errors.New("unsafe argv substitution is not allowed in the command name"))
+	}
+	resolvedSecrets := []resolvedSecret{}
+	for i, arg := range commandArgs[1:] {
+		resolved, err := a.resolveUnsafeArgvArg(st, target, agent, runtimeType, arg, &resolvedSecrets)
+		if err != nil {
+			_ = st.Save()
+			a.syncRuntimeAuditBestEffort(st)
+			return a.fail(err)
+		}
+		resolvedArgs[i+1] = resolved
+	}
+	for _, secret := range resolvedSecrets {
+		st.Audit(agent, "secret_unsafe_argv_injected", "allowed", secret.Scope, secret.Hash, "unsafe argv materialization", runtimeAuditMetadata(st, secret.Scope, agent, runtimeType, map[string]string{"mode": "unsafe-argv"}))
+	}
+	if err := st.Save(); err != nil {
+		return a.fail(err)
+	}
+	a.syncRuntimeAuditBestEffort(st)
+	return a.execChild(resolvedArgs[0], resolvedArgs[1:], os.Environ())
+}
+
+func parseUnsafeArgvArgs(args []string) (string, bool, []string, error) {
+	agent := ""
+	agentExplicit := false
+	unsafe := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--unsafe-argv":
+			unsafe = true
+		case "--agent":
+			if i+1 >= len(args) {
+				return "", false, nil, errors.New("--agent requires a subject")
+			}
+			agent = store.NormalizeSubjectLabel(args[i+1])
+			agentExplicit = true
+			i++
+		case "--":
+			if i+1 >= len(args) {
+				return "", false, nil, errors.New("run requires a command")
+			}
+			if !unsafe {
+				return "", false, nil, errors.New("--unsafe-argv is required for argument substitution")
+			}
+			return agent, agentExplicit, args[i+1:], nil
+		default:
+			if strings.HasPrefix(args[i], "--") {
+				return "", false, nil, fmt.Errorf("unknown run option %s", args[i])
+			}
+			if !unsafe {
+				return "", false, nil, errors.New("--unsafe-argv is required for argument substitution")
+			}
+			return agent, agentExplicit, args[i:], nil
+		}
+	}
+	return "", false, nil, errors.New("run requires a command")
+}
+
+func (a App) resolveUnsafeArgvArg(st *store.FileStore, target workspacePathTarget, agent, runtimeType, arg string, resolvedSecrets *[]resolvedSecret) (string, error) {
+	if !strings.Contains(arg, "asiri://") {
+		return arg, nil
+	}
+	matches := asiriRefPattern.FindAllStringIndex(arg, -1)
+	if len(matches) == 0 {
+		return "", errors.New("invalid asiri:// reference; expected asiri://scope/name")
+	}
+	for offset := 0; ; {
+		index := strings.Index(arg[offset:], "asiri://")
+		if index < 0 {
+			break
+		}
+		start := offset + index
+		covered := false
+		for _, match := range matches {
+			if match[0] == start {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			return "", errors.New("invalid asiri:// reference; expected asiri://scope/name")
+		}
+		offset = start + len("asiri://")
+	}
+	var resolveErr error
+	resolved := asiriRefPattern.ReplaceAllStringFunc(arg, func(ref string) string {
+		if resolveErr != nil {
+			return ref
+		}
+		value, err := a.resolveUnsafeArgvSecret(st, target, agent, runtimeType, strings.TrimPrefix(ref, "asiri://"), resolvedSecrets)
+		if err != nil {
+			resolveErr = err
+			return ref
+		}
+		return value
+	})
+	if resolveErr != nil {
+		return "", resolveErr
+	}
+	return resolved, nil
+}
+
+func (a App) resolveUnsafeArgvSecret(st *store.FileStore, target workspacePathTarget, agent, runtimeType, shortPath string, resolvedSecrets *[]resolvedSecret) (string, error) {
+	fullPath, err := workspacePrefixedPath(target, shortPath, "run")
+	if err != nil {
+		return "", err
+	}
+	allowed, reason := st.CheckPolicy(agent, fullPath, "inject")
+	scope, name, parseErr := store.ParseSecretPath(fullPath)
+	metadataScope := ""
+	if parseErr == nil {
+		metadataScope = scope
+	}
+	metadata := runtimeAuditMetadata(st, metadataScope, agent, runtimeType, map[string]string{"mode": "unsafe-argv"})
+	if !allowed {
+		if parseErr == nil {
+			st.Audit(agent, "secret_unsafe_argv_injected", "denied", scope, store.HashSecretName(scope, name), reason, metadata)
+		} else {
+			st.Audit(agent, "secret_unsafe_argv_injected", "denied", "", "", reason, metadata)
+		}
+		return "", fmt.Errorf("%s: %s cannot inject %s", reason, agent, fullPath)
+	}
+	value, secret, err := st.GetSecret(fullPath)
+	if err != nil {
+		return "", err
+	}
+	*resolvedSecrets = append(*resolvedSecrets, resolvedSecret{Path: fullPath, Scope: secret.Scope, Name: secret.Name, Hash: secret.NameHash, Value: value})
+	return value, nil
+}
+
+func (a App) auditDeniedSecretUse(st *store.FileStore, agent, runtimeType, fullPath, reason string) {
+	scope, name, err := store.ParseSecretPath(fullPath)
+	if err != nil {
+		metadata := runtimeAuditMetadata(st, "", agent, runtimeType, nil)
+		st.Audit(agent, "secret_injected", "denied", "", "", reason, metadata)
+		return
+	}
+	metadata := runtimeAuditMetadata(st, scope, agent, runtimeType, nil)
+	st.Audit(agent, "secret_injected", "denied", scope, store.HashSecretName(scope, name), reason, metadata)
+}
+
+func (a App) execChild(name string, args []string, env []string) int {
+	command := exec.Command(name, args...)
+	command.Env = env
+	command.Stdout = a.Out
+	command.Stderr = a.Err
+	command.Stdin = os.Stdin
+	if err := command.Run(); err != nil {
+		return a.fail(err)
+	}
+	return 0
+}
+
+type resolvedSecret struct {
+	Path  string
+	Scope string
+	Name  string
+	Hash  string
+	Value string
+}
+
+func (a App) env(st *store.FileStore, args []string) int {
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	workspaceArg, remaining, err := splitWorkspaceFlag(args, "env", true)
+	if err != nil {
+		return a.fail(err)
+	}
+	target, err := a.workspacePathTarget(st, workspaceArg, "env")
+	if err != nil {
+		return a.fail(err)
+	}
+	agentExplicit := hasFlag(remaining, "--agent")
+	agent, pathSpec, commandArgs, err := parseSecretCommandArgs("env", remaining, false)
+	if err != nil {
+		return a.fail(err)
+	}
+	pathSpec, err = workspacePrefixedSelection(target, pathSpec, "env")
+	if err != nil {
+		return a.fail(err)
+	}
+	agent, runtimeType, err := workloadRuntimeSubject(st, agent, filepath.Base(commandArgs[0]), agentExplicit)
+	if err != nil {
+		return a.fail(err)
+	}
+	secrets, err := a.resolveSecretSelection(st, pathSpec, agent, runtimeType, "inject", "secret_env_exported")
+	if err != nil {
+		_ = st.Save()
+		a.syncRuntimeAuditBestEffort(st)
+		return a.fail(err)
+	}
+	envAdds := make(map[string]string, len(secrets))
+	for _, secret := range secrets {
+		if !envNamePattern.MatchString(secret.Name) {
+			return a.fail(fmt.Errorf("secret name %q is not a valid environment variable name", secret.Name))
+		}
+		if _, exists := envAdds[secret.Name]; exists {
+			return a.fail(fmt.Errorf("environment variable %s would collide", secret.Name))
+		}
+		envAdds[secret.Name] = secret.Value
+	}
+	env := os.Environ()
+	for name, value := range envAdds {
+		env = append(env, name+"="+value)
+	}
+	for _, secret := range secrets {
+		st.Audit(agent, "secret_env_exported", "allowed", secret.Scope, secret.Hash, "inject materialization", runtimeAuditMetadata(st, secret.Scope, agent, runtimeType, nil))
+	}
+	if err := st.Save(); err != nil {
+		return a.fail(err)
+	}
+	a.syncRuntimeAuditBestEffort(st)
+	return a.execChild(commandArgs[0], commandArgs[1:], env)
+}
+
+func (a App) mount(st *store.FileStore, args []string) int {
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	workspaceArg, remaining, err := splitWorkspaceFlag(args, "mount", true)
+	if err != nil {
+		return a.fail(err)
+	}
+	target, err := a.workspacePathTarget(st, workspaceArg, "mount")
+	if err != nil {
+		return a.fail(err)
+	}
+	agentExplicit := hasFlag(remaining, "--agent")
+	agent, pathSpec, commandArgs, err := parseSecretCommandArgs("mount", remaining, true)
+	if err != nil {
+		return a.fail(err)
+	}
+	agent, runtimeType, err := workloadRuntimeSubject(st, agent, filepath.Base(commandArgs[0]), agentExplicit)
+	if err != nil {
+		return a.fail(err)
+	}
+	pathPart, explicitDest, hasExplicitDest := strings.Cut(pathSpec, ":")
+	pathPart, err = workspacePrefixedSelection(target, pathPart, "mount")
+	if err != nil {
+		return a.fail(err)
+	}
+	secrets, err := a.resolveSecretSelection(st, pathPart, agent, runtimeType, "mount", "secret_mounted")
+	if err != nil {
+		_ = st.Save()
+		a.syncRuntimeAuditBestEffort(st)
+		return a.fail(err)
+	}
+	mountDir := mountDirFromArgs(remaining)
+	createdTempDir := false
+	if mountDir == "" && !hasExplicitDest {
+		mountDir, err = os.MkdirTemp("", "asiri-secrets-*")
+		if err != nil {
+			return a.fail(err)
+		}
+		createdTempDir = true
+	} else if mountDir != "" {
+		if err := os.MkdirAll(mountDir, 0o700); err != nil {
+			return a.fail(err)
+		}
+		_ = os.Chmod(mountDir, 0o700)
+	}
+	cleanupPaths := []string{}
+	if createdTempDir {
+		defer os.RemoveAll(mountDir)
+	} else {
+		defer func() {
+			for _, path := range cleanupPaths {
+				_ = os.Remove(path)
+			}
+		}()
+	}
+	if hasExplicitDest && len(secrets) != 1 {
+		return a.fail(errors.New("explicit mount destination requires an exact single secret path"))
+	}
+	seenTargets := map[string]bool{}
+	for _, secret := range secrets {
+		target := ""
+		if hasExplicitDest {
+			if err := validateExplicitMountDest(explicitDest); err != nil {
+				return a.fail(err)
+			}
+			target = explicitDest
+			if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+				return a.fail(err)
+			}
+		} else {
+			if err := validateSecretFileName(secret.Name); err != nil {
+				return a.fail(err)
+			}
+			target = filepath.Join(mountDir, secret.Name)
+		}
+		if seenTargets[target] {
+			return a.fail(fmt.Errorf("mount target %s would collide", target))
+		}
+		seenTargets[target] = true
+		if err := writeExclusiveSecretFile(target, []byte(secret.Value)); err != nil {
+			return a.fail(err)
+		}
+		cleanupPaths = append(cleanupPaths, target)
+	}
+	for _, secret := range secrets {
+		st.Audit(agent, "secret_mounted", "allowed", secret.Scope, secret.Hash, "mount materialization", runtimeAuditMetadata(st, secret.Scope, agent, runtimeType, nil))
+	}
+	env := os.Environ()
+	if !hasExplicitDest || mountDir != "" {
+		env = append(env, "ASIRI_SECRETS_DIR="+mountDir)
+	}
+	if err := st.Save(); err != nil {
+		return a.fail(err)
+	}
+	a.syncRuntimeAuditBestEffort(st)
+	return a.execChild(commandArgs[0], commandArgs[1:], env)
+}
+
+func parseSecretCommandArgs(command string, args []string, allowDir bool) (string, string, []string, error) {
+	agent := ""
+	pathSpec := ""
+	cmdIndex := -1
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--agent":
+			if i+1 >= len(args) {
+				return "", "", nil, errors.New("--agent requires a subject")
+			}
+			agent = store.NormalizeSubjectLabel(args[i+1])
+			i++
+		case "--dir":
+			if !allowDir {
+				return "", "", nil, fmt.Errorf("%s does not support --dir", command)
+			}
+			if i+1 >= len(args) {
+				return "", "", nil, errors.New("--dir requires a directory")
+			}
+			i++
+		case "--":
+			cmdIndex = i + 1
+			i = len(args)
+		default:
+			if strings.HasPrefix(args[i], "--") {
+				return "", "", nil, fmt.Errorf("unknown %s option %s", command, args[i])
+			}
+			if pathSpec == "" {
+				pathSpec = args[i]
+			} else {
+				return "", "", nil, fmt.Errorf("%s accepts one scope or secret path before --", command)
+			}
+		}
+	}
+	if pathSpec == "" {
+		return "", "", nil, fmt.Errorf("%s requires a scope or secret path", command)
+	}
+	if cmdIndex < 0 || cmdIndex >= len(args) {
+		return "", "", nil, fmt.Errorf("%s requires -- <command...>", command)
+	}
+	return store.NormalizeSubjectLabel(agent), pathSpec, args[cmdIndex:], nil
+}
+
+func mountDirFromArgs(args []string) string {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "--" {
+			return ""
+		}
+		if args[i] == "--dir" {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+func (a App) resolveSecretSelection(st *store.FileStore, pathSpec, agent, runtimeType, action, auditAction string) ([]resolvedSecret, error) {
+	pathSpec = strings.Trim(pathSpec, "/")
+	if pathSpec == "" {
+		return nil, errors.New("secret path or scope is required")
+	}
+	if scope, name, err := store.ParseSecretPath(pathSpec); err == nil {
+		key := store.SecretKey(scope, name)
+		if _, ok := st.State.Secrets[key]; ok {
+			secret, err := a.resolveOneSecret(st, agent, runtimeType, action, auditAction, pathSpec)
+			if err != nil {
+				return nil, err
+			}
+			return []resolvedSecret{secret}, nil
+		}
+	}
+	keys := make([]string, 0)
+	for key, secret := range st.State.Secrets {
+		if secret.Scope == pathSpec {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("no exact secret or direct child secrets found for %s", pathSpec)
+	}
+	sort.Strings(keys)
+	resolved := make([]resolvedSecret, 0, len(keys))
+	for _, key := range keys {
+		secret := st.State.Secrets[key]
+		item, err := a.resolveOneSecret(st, agent, runtimeType, action, auditAction, secret.Scope+"/"+secret.Name)
+		if err != nil {
+			return nil, err
+		}
+		resolved = append(resolved, item)
+	}
+	return resolved, nil
+}
+
+func (a App) resolveOneSecret(st *store.FileStore, agent, runtimeType, action, auditAction, fullPath string) (resolvedSecret, error) {
+	allowed, reason := st.CheckPolicy(agent, fullPath, action)
+	scope, name, parseErr := store.ParseSecretPath(fullPath)
+	metadataScope := ""
+	if parseErr == nil {
+		metadataScope = scope
+	}
+	metadata := runtimeAuditMetadata(st, metadataScope, agent, runtimeType, map[string]string{"mode": action})
+	if !allowed {
+		if parseErr == nil {
+			st.Audit(agent, auditAction, "denied", scope, store.HashSecretName(scope, name), reason, metadata)
+		} else {
+			st.Audit(agent, auditAction, "denied", "", "", reason, metadata)
+		}
+		return resolvedSecret{}, fmt.Errorf("%s: %s cannot %s %s", reason, agent, action, fullPath)
+	}
+	value, secret, err := st.GetSecret(fullPath)
+	if err != nil {
+		return resolvedSecret{}, err
+	}
+	return resolvedSecret{Path: fullPath, Scope: secret.Scope, Name: secret.Name, Hash: secret.NameHash, Value: value}, nil
+}
+
+func validateSecretFileName(name string) error {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\\`) {
+		return fmt.Errorf("secret name %q is not safe for file materialization", name)
+	}
+	return nil
+}
+
+func validateExplicitMountDest(dest string) error {
+	if dest == "" {
+		return errors.New("mount destination cannot be empty")
+	}
+	clean := filepath.Clean(dest)
+	for _, part := range strings.Split(clean, string(os.PathSeparator)) {
+		if part == ".." {
+			return fmt.Errorf("mount destination %q must not contain path traversal", dest)
+		}
+	}
+	return nil
+}
+
+func (a App) broker(st *store.FileStore, args []string) int {
+	if len(args) == 0 || args[0] != "start" {
+		return a.fail(errors.New("broker start is required"))
+	}
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	if hasFlag(args[1:], "--once") {
+		summary := broker.StartOnce()
+		st.Audit(st.State.UserID, "broker_started", "allowed", "", "", summary.Policy, map[string]string{"mode": summary.Mode})
+		_ = st.Save()
+		fmt.Fprintln(a.Out, summary.String())
+		return 0
+	}
+	return a.fail(errors.New("long-running broker is not started in this local smoke path; use --once for QA"))
+}
+
+func (a App) audit(st *store.FileStore, args []string) int {
+	if len(args) == 0 || args[0] != "tail" {
+		return a.fail(errors.New("audit tail is required"))
+	}
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	workspaceFilters, remaining, err := splitWorkspaceFilters(args[1:], "audit tail")
+	if err != nil {
+		return a.fail(err)
+	}
+	if err := rejectUnknownArgs(remaining, "--limit"); err != nil {
+		return a.fail(err)
+	}
+	workspaceSet, err := a.workspaceFilterSet(st, workspaceFilters, "audit tail")
+	if err != nil {
+		return a.fail(err)
+	}
+	limit := 20
+	if value := flagValue(remaining, "--limit", ""); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 {
+			return a.fail(errors.New("--limit must be a positive integer"))
+		}
+		limit = parsed
+	}
+	printed := 0
+	for _, event := range st.State.Audit {
+		if printed >= limit {
+			break
+		}
+		if len(workspaceSet) > 0 && !auditEventMatchesWorkspace(event, workspaceSet) {
+			continue
+		}
+		fmt.Fprintf(a.Out, "%s\t%s\t%s\t%s\t%s\n", event.CreatedAt.Format(time.RFC3339), event.Actor, event.Action, event.Result, event.Reason)
+		printed++
+	}
+	return 0
+}
+
+func auditEventMatchesWorkspace(event asiri.AuditEvent, workspaces map[string]bool) bool {
+	if len(workspaces) == 0 {
+		return true
+	}
+	if event.Metadata != nil {
+		if workspaces[event.Metadata["workspaceSlug"]] || workspaces[event.Metadata["workspace"]] {
+			return true
+		}
+	}
+	return workspaces[store.WorkspacePrefix(event.Scope)]
+}
+
+func (a App) syncRuntimeAuditBestEffort(st *store.FileStore) {
+	if st.State.ControlPlane == nil {
+		return
+	}
+	if st.State.ControlPlane.Source == "oidc" {
+		return
+	}
+	ids, events := pendingRuntimeAuditEvents(st)
+	if len(events) == 0 {
+		return
+	}
+	accessToken, ok := runtimeAuditAccessToken(st)
+	if !ok {
+		return
+	}
+	endpoint := strings.TrimRight(st.State.ControlPlane.Origin, "/") + "/v1/audit/batch"
+	if err := postJSONBearerTimeout(st, endpoint, accessToken, runtimeAuditBatchRequest{Events: events}, nil, runtimeAuditSyncTimeout); err != nil {
+		return
+	}
+	st.MarkAuditEventsRemoteSynced(ids, time.Now().UTC())
+	_ = st.Save()
+}
+
+var runtimeAuditSyncTimeout = 2 * time.Second
+
+func runtimeAuditAccessToken(st *store.FileStore) (string, bool) {
+	if st == nil || st.State.ControlPlane == nil {
+		return "", false
+	}
+	if time.Until(st.State.ControlPlane.AccessTokenExpiresAt) <= 30*time.Second {
+		return "", false
+	}
+	accessToken, err := st.ControlPlaneAccessToken()
+	if err != nil || accessToken == "" {
+		return "", false
+	}
+	return accessToken, true
+}
+
+type runtimeAuditBatchRequest struct {
+	Events []runtimeAuditUploadEvent `json:"events"`
+}
+
+type runtimeAuditUploadEvent struct {
+	OrgID          string            `json:"orgId"`
+	Action         string            `json:"action"`
+	Result         string            `json:"result"`
+	Scope          string            `json:"scope,omitempty"`
+	SecretNameHash string            `json:"secretNameHash,omitempty"`
+	Reason         string            `json:"reason,omitempty"`
+	CreatedAt      string            `json:"createdAt,omitempty"`
+	Metadata       map[string]string `json:"metadata,omitempty"`
+}
+
+func pendingRuntimeAuditEvents(st *store.FileStore) ([]string, []runtimeAuditUploadEvent) {
+	if st.State.ControlPlane == nil {
+		return nil, nil
+	}
+	ids := []string{}
+	events := []runtimeAuditUploadEvent{}
+	for _, event := range st.State.Audit {
+		if event.RemoteSyncedAt != nil || !isRuntimeAuditAction(event.Action) {
+			continue
+		}
+		if event.Metadata == nil || event.Metadata["runtimeLabel"] == "" {
+			continue
+		}
+		eventWorkspaceID := runtimeAuditEventWorkspaceID(st, event)
+		if eventWorkspaceID == "" || eventWorkspaceID != st.State.ControlPlane.WorkspaceID {
+			continue
+		}
+		metadata := copyStringMap(event.Metadata)
+		metadata["localAuditId"] = event.ID
+		metadata["reportedCreatedAt"] = event.CreatedAt.Format(time.RFC3339)
+		ids = append(ids, event.ID)
+		events = append(events, runtimeAuditUploadEvent{
+			OrgID:          eventWorkspaceID,
+			Action:         event.Action,
+			Result:         event.Result,
+			Scope:          event.Scope,
+			SecretNameHash: event.SecretNameHash,
+			Reason:         event.Reason,
+			CreatedAt:      event.CreatedAt.Format(time.RFC3339),
+			Metadata:       metadata,
+		})
+	}
+	return ids, events
+}
+
+func runtimeAuditEventWorkspaceID(st *store.FileStore, event asiri.AuditEvent) string {
+	if st == nil || st.State.ControlPlane == nil {
+		return ""
+	}
+	if event.Metadata == nil {
+		return ""
+	}
+	return event.Metadata["workspaceId"]
+}
+
+func isRuntimeAuditAction(action string) bool {
+	switch action {
+	case "secret_read", "secret_injected", "secret_env_exported", "secret_mounted", "secret_unsafe_argv_injected":
+		return true
+	default:
+		return false
+	}
+}
+
+func runtimeLabelType(agentExplicit bool) string {
+	if agentExplicit {
+		return "agent"
+	}
+	return "process"
+}
+
+func workloadRuntimeSubject(st *store.FileStore, current, fallback string, agentExplicit bool) (string, string, error) {
+	if st != nil && st.State.ControlPlane != nil && st.State.ControlPlane.Source == "oidc" {
+		workload := store.NormalizeSubjectLabel(st.State.ControlPlane.WorkloadSlug)
+		if workload == "" {
+			return "", "", errors.New("OIDC workload session is missing workload identity")
+		}
+		return workload, "service", nil
+	}
+	if current == "" {
+		current = fallback
+	}
+	return store.NormalizeSubjectLabel(current), runtimeLabelType(agentExplicit), nil
+}
+
+func runtimeAuditMetadata(st *store.FileStore, scope, label, labelType string, extra map[string]string) map[string]string {
+	label = store.NormalizeSubjectLabel(label)
+	if label == "" {
+		if len(extra) == 0 {
+			return nil
+		}
+		return copyStringMap(extra)
+	}
+	if labelType == "" {
+		labelType = "process"
+	}
+	metadata := map[string]string{
+		"runtimeLabel":     label,
+		"runtimeLabelType": labelType,
+	}
+	if workspaceID, workspaceSlug := runtimeAuditScopeWorkspace(st, scope); workspaceID != "" {
+		metadata["workspaceId"] = workspaceID
+		metadata["workspaceSlug"] = workspaceSlug
+	}
+	for key, value := range extra {
+		metadata[key] = value
+	}
+	return metadata
+}
+
+func runtimeAuditScopeWorkspace(st *store.FileStore, scope string) (string, string) {
+	if st == nil || scope == "" {
+		return "", ""
+	}
+	binding, ok := st.RemoteBindingForPrefix(store.WorkspacePrefix(scope))
+	if !ok || binding.WorkspaceID == "" {
+		return "", ""
+	}
+	return binding.WorkspaceID, binding.WorkspaceSlug
+}
+
+func copyStringMap(input map[string]string) map[string]string {
+	if len(input) == 0 {
+		return nil
+	}
+	output := make(map[string]string, len(input))
+	for key, value := range input {
+		output[key] = value
+	}
+	return output
+}
+
+func (a App) local(st *store.FileStore, args []string) int {
+	if len(args) == 0 {
+		return a.fail(errors.New("local subcommand required"))
+	}
+	switch args[0] {
+	case "wipe":
+		return a.localWipe(st, args[1:])
+	default:
+		return a.fail(fmt.Errorf("unknown local command %q", args[0]))
+	}
+}
+
+func (a App) localWipe(st *store.FileStore, args []string) int {
+	if err := rejectUnknownArgs(args, "--yes"); err != nil {
+		return a.fail(err)
+	}
+	if len(positionalArgs(args)) > 0 {
+		return a.fail(errors.New("local wipe accepts only --yes"))
+	}
+	if err := rejectWorkloadLocalMutation(st); err != nil {
+		return a.fail(err)
+	}
+	if !hasFlag(args, "--yes") {
+		if err := a.confirmLocalWipe(); err != nil {
+			return a.fail(err)
+		}
+	}
+	if err := wipeLocalState(st); err != nil {
+		return a.fail(err)
+	}
+	fmt.Fprintln(a.Out, "✓ Local Asiri state wiped")
+	return 0
+}
+
+func (a App) confirmLocalWipe() error {
+	fmt.Fprint(a.Out, "Type wipe local to delete local Asiri state: ")
+	reader := bufio.NewReader(a.In)
+	value, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	value = strings.TrimSuffix(value, "\n")
+	value = strings.TrimSuffix(value, "\r")
+	if value != "wipe local" {
+		return errors.New("confirmation did not match; local state was not wiped")
+	}
+	return nil
+}
+
+func (a App) cache(st *store.FileStore, args []string) int {
+	if len(args) == 0 || args[0] != "wipe" {
+		return a.fail(errors.New("cache wipe is required"))
+	}
+	if err := rejectWorkloadLocalMutation(st); err != nil {
+		return a.fail(err)
+	}
+	if err := wipeLocalState(st); err != nil {
+		return a.fail(err)
+	}
+	fmt.Fprintln(a.Out, "✓ Local Asiri cache wiped")
+	return 0
+}
+
+func wipeLocalState(st *store.FileStore) error {
+	if err := st.DeletePlatformKeys(); err != nil {
+		return err
+	}
+	if err := os.Remove(st.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+type deviceCodeStartResponse struct {
+	DeviceCode              string `json:"deviceCode"`
+	UserCode                string `json:"userCode"`
+	VerificationURI         string `json:"verificationUri"`
+	VerificationURIComplete string `json:"verificationUriComplete"`
+	ExpiresIn               int    `json:"expiresIn"`
+	Interval                int    `json:"interval"`
+}
+
+type pushWorkspacePlan struct {
+	Prefix string
+	Refs   []store.LocalSecretRef
+}
+
+type deviceCodeTokenResponse struct {
+	Status           string `json:"status"`
+	Error            string `json:"error"`
+	Message          string `json:"message"`
+	OrgID            string `json:"orgId"`
+	WorkspaceSlug    string `json:"workspaceSlug"`
+	UserID           string `json:"userId"`
+	WorkloadID       string `json:"workloadId"`
+	WorkloadSlug     string `json:"workloadSlug"`
+	DeviceID         string `json:"deviceId"`
+	AccessToken      string `json:"accessToken"`
+	RefreshToken     string `json:"refreshToken"`
+	ExpiresIn        int    `json:"expiresIn"`
+	RefreshExpiresAt string `json:"refreshExpiresAt"`
+	Interval         int    `json:"interval"`
+}
+
+type sessionRefreshResponse struct {
+	Status           string `json:"status"`
+	Error            string `json:"error"`
+	OrgID            string `json:"orgId"`
+	WorkspaceSlug    string `json:"workspaceSlug"`
+	UserID           string `json:"userId"`
+	DeviceID         string `json:"deviceId"`
+	AccessToken      string `json:"accessToken"`
+	ExpiresIn        int    `json:"expiresIn"`
+	RefreshExpiresAt string `json:"refreshExpiresAt"`
+}
+
+type remoteWhoamiResponse struct {
+	User      remoteUserResponse          `json:"user"`
+	Workspace remoteWorkspaceResponse     `json:"workspace"`
+	Device    remoteWhoamiDeviceResponse  `json:"device"`
+	Session   remoteWhoamiSessionResponse `json:"session"`
+}
+
+type remoteUserResponse struct {
+	ID          string `json:"id"`
+	Email       string `json:"email"`
+	DisplayName string `json:"displayName"`
+	Role        string `json:"role"`
+	Status      string `json:"status"`
+}
+
+type remoteWhoamiDeviceResponse struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Kind   string `json:"kind"`
+	Status string `json:"status"`
+}
+
+type remoteWhoamiSessionResponse struct {
+	WorkspaceID  string `json:"workspaceId"`
+	DeviceID     string `json:"deviceId"`
+	WorkloadID   string `json:"workloadId"`
+	WorkloadSlug string `json:"workloadSlug"`
+	Source       string `json:"source"`
+	Status       string `json:"status"`
+	ExpiresAt    string `json:"expiresAt"`
+}
+
+type remoteWorkspaceResponse struct {
+	ID                   string `json:"id"`
+	Name                 string `json:"name"`
+	Slug                 string `json:"slug"`
+	OwnerUserID          string `json:"ownerUserId"`
+	Role                 string `json:"role"`
+	CanPull              *bool  `json:"canPull"`
+	CanWrite             *bool  `json:"canWrite"`
+	CurrentDeviceTrusted *bool  `json:"currentDeviceTrusted"`
+	CurrentDeviceID      string `json:"currentDeviceId"`
+	CanApproveDevice     *bool  `json:"canApproveDevice"`
+}
+
+type remoteWorkspacesResponse struct {
+	Organizations []remoteWorkspaceResponse `json:"organizations"`
+	ActiveOrgID   string                    `json:"activeOrgId"`
+}
+
+type writeOptionsResponse struct {
+	RequestedWorkspaceSlug string                 `json:"requestedWorkspaceSlug"`
+	SourceWorkspace        *writeWorkspaceOption  `json:"sourceWorkspace"`
+	ActiveWorkspace        writeWorkspaceOption   `json:"activeWorkspace"`
+	WritableWorkspaces     []writeWorkspaceOption `json:"writableWorkspaces"`
+}
+
+type writeWorkspaceOption struct {
+	ID       string            `json:"id"`
+	Slug     string            `json:"slug"`
+	CanWrite bool              `json:"canWrite"`
+	Paths    []writePathOption `json:"paths"`
+}
+
+type writePathOption struct {
+	Scope              string `json:"scope"`
+	Name               string `json:"name"`
+	FullPath           string `json:"fullPath"`
+	RequiredCapability string `json:"requiredCapability"`
+	CanWrite           bool   `json:"canWrite"`
+}
+
+type remoteDeviceResponse struct {
+	ID                  string `json:"id"`
+	Name                string `json:"name"`
+	Kind                string `json:"kind"`
+	Status              string `json:"status"`
+	EncryptionPublicKey string `json:"encryptionPublicKey"`
+}
+
+type syncBundleResponse struct {
+	OrgID            string                      `json:"orgId"`
+	DeviceID         string                      `json:"deviceId"`
+	IssuedAt         string                      `json:"issuedAt"`
+	EncryptedSecrets []store.RemoteSecretVersion `json:"encryptedSecrets"`
+	Policies         []syncPolicyResponse        `json:"policies"`
+}
+
+type syncPolicyResponse struct {
+	ID            string     `json:"id"`
+	SubjectType   string     `json:"subjectType"`
+	SubjectID     string     `json:"subjectId"`
+	ScopePattern  string     `json:"scopePattern"`
+	SecretPattern string     `json:"secretPattern"`
+	Actions       []string   `json:"actions"`
+	ApprovalMode  string     `json:"approvalMode"`
+	CreatedAt     time.Time  `json:"createdAt"`
+	ExpiresAt     *time.Time `json:"expiresAt,omitempty"`
+}
+
+type remoteDevicesResponse struct {
+	Devices []remoteDeviceResponse `json:"devices"`
+}
+
+type remoteSecretsResponse struct {
+	Secrets []remoteSecretRecord `json:"secrets"`
+}
+
+type visibleRemoteSecretsResponse struct {
+	Secrets []visibleRemoteSecretRecord `json:"secrets"`
+}
+
+type remoteSecretRecord struct {
+	ID                string                   `json:"id"`
+	OrgID             string                   `json:"orgId"`
+	Scope             string                   `json:"scope"`
+	Name              string                   `json:"name"`
+	Version           int                      `json:"version"`
+	Algorithm         string                   `json:"algorithm"`
+	Nonce             string                   `json:"nonce"`
+	Ciphertext        string                   `json:"ciphertext"`
+	AAD               string                   `json:"aad"`
+	Status            string                   `json:"status"`
+	WrappedKeys       []store.RemoteWrappedKey `json:"wrappedKeys"`
+	CreatedByDeviceID string                   `json:"createdByDeviceId"`
+	CreatedAt         time.Time                `json:"createdAt"`
+}
+
+type recoveryRecipientReplacement struct {
+	SecretID   string                 `json:"secretId"`
+	WrappedKey store.RemoteWrappedKey `json:"wrappedKey"`
+}
+
+type remoteRecoveryRecipientResponse struct {
+	RecipientID          string `json:"recipientId"`
+	PublicKey            string `json:"publicKey"`
+	PublicKeyFingerprint string `json:"publicKeyFingerprint"`
+	Status               string `json:"status"`
+}
+
+type visibleRemoteSecretRecord struct {
+	ID                     string                   `json:"id"`
+	OrgID                  string                   `json:"orgId"`
+	WorkspaceSlug          string                   `json:"workspaceSlug"`
+	Scope                  string                   `json:"scope"`
+	Name                   string                   `json:"name"`
+	Version                int                      `json:"version"`
+	Status                 string                   `json:"status"`
+	CanWrite               bool                     `json:"canWrite"`
+	WrappedToCurrentDevice *bool                    `json:"wrappedToCurrentDevice"`
+	CurrentDeviceID        string                   `json:"currentDeviceId"`
+	WrappedKeys            []store.RemoteWrappedKey `json:"wrappedKeys"`
+}
+
+func startDeviceCodeLogin(origin, workspaceSlug string, device asiri.Device) (deviceCodeStartResponse, error) {
+	body := map[string]string{
+		"deviceName":          device.Name,
+		"kind":                string(device.Kind),
+		"encryptionPublicKey": device.EncryptionPublicKey,
+		"signingPublicKey":    device.SigningPublicKey,
+	}
+	if workspaceSlug != "" {
+		body["workspaceSlug"] = workspaceSlug
+	}
+	var result deviceCodeStartResponse
+	if err := postJSON(origin+"/v1/auth/device-code/start", body, &result); err != nil {
+		return result, err
+	}
+	if result.DeviceCode == "" || result.UserCode == "" || result.VerificationURIComplete == "" {
+		return result, errors.New("control plane returned an incomplete device-code response")
+	}
+	if err := validateDeviceCodeApprovalOrigin(origin, result.VerificationURIComplete); err != nil {
+		return result, err
+	}
+	if result.Interval <= 0 {
+		result.Interval = 2
+	}
+	return result, nil
+}
+
+func exchangeWorkloadOidc(origin, provider, token string, device asiri.Device) (deviceCodeTokenResponse, error) {
+	body := map[string]string{
+		"provider":            provider,
+		"token":               token,
+		"deviceName":          device.Name,
+		"kind":                string(device.Kind),
+		"encryptionPublicKey": device.EncryptionPublicKey,
+		"signingPublicKey":    device.SigningPublicKey,
+	}
+	var result deviceCodeTokenResponse
+	if err := postJSON(strings.TrimRight(origin, "/")+"/v1/workload/oidc/token", body, &result); err != nil {
+		return result, err
+	}
+	if result.Status != "approved" || result.OrgID == "" || result.WorkspaceSlug == "" || result.UserID == "" || result.WorkloadID == "" || result.WorkloadSlug == "" || result.DeviceID == "" || result.AccessToken == "" {
+		return result, errors.New("control plane approved workload login without link metadata")
+	}
+	return result, nil
+}
+
+func validateDeviceCodeApprovalOrigin(controlPlaneOrigin, approvalURL string) error {
+	controlPlane, err := url.Parse(controlPlaneOrigin)
+	if err != nil || controlPlane.Scheme == "" || controlPlane.Host == "" {
+		return fmt.Errorf("invalid control-plane origin %q", controlPlaneOrigin)
+	}
+	approval, err := url.Parse(approvalURL)
+	if err != nil || approval.Scheme == "" || approval.Host == "" {
+		return fmt.Errorf("control plane returned invalid approval URL %q", approvalURL)
+	}
+	controlPlaneURLOrigin := urlOrigin(controlPlane)
+	approvalURLOrigin := urlOrigin(approval)
+	if approvalURLOrigin != controlPlaneURLOrigin {
+		if isLoopbackHost(controlPlane.Hostname()) && isLoopbackHost(approval.Hostname()) {
+			return nil
+		}
+		return fmt.Errorf("device-code approval URL origin %s does not match control-plane origin %s", approvalURLOrigin, controlPlaneURLOrigin)
+	}
+	return nil
+}
+
+func urlOrigin(parsed *url.URL) string {
+	return parsed.Scheme + "://" + parsed.Host
+}
+
+func pollDeviceCodeLogin(st *store.FileStore, origin string, start deviceCodeStartResponse) (deviceCodeTokenResponse, error) {
+	deadline := time.Now().Add(time.Duration(start.ExpiresIn) * time.Second)
+	if start.ExpiresIn <= 0 {
+		deadline = time.Now().Add(10 * time.Minute)
+	}
+	interval := time.Duration(start.Interval) * time.Second
+	if interval <= 0 {
+		interval = 250 * time.Millisecond
+	}
+	for {
+		var result deviceCodeTokenResponse
+		status, err := postJSONDeviceCodeClaimStatus(st, origin+"/v1/auth/device-code/token", map[string]string{"deviceCode": start.DeviceCode}, credentialHash(start.DeviceCode), &result)
+		if err != nil {
+			return result, err
+		}
+		if status == http.StatusOK && result.Status == "approved" {
+			if result.OrgID == "" || result.WorkspaceSlug == "" || result.UserID == "" || result.DeviceID == "" || result.AccessToken == "" || result.RefreshToken == "" {
+				return result, errors.New("control plane approved login without link metadata")
+			}
+			return result, nil
+		}
+		if result.Error != "" && result.Error != "authorization_pending" {
+			return result, fmt.Errorf("device-code login failed: %s", result.Error)
+		}
+		if time.Now().After(deadline) {
+			return result, errors.New("device-code login timed out")
+		}
+		time.Sleep(interval)
+	}
+}
+
+func refreshDeviceSession(origin string, st *store.FileStore) (sessionRefreshResponse, int, error) {
+	var result sessionRefreshResponse
+	refreshToken, err := st.ControlPlaneRefreshToken()
+	if err != nil {
+		return result, 0, err
+	}
+	status, err := postJSONDeviceSignedStatus(st, origin+"/v1/auth/session/refresh", map[string]string{"refreshToken": refreshToken}, credentialHash(refreshToken), &result)
+	if err != nil {
+		return result, status, err
+	}
+	if status == http.StatusOK {
+		if result.Status != "approved" || result.AccessToken == "" || result.OrgID == "" || result.WorkspaceSlug == "" || result.UserID == "" || result.DeviceID == "" {
+			return result, status, errors.New("control plane refreshed session without link metadata")
+		}
+	}
+	return result, status, nil
+}
+
+func logoutDeviceSession(st *store.FileStore, origin, refreshToken string) error {
+	_, err := postJSONDeviceSignedStatus(st, origin+"/v1/auth/session/logout", map[string]string{"refreshToken": refreshToken}, credentialHash(refreshToken), nil)
+	return err
+}
+
+func listRemoteWorkspaces(st *store.FileStore, origin, accessToken string) ([]remoteWorkspaceResponse, error) {
+	var result remoteWorkspacesResponse
+	endpoint := strings.TrimRight(origin, "/") + "/v1/orgs"
+	if err := getJSONBearer(st, endpoint, accessToken, &result); err != nil {
+		return nil, err
+	}
+	return result.Organizations, nil
+}
+
+func requireRemoteWorkspace(workspaces []remoteWorkspaceResponse, requested string) (remoteWorkspaceResponse, error) {
+	workspace, ok := findWorkspace(workspaces, requested)
+	if !ok {
+		return remoteWorkspaceResponse{}, fmt.Errorf("workspace %s is not visible", requested)
+	}
+	return workspace, nil
+}
+
+func (a App) ensureWorkspaceSession(st *store.FileStore, accessToken string, workspace remoteWorkspaceResponse) (string, error) {
+	if st.State.ControlPlane == nil {
+		return "", errors.New("asiri is not linked to a control plane")
+	}
+	if workspace.ID == "" {
+		return "", errors.New("workspace id is required")
+	}
+	if workspace.ID == st.State.ControlPlane.WorkspaceID {
+		return accessToken, nil
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		return "", err
+	}
+	result, err := switchRemoteWorkspace(st, st.State.ControlPlane.Origin, accessToken, workspace.ID, *device)
+	if err != nil {
+		return "", err
+	}
+	if err := st.LinkControlPlaneForDevice(st.State.ControlPlane.Origin, result.OrgID, result.WorkspaceSlug, result.UserID, result.DeviceID, device.ID, result.AccessToken, result.RefreshToken, result.ExpiresIn, result.RefreshExpiresAt); err != nil {
+		return "", err
+	}
+	return result.AccessToken, nil
+}
+
+func (a App) remoteWorkspaceTarget(st *store.FileStore, accessToken, requested string) (remoteWorkspaceResponse, string, error) {
+	requested = strings.TrimSpace(requested)
+	if _, err := localWorkspaceSlug(requested); err != nil {
+		return remoteWorkspaceResponse{}, "", errors.New("--workspace requires a workspace slug")
+	}
+	if st.State.ControlPlane != nil && requested == st.State.ControlPlane.WorkspaceSlug {
+		return remoteWorkspaceResponse{ID: st.State.ControlPlane.WorkspaceID, Slug: st.State.ControlPlane.WorkspaceSlug, CanPull: boolPtr(true), CanWrite: boolPtr(true), CurrentDeviceTrusted: boolPtr(true), CurrentDeviceID: st.State.ControlPlane.DeviceID}, accessToken, nil
+	}
+	workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken)
+	if err != nil {
+		return remoteWorkspaceResponse{}, "", err
+	}
+	workspace, err := requireRemoteWorkspace(workspaces, requested)
+	if err != nil {
+		return remoteWorkspaceResponse{}, "", err
+	}
+	token, err := a.ensureWorkspaceSession(st, accessToken, workspace)
+	if err != nil {
+		if workspaceNeedsDeviceTrust(err) {
+			return remoteWorkspaceResponse{}, "", fmt.Errorf("this device is not trusted for workspace %s; device %s; next: %s", requested, currentDeviceDescription(st), deviceTrustCommand(st, requested))
+		}
+		return remoteWorkspaceResponse{}, "", err
+	}
+	if st.State.ControlPlane != nil {
+		workspace.ID = st.State.ControlPlane.WorkspaceID
+		workspace.Slug = st.State.ControlPlane.WorkspaceSlug
+	}
+	return workspace, token, nil
+}
+
+func (a App) pushWorkspaceTarget(st *store.FileStore, accessToken, requested string) (remoteWorkspaceResponse, string, error) {
+	requested = strings.TrimSpace(requested)
+	if _, err := localWorkspaceSlug(requested); err != nil {
+		return remoteWorkspaceResponse{}, "", errors.New("--workspace requires a workspace slug")
+	}
+	if st.State.ControlPlane != nil && requested == st.State.ControlPlane.WorkspaceSlug {
+		return remoteWorkspaceResponse{ID: st.State.ControlPlane.WorkspaceID, Slug: st.State.ControlPlane.WorkspaceSlug, CanPull: boolPtr(true), CanWrite: boolPtr(true), CurrentDeviceTrusted: boolPtr(true), CurrentDeviceID: st.State.ControlPlane.DeviceID}, accessToken, nil
+	}
+	workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken)
+	if err != nil {
+		return remoteWorkspaceResponse{}, "", err
+	}
+	workspace, err := requireRemoteWorkspace(workspaces, requested)
+	if err != nil {
+		return remoteWorkspaceResponse{}, "", err
+	}
+	if workspace.CanWrite != nil && !*workspace.CanWrite {
+		return remoteWorkspaceResponse{}, "", fmt.Errorf("this account cannot write secrets in workspace %s", requested)
+	}
+	if !workspaceDeviceTrusted(workspace, st.State.ControlPlane.WorkspaceID) {
+		return remoteWorkspaceResponse{}, "", fmt.Errorf("this device is not trusted for workspace %s; device %s; next: %s", requested, currentDeviceDescription(st), deviceTrustCommand(st, requested))
+	}
+	token, err := a.ensureWorkspaceSession(st, accessToken, workspace)
+	if err != nil {
+		if workspaceNeedsDeviceTrust(err) {
+			return remoteWorkspaceResponse{}, "", fmt.Errorf("this device is not trusted for workspace %s; device %s; next: %s", requested, currentDeviceDescription(st), deviceTrustCommand(st, requested))
+		}
+		return remoteWorkspaceResponse{}, "", err
+	}
+	if st.State.ControlPlane != nil {
+		workspace.ID = st.State.ControlPlane.WorkspaceID
+		workspace.Slug = st.State.ControlPlane.WorkspaceSlug
+		workspace.CurrentDeviceTrusted = boolPtr(true)
+		workspace.CanPull = boolPtr(true)
+	}
+	return workspace, token, nil
+}
+
+func workspaceNeedsDeviceTrust(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "trusted matching device required") || strings.Contains(message, "control plane returned HTTP 403")
+}
+
+func switchRemoteWorkspace(st *store.FileStore, origin, accessToken, workspace string, device asiri.Device) (deviceCodeTokenResponse, error) {
+	body := map[string]string{
+		"workspace":           workspace,
+		"deviceName":          device.Name,
+		"kind":                string(device.Kind),
+		"encryptionPublicKey": device.EncryptionPublicKey,
+		"signingPublicKey":    device.SigningPublicKey,
+	}
+	var result deviceCodeTokenResponse
+	status, err := postJSONBearerStatus(st, strings.TrimRight(origin, "/")+"/v1/auth/session/switch", accessToken, body, &result)
+	if err != nil {
+		return result, err
+	}
+	if status < 200 || status >= 300 {
+		if result.Message != "" {
+			return result, fmt.Errorf("control plane returned HTTP %d: %s", status, result.Message)
+		}
+		if result.Error != "" {
+			return result, fmt.Errorf("control plane returned HTTP %d: %s", status, result.Error)
+		}
+		return result, fmt.Errorf("control plane returned HTTP %d", status)
+	}
+	if result.Status != "approved" || result.OrgID == "" || result.WorkspaceSlug == "" || result.UserID == "" || result.DeviceID == "" || result.AccessToken == "" || result.RefreshToken == "" {
+		return result, errors.New("control plane switched workspace without link metadata")
+	}
+	return result, nil
+}
+
+func remoteWriteOptions(st *store.FileStore, origin, accessToken string, refs []store.LocalSecretRef) (writeOptionsResponse, error) {
+	entries := make([]map[string]string, 0, len(refs))
+	seen := map[string]bool{}
+	for _, ref := range refs {
+		key := store.SecretKey(ref.Scope, ref.Name)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		entries = append(entries, map[string]string{"scope": ref.Scope, "name": ref.Name})
+	}
+	var result writeOptionsResponse
+	if err := postJSONBearer(st, strings.TrimRight(origin, "/")+"/v1/sync/write-options", accessToken, map[string]any{"entries": entries}, &result); err != nil {
+		return result, err
+	}
+	if result.RequestedWorkspaceSlug == "" || result.ActiveWorkspace.Slug == "" {
+		return result, errors.New("control plane returned incomplete write options")
+	}
+	return result, nil
+}
+
+func fullPathList(paths []writePathOption) string {
+	values := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if path.FullPath != "" {
+			values = append(values, path.FullPath)
+		}
+	}
+	sort.Strings(values)
+	return strings.Join(values, ", ")
+}
+
+func workspaceRoleLabel(workspace remoteWorkspaceResponse, userID string) string {
+	if workspace.Role != "" && workspace.Role != "none" {
+		return workspace.Role
+	}
+	if workspace.OwnerUserID != "" && workspace.OwnerUserID == userID {
+		return "owner"
+	}
+	if workspace.Role == "none" {
+		return "none"
+	}
+	return "member"
+}
+
+func boolPointerLabel(value *bool) string {
+	if value == nil {
+		return "unknown"
+	}
+	if *value {
+		return "yes"
+	}
+	return "no"
+}
+
+func deviceTrustLabel(value *bool) string {
+	if value == nil {
+		return "unknown"
+	}
+	if *value {
+		return "trusted"
+	}
+	return "not trusted"
+}
+
+func deviceTrustCommand(st *store.FileStore, workspaceSlug string) string {
+	command := fmt.Sprintf("asiri device trust --workspace %s", workspaceSlug)
+	if st != nil && st.State.ControlPlane != nil && st.State.ControlPlane.Origin != "" && st.State.ControlPlane.Origin != defaultControlPlaneOrigin {
+		command += fmt.Sprintf(" --origin %s", st.State.ControlPlane.Origin)
+	}
+	return command
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func printable(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "-"
+	}
+	return value
+}
+
+func currentDeviceDescription(st *store.FileStore) string {
+	if st == nil {
+		return "unknown"
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		return "unknown"
+	}
+	fingerprint := store.PublicKeyFingerprint(device.EncryptionPublicKey)
+	if device.Name == "" {
+		return fingerprint
+	}
+	return fmt.Sprintf("%s (%s)", device.Name, fingerprint)
+}
+
+func ensureControlPlaneAccess(origin string, st *store.FileStore) (string, error) {
+	if st.State.ControlPlane == nil {
+		return "", errors.New("asiri is not linked to a control plane")
+	}
+	if err := validateControlPlaneOrigin(origin); err != nil {
+		return "", err
+	}
+	cached, cachedErr := st.ControlPlaneAccessToken()
+	cacheFresh := cachedErr == nil && time.Until(st.State.ControlPlane.AccessTokenExpiresAt) > time.Minute
+	if st.State.ControlPlane.Source == "oidc" {
+		if cacheFresh {
+			return cached, nil
+		}
+		return "", errors.New("OIDC workload session expired; run workload login again")
+	}
+	result, status, err := refreshDeviceSession(origin, st)
+	if err != nil {
+		if cacheFresh {
+			return cached, nil
+		}
+		return "", err
+	}
+	if remoteDeviceNotTrusted(status, result.Error) {
+		if err := st.QuarantineLocalKeys("remote device is no longer trusted"); err != nil {
+			return "", fmt.Errorf("remote device is no longer trusted, but local key cleanup failed: %w", err)
+		}
+		return "", errors.New("remote device is no longer trusted; local key material was cleared")
+	}
+	if status != http.StatusOK {
+		if cacheFresh && status >= 500 {
+			return cached, nil
+		}
+		return "", fmt.Errorf("control plane returned HTTP %d", status)
+	}
+	if err := st.RefreshControlPlane(result.AccessToken, result.ExpiresIn, result.RefreshExpiresAt); err != nil {
+		return "", err
+	}
+	return st.ControlPlaneAccessToken()
+}
+
+func rejectWorkloadControlPlaneMutation(st *store.FileStore) error {
+	if st != nil && st.State.ControlPlane != nil && st.State.ControlPlane.Source == "oidc" {
+		return errors.New("OIDC workload sessions are read-only; run workload login again only to refresh access")
+	}
+	return nil
+}
+
+func rejectWorkloadLocalMutation(st *store.FileStore) error {
+	if st != nil && st.State.ControlPlane != nil && st.State.ControlPlane.Source == "oidc" {
+		return errors.New("OIDC workload sessions cannot mutate local vault or policy state")
+	}
+	return nil
+}
+
+func remoteDeviceNotTrusted(status int, errorCode string) bool {
+	return status == http.StatusForbidden && errorCode == "device_not_trusted"
+}
+
+func revokeRemoteDevice(st *store.FileStore, origin, deviceID, accessToken string) (remoteDeviceResponse, error) {
+	var result remoteDeviceResponse
+	endpoint := strings.TrimRight(origin, "/") + "/v1/devices/" + url.PathEscape(deviceID) + "/revoke"
+	if err := postJSONBearer(st, endpoint, accessToken, map[string]string{}, &result); err != nil {
+		return result, err
+	}
+	if result.Status != "revoked" {
+		return result, errors.New("control plane did not revoke the device")
+	}
+	return result, nil
+}
+
+func listRemoteDevices(st *store.FileStore, origin, orgID, accessToken string) ([]remoteDeviceResponse, error) {
+	var result remoteDevicesResponse
+	endpoint := fmt.Sprintf("%s/v1/devices?orgId=%s", strings.TrimRight(origin, "/"), url.QueryEscape(orgID))
+	if err := getJSONBearer(st, endpoint, accessToken, &result); err != nil {
+		return nil, err
+	}
+	return result.Devices, nil
+}
+
+func listRemoteSecrets(st *store.FileStore, origin, orgID, accessToken, recoveryRecipientID string) ([]remoteSecretRecord, error) {
+	var result remoteSecretsResponse
+	endpoint := fmt.Sprintf("%s/v1/secrets/encrypted?orgId=%s", strings.TrimRight(origin, "/"), url.QueryEscape(orgID))
+	if recoveryRecipientID != "" {
+		endpoint += "&recoveryRecipientId=" + url.QueryEscape(recoveryRecipientID)
+	}
+	if err := getJSONBearer(st, endpoint, accessToken, &result); err != nil {
+		return nil, err
+	}
+	return result.Secrets, nil
+}
+
+func getActiveRemoteRecoveryRecipient(st *store.FileStore, origin, orgID, accessToken string) (*asiri.RecoveryConfig, error) {
+	var result remoteRecoveryRecipientResponse
+	endpoint := fmt.Sprintf("%s/v1/recovery-recipient?orgId=%s", strings.TrimRight(origin, "/"), url.QueryEscape(orgID))
+	status, err := getJSONBearerStatus(st, endpoint, accessToken, &result)
+	if err != nil {
+		return nil, err
+	}
+	if status == http.StatusNotFound {
+		return nil, nil
+	}
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("control plane returned HTTP %d", status)
+	}
+	if result.Status != "active" || result.RecipientID == "" || result.PublicKey == "" || result.PublicKeyFingerprint == "" {
+		return nil, errors.New("control plane returned incomplete recovery recipient metadata")
+	}
+	return &asiri.RecoveryConfig{
+		RecipientID:          result.RecipientID,
+		PublicKey:            result.PublicKey,
+		PublicKeyFingerprint: result.PublicKeyFingerprint,
+		CreatedAt:            time.Now().UTC(),
+	}, nil
+}
+
+func listVisibleRemoteSecrets(st *store.FileStore, origin, accessToken string) ([]visibleRemoteSecretRecord, error) {
+	var result visibleRemoteSecretsResponse
+	endpoint := strings.TrimRight(origin, "/") + "/v1/secrets/visible"
+	if err := getJSONBearer(st, endpoint, accessToken, &result); err != nil {
+		return nil, err
+	}
+	return result.Secrets, nil
+}
+
+func resolveActiveRemoteSecret(st *store.FileStore, origin, accessToken string, target remoteWorkspaceResponse, scope, name string) (visibleRemoteSecretRecord, error) {
+	secrets, err := listVisibleRemoteSecrets(st, origin, accessToken)
+	if err != nil {
+		return visibleRemoteSecretRecord{}, err
+	}
+	matches := []visibleRemoteSecretRecord{}
+	for _, secret := range secrets {
+		if secret.Status != "active" || secret.Scope != scope || secret.Name != name {
+			continue
+		}
+		if !visibleSecretInWorkspace(secret, target) {
+			continue
+		}
+		matches = append(matches, secret)
+	}
+	fullPath := store.SecretKey(scope, name)
+	if len(matches) == 0 {
+		return visibleRemoteSecretRecord{}, fmt.Errorf("no active remote secret found for %s in workspace %s", fullPath, target.Slug)
+	}
+	if len(matches) > 1 {
+		return visibleRemoteSecretRecord{}, fmt.Errorf("multiple active remote secrets found for %s in workspace %s", fullPath, target.Slug)
+	}
+	return matches[0], nil
+}
+
+func visibleSecretInWorkspace(secret visibleRemoteSecretRecord, target remoteWorkspaceResponse) bool {
+	if target.ID != "" && secret.OrgID != "" {
+		return secret.OrgID == target.ID
+	}
+	if secret.WorkspaceSlug != "" {
+		return secret.WorkspaceSlug == target.Slug
+	}
+	return store.WorkspacePrefix(secret.Scope) == target.Slug
+}
+
+func remoteOnlyUnwrappedDeleteCandidates(st *store.FileStore, target remoteWorkspaceResponse, secrets []visibleRemoteSecretRecord) []visibleRemoteSecretRecord {
+	candidates := []visibleRemoteSecretRecord{}
+	for _, secret := range secrets {
+		if secret.Status != "active" || !visibleSecretInWorkspace(secret, target) {
+			continue
+		}
+		if secret.WrappedToCurrentDevice == nil || *secret.WrappedToCurrentDevice {
+			continue
+		}
+		if localActiveSecretExists(st, secret.Scope, secret.Name) {
+			continue
+		}
+		candidates = append(candidates, secret)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		left := shortSecretPath(candidates[i].Scope, candidates[i].Name)
+		right := shortSecretPath(candidates[j].Scope, candidates[j].Name)
+		if left == right {
+			return candidates[i].ID < candidates[j].ID
+		}
+		return left < right
+	})
+	return candidates
+}
+
+func deleteRemoteSecret(st *store.FileStore, origin, secretID, deviceID, accessToken string) (visibleRemoteSecretRecord, error) {
+	var result visibleRemoteSecretRecord
+	endpoint := strings.TrimRight(origin, "/") + "/v1/secrets/" + url.PathEscape(secretID) + "/delete"
+	if err := postJSONBearer(st, endpoint, accessToken, map[string]string{"createdByDeviceId": deviceID}, &result); err != nil {
+		return result, err
+	}
+	if result.Status != "deleted" {
+		return result, errors.New("control plane did not mark the secret deleted")
+	}
+	return result, nil
+}
+
+func addRemoteWrappedKeys(st *store.FileStore, origin, secretID, accessToken string, wrappedKeys []store.RemoteWrappedKey) error {
+	endpoint := strings.TrimRight(origin, "/") + "/v1/secrets/" + url.PathEscape(secretID) + "/wrapped-keys"
+	return postJSONBearer(st, endpoint, accessToken, map[string]any{"wrappedKeys": wrappedKeys}, nil)
+}
+
+func registerRemoteRecoveryRecipient(st *store.FileStore, origin, accessToken string, setup store.RecoverySetup, replacements []recoveryRecipientReplacement) error {
+	if replacements == nil {
+		replacements = []recoveryRecipientReplacement{}
+	}
+	endpoint := strings.TrimRight(origin, "/") + "/v1/recovery-recipient"
+	return postJSONBearer(st, endpoint, accessToken, map[string]any{
+		"orgId":                st.State.ControlPlane.WorkspaceID,
+		"recipientId":          setup.RecipientID,
+		"publicKey":            setup.PublicKey,
+		"publicKeyFingerprint": setup.Fingerprint,
+		"replacements":         replacements,
+	}, nil)
+}
+
+func replaceRemoteRecoveryRecipient(st *store.FileStore, origin, accessToken string, setup store.RecoverySetup, replacements []recoveryRecipientReplacement) error {
+	if replacements == nil {
+		replacements = []recoveryRecipientReplacement{}
+	}
+	endpoint := strings.TrimRight(origin, "/") + "/v1/recovery-recipient/replace"
+	return postJSONBearer(st, endpoint, accessToken, map[string]any{
+		"orgId":                st.State.ControlPlane.WorkspaceID,
+		"recipientId":          setup.RecipientID,
+		"publicKey":            setup.PublicKey,
+		"publicKeyFingerprint": setup.Fingerprint,
+		"replacements":         replacements,
+	}, nil)
+}
+
+func addRecoveryRestoredWrappedKeys(st *store.FileStore, origin, secretID, accessToken, recoveryRecipientID string, wrappedKeys []store.RemoteWrappedKey) error {
+	endpoint := strings.TrimRight(origin, "/") + "/v1/secrets/" + url.PathEscape(secretID) + "/recovery-wrapped-keys"
+	return postJSONBearer(st, endpoint, accessToken, map[string]any{"recoveryRecipientId": recoveryRecipientID, "wrappedKeys": wrappedKeys}, nil)
+}
+
+func remoteRecordsToVersions(records []remoteSecretRecord) []store.RemoteSecretVersion {
+	versions := make([]store.RemoteSecretVersion, 0, len(records))
+	for _, record := range records {
+		if record.Status != "active" {
+			continue
+		}
+		versions = append(versions, store.RemoteSecretVersion{
+			ID:                record.ID,
+			OrgID:             record.OrgID,
+			Scope:             record.Scope,
+			Name:              record.Name,
+			Version:           record.Version,
+			Algorithm:         record.Algorithm,
+			Nonce:             record.Nonce,
+			Ciphertext:        record.Ciphertext,
+			AAD:               record.AAD,
+			WrappedKeys:       record.WrappedKeys,
+			Status:            record.Status,
+			CreatedByDeviceID: record.CreatedByDeviceID,
+			CreatedAt:         record.CreatedAt,
+		})
+	}
+	return versions
+}
+
+func remoteSecretHasRecipient(secret remoteSecretRecord, deviceID string) bool {
+	for _, key := range secret.WrappedKeys {
+		if key.RecipientType == "device" && key.RecipientID == deviceID {
+			return true
+		}
+	}
+	return false
+}
+
+func remoteSecretHasRecoveryRecipient(secret remoteSecretRecord, recipientID string) bool {
+	for _, key := range secret.WrappedKeys {
+		if key.RecipientType == "recovery" && key.RecipientID == recipientID {
+			return true
+		}
+	}
+	return false
+}
+
+func localSecretVersionExists(st *store.FileStore, scope, name string, versionNumber int) bool {
+	secret, ok := st.State.Secrets[store.SecretKey(scope, name)]
+	if !ok {
+		return false
+	}
+	for _, version := range secret.Versions {
+		if version.Version == versionNumber && version.DataKeyAccount != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func localActiveSecretExists(st *store.FileStore, scope, name string) bool {
+	secret, ok := st.State.Secrets[store.SecretKey(scope, name)]
+	if !ok {
+		return false
+	}
+	return activeVersion(secret) != nil
+}
+
+func localSecretWorkspacePrefixes(refs []store.LocalSecretRef) []string {
+	seen := map[string]bool{}
+	for _, ref := range refs {
+		prefix := store.WorkspacePrefix(ref.Scope)
+		if prefix != "" {
+			seen[prefix] = true
+		}
+	}
+	values := make([]string, 0, len(seen))
+	for prefix := range seen {
+		values = append(values, prefix)
+	}
+	sort.Strings(values)
+	return values
+}
+
+type listRow struct {
+	Path         string
+	Version      int
+	NameHash     string
+	Status       string
+	Keys         string
+	Workspace    string
+	WorkspaceID  string
+	HasLocal     bool
+	HasRemote    bool
+	RemoteStatus string
+}
+
+func activeVersion(secret asiri.Secret) *asiri.SecretVersion {
+	for i := range secret.Versions {
+		if secret.Versions[i].Version == secret.ActiveVersion && secret.Versions[i].Status == "active" {
+			return &secret.Versions[i]
+		}
+	}
+	return nil
+}
+
+func matchesListFilter(row listRow, filter string, workspaces map[string]bool, status string, localOnly, remoteOnly bool) bool {
+	if localOnly && !row.HasLocal {
+		return false
+	}
+	if remoteOnly && !row.HasRemote {
+		return false
+	}
+	if len(workspaces) > 0 && !workspaces[row.Workspace] {
+		return false
+	}
+	if status != "" && row.Status != status && row.RemoteStatus != status {
+		return false
+	}
+	if filter == "" {
+		return true
+	}
+	return strings.Contains(row.Path, filter)
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func shortSecretPath(scope, name string) string {
+	prefix := store.WorkspacePrefix(scope)
+	shortScope := scope
+	if prefix != "" {
+		shortScope = strings.TrimPrefix(scope, prefix+"/")
+	}
+	if shortScope == "" {
+		return name
+	}
+	return store.SecretKey(shortScope, name)
+}
+
+func boundWorkspaceID(st *store.FileStore, workspaceSlug string) string {
+	if st == nil || workspaceSlug == "" {
+		return ""
+	}
+	if binding, ok := st.RemoteBindingForPrefix(workspaceSlug); ok {
+		return binding.WorkspaceID
+	}
+	if st.State.ControlPlane != nil && st.State.ControlPlane.WorkspaceSlug == workspaceSlug {
+		return st.State.ControlPlane.WorkspaceID
+	}
+	return ""
+}
+
+func postJSON(url string, body any, out any) error {
+	status, err := postJSONStatus(url, body, out)
+	if err != nil {
+		return err
+	}
+	if status < 200 || status >= 300 {
+		return fmt.Errorf("control plane returned HTTP %d", status)
+	}
+	return nil
+}
+
+func postJSONBearer(st *store.FileStore, url, bearer string, body any, out any) error {
+	status, err := postJSONBearerStatus(st, url, bearer, body, out)
+	if err != nil {
+		return err
+	}
+	if status < 200 || status >= 300 {
+		return fmt.Errorf("control plane returned HTTP %d", status)
+	}
+	return nil
+}
+
+func postJSONBearerStatus(st *store.FileStore, url, bearer string, body any, out any) (int, error) {
+	return postJSONBearerStatusWithClient(st, http.DefaultClient, url, bearer, body, out)
+}
+
+func postJSONBearerTimeout(st *store.FileStore, url, bearer string, body any, out any, timeout time.Duration) error {
+	status, err := postJSONBearerStatusWithClient(st, &http.Client{Timeout: timeout}, url, bearer, body, out)
+	if err != nil {
+		return err
+	}
+	if status < 200 || status >= 300 {
+		return fmt.Errorf("control plane returned HTTP %d", status)
+	}
+	return nil
+}
+
+func postJSONBearerStatusWithClient(st *store.FileStore, client *http.Client, url, bearer string, body any, out any) (int, error) {
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return 0, err
+	}
+	request, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(encoded))
+	if err != nil {
+		return 0, err
+	}
+	request.Header.Set("content-type", "application/json")
+	request.Header.Set("authorization", "Bearer "+bearer)
+	if err := signBearerRequest(st, request, encoded, bearer); err != nil {
+		return 0, err
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return 0, err
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(response.Body)
+	if err != nil {
+		return response.StatusCode, err
+	}
+	if out != nil && len(bytes.TrimSpace(responseBody)) > 0 {
+		if err := json.Unmarshal(responseBody, out); err != nil && response.StatusCode >= 200 && response.StatusCode < 300 {
+			return response.StatusCode, err
+		}
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		var failure struct {
+			Error   string `json:"error"`
+			Message string `json:"message"`
+		}
+		if len(bytes.TrimSpace(responseBody)) > 0 {
+			_ = json.Unmarshal(responseBody, &failure)
+		}
+		if failure.Message != "" {
+			return response.StatusCode, fmt.Errorf("control plane returned HTTP %d: %s", response.StatusCode, failure.Message)
+		}
+		if failure.Error != "" {
+			return response.StatusCode, fmt.Errorf("control plane returned HTTP %d: %s", response.StatusCode, failure.Error)
+		}
+	}
+	return response.StatusCode, nil
+}
+
+func getJSONBearer(st *store.FileStore, url, bearer string, out any) error {
+	status, err := getJSONBearerStatus(st, url, bearer, out)
+	if err != nil {
+		return err
+	}
+	if status < 200 || status >= 300 {
+		return fmt.Errorf("control plane returned HTTP %d", status)
+	}
+	return nil
+}
+
+func getJSONBearerStatus(st *store.FileStore, url, bearer string, out any) (int, error) {
+	request, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return 0, err
+	}
+	request.Header.Set("authorization", "Bearer "+bearer)
+	if err := signBearerRequest(st, request, nil, bearer); err != nil {
+		return 0, err
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return 0, err
+	}
+	defer response.Body.Close()
+	if out != nil && response.StatusCode >= 200 && response.StatusCode < 300 {
+		if err := json.NewDecoder(response.Body).Decode(out); err != nil && !errors.Is(err, io.EOF) {
+			return response.StatusCode, err
+		}
+	}
+	return response.StatusCode, nil
+}
+
+func signBearerRequest(st *store.FileStore, request *http.Request, body []byte, bearer string) error {
+	return signDeviceRequest(st, request, body, credentialHash(bearer))
+}
+
+func signDeviceRequest(st *store.FileStore, request *http.Request, body []byte, credentialHash string) error {
+	if st.State.ControlPlane == nil || st.State.ControlPlane.DeviceID == "" {
+		return errors.New("control plane device is not linked")
+	}
+	if credentialHash == "" {
+		return errors.New("device request credential binding is required")
+	}
+	privateKey, err := st.DeviceSigningPrivateKey()
+	if err != nil {
+		return err
+	}
+	bodyDigest := sha256.Sum256(body)
+	timestamp := time.Now().UTC().Format(time.RFC3339)
+	nonceBytes := make([]byte, 16)
+	if _, err := rand.Read(nonceBytes); err != nil {
+		return err
+	}
+	nonce := base64.RawURLEncoding.EncodeToString(nonceBytes)
+	canonical := strings.Join([]string{
+		"asiri-device-request-v1",
+		request.Method,
+		request.URL.RequestURI(),
+		hex.EncodeToString(bodyDigest[:]),
+		timestamp,
+		nonce,
+		st.State.ControlPlane.DeviceID,
+		credentialHash,
+	}, "\n")
+	canonicalDigest := sha256.Sum256([]byte(canonical))
+	r, s, err := ecdsa.Sign(rand.Reader, privateKey, canonicalDigest[:])
+	if err != nil {
+		return err
+	}
+	signature := make([]byte, 64)
+	r.FillBytes(signature[:32])
+	s.FillBytes(signature[32:])
+	request.Header.Set("x-asiri-device", st.State.ControlPlane.DeviceID)
+	request.Header.Set("x-asiri-timestamp", timestamp)
+	request.Header.Set("x-asiri-nonce", nonce)
+	request.Header.Set("x-asiri-signature", base64.RawURLEncoding.EncodeToString(signature))
+	return nil
+}
+
+func signDeviceCodeClaimRequest(st *store.FileStore, request *http.Request, body []byte, credentialHash string) error {
+	if credentialHash == "" {
+		return errors.New("device-code claim credential binding is required")
+	}
+	privateKey, err := st.LocalDeviceSigningPrivateKey()
+	if err != nil {
+		return err
+	}
+	bodyDigest := sha256.Sum256(body)
+	timestamp := time.Now().UTC().Format(time.RFC3339)
+	nonceBytes := make([]byte, 16)
+	if _, err := rand.Read(nonceBytes); err != nil {
+		return err
+	}
+	nonce := base64.RawURLEncoding.EncodeToString(nonceBytes)
+	canonical := strings.Join([]string{
+		"asiri-device-code-claim-v1",
+		request.Method,
+		request.URL.RequestURI(),
+		hex.EncodeToString(bodyDigest[:]),
+		timestamp,
+		nonce,
+		credentialHash,
+	}, "\n")
+	canonicalDigest := sha256.Sum256([]byte(canonical))
+	r, s, err := ecdsa.Sign(rand.Reader, privateKey, canonicalDigest[:])
+	if err != nil {
+		return err
+	}
+	signature := make([]byte, 64)
+	r.FillBytes(signature[:32])
+	s.FillBytes(signature[32:])
+	request.Header.Set("x-asiri-timestamp", timestamp)
+	request.Header.Set("x-asiri-nonce", nonce)
+	request.Header.Set("x-asiri-signature", base64.RawURLEncoding.EncodeToString(signature))
+	return nil
+}
+
+func credentialHash(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(digest[:])
+}
+
+func postJSONDeviceCodeClaimStatus(st *store.FileStore, url string, body any, credentialHash string, out any) (int, error) {
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return 0, err
+	}
+	request, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(encoded))
+	if err != nil {
+		return 0, err
+	}
+	request.Header.Set("content-type", "application/json")
+	if err := signDeviceCodeClaimRequest(st, request, encoded, credentialHash); err != nil {
+		return 0, err
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return 0, err
+	}
+	defer response.Body.Close()
+	if out != nil {
+		if err := json.NewDecoder(response.Body).Decode(out); err != nil && !errors.Is(err, io.EOF) {
+			return response.StatusCode, err
+		}
+	}
+	return response.StatusCode, nil
+}
+
+func postJSONDeviceSignedStatus(st *store.FileStore, url string, body any, credentialHash string, out any) (int, error) {
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return 0, err
+	}
+	request, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(encoded))
+	if err != nil {
+		return 0, err
+	}
+	request.Header.Set("content-type", "application/json")
+	if err := signDeviceRequest(st, request, encoded, credentialHash); err != nil {
+		return 0, err
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return 0, err
+	}
+	defer response.Body.Close()
+	if out != nil {
+		if err := json.NewDecoder(response.Body).Decode(out); err != nil && !errors.Is(err, io.EOF) {
+			return response.StatusCode, err
+		}
+	}
+	return response.StatusCode, nil
+}
+
+func postJSONStatus(url string, body any, out any) (int, error) {
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return 0, err
+	}
+	response, err := http.Post(url, "application/json", bytes.NewReader(encoded))
+	if err != nil {
+		return 0, err
+	}
+	defer response.Body.Close()
+	if out != nil {
+		if err := json.NewDecoder(response.Body).Decode(out); err != nil && !errors.Is(err, io.EOF) {
+			return response.StatusCode, err
+		}
+	}
+	return response.StatusCode, nil
+}
+
+func createDevice(name string) (asiri.Device, []asiri.KeyRef, error) {
+	deviceID := store.NewID("dev")
+	encryptionPrivateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return asiri.Device{}, nil, err
+	}
+	signingPrivateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return asiri.Device{}, nil, err
+	}
+	encryptionPrivateBytes, err := x509.MarshalECPrivateKey(encryptionPrivateKey)
+	if err != nil {
+		return asiri.Device{}, nil, err
+	}
+	signingPrivateBytes, err := x509.MarshalECPrivateKey(signingPrivateKey)
+	if err != nil {
+		return asiri.Device{}, nil, err
+	}
+	encryptionPublicBytes, err := x509.MarshalPKIXPublicKey(&encryptionPrivateKey.PublicKey)
+	if err != nil {
+		return asiri.Device{}, nil, err
+	}
+	signingPublicBytes, err := x509.MarshalPKIXPublicKey(&signingPrivateKey.PublicKey)
+	if err != nil {
+		return asiri.Device{}, nil, err
+	}
+	encryptionAccount := keystore.DeviceKeyAccount(deviceID, "encryption-private")
+	signingAccount := keystore.DeviceKeyAccount(deviceID, "signing-private")
+	if err := keystore.Store(encryptionAccount, base64.StdEncoding.EncodeToString(encryptionPrivateBytes)); err != nil {
+		return asiri.Device{}, nil, err
+	}
+	if err := keystore.Store(signingAccount, base64.StdEncoding.EncodeToString(signingPrivateBytes)); err != nil {
+		_ = keystore.Delete(encryptionAccount)
+		return asiri.Device{}, nil, err
+	}
+	return asiri.Device{
+			ID:                  deviceID,
+			Name:                name,
+			Kind:                "laptop",
+			Status:              asiri.DeviceTrusted,
+			EncryptionPublicKey: base64.StdEncoding.EncodeToString(encryptionPublicBytes),
+			SigningPublicKey:    base64.StdEncoding.EncodeToString(signingPublicBytes),
+			CreatedAt:           time.Now().UTC(),
+		}, []asiri.KeyRef{
+			{Purpose: "device-encryption-private-key", Account: encryptionAccount},
+			{Purpose: "device-signing-private-key", Account: signingAccount},
+		}, nil
+}
+
+func hasFlag(args []string, flag string) bool {
+	for _, arg := range args {
+		if arg == flag {
+			return true
+		}
+	}
+	return false
+}
+
+func firstPositional(args []string) string {
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "--") {
+			continue
+		}
+		return arg
+	}
+	return ""
+}
+
+func positionalArgs(args []string) []string {
+	positionals := []string{}
+	for _, arg := range args {
+		if arg == "--" {
+			break
+		}
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		positionals = append(positionals, arg)
+	}
+	return positionals
+}
+
+func firstPositionalSkippingFlagValues(args []string, flagsWithValues ...string) string {
+	valueFlags := map[string]bool{}
+	for _, flag := range flagsWithValues {
+		valueFlags[flag] = true
+	}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return ""
+		}
+		if strings.HasPrefix(arg, "--") {
+			if valueFlags[arg] {
+				i++
+			}
+			continue
+		}
+		return arg
+	}
+	return ""
+}
+
+func flagValue(args []string, flag, fallback string) string {
+	for i := range args {
+		if args[i] == flag && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return fallback
+}
+
+func optionalFlagValue(args []string, flag string) (string, bool, error) {
+	for i := range args {
+		if args[i] != flag {
+			continue
+		}
+		if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+			return "", true, fmt.Errorf("%s requires a value", flag)
+		}
+		return args[i+1], true, nil
+	}
+	return "", false, nil
+}
+
+func splitWorkspaceFlag(args []string, command string, required bool) (string, []string, error) {
+	workspace := ""
+	remaining := []string{}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			remaining = append(remaining, args[i:]...)
+			break
+		}
+		if arg == "--workspace" || arg == "-w" {
+			if workspace != "" {
+				return "", nil, fmt.Errorf("%s accepts one --workspace value", command)
+			}
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+				return "", nil, fmt.Errorf("%s --workspace requires a slug", command)
+			}
+			workspace = args[i+1]
+			i++
+			continue
+		}
+		remaining = append(remaining, arg)
+	}
+	if required && workspace == "" {
+		return "", nil, fmt.Errorf("%s requires --workspace <slug>", command)
+	}
+	return workspace, remaining, nil
+}
+
+func splitWorkspaceFilters(args []string, command string) ([]string, []string, error) {
+	workspaces := []string{}
+	remaining := []string{}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			remaining = append(remaining, args[i:]...)
+			break
+		}
+		if arg == "--workspace" || arg == "-w" {
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+				return nil, nil, fmt.Errorf("%s --workspace requires a slug", command)
+			}
+			workspaces = append(workspaces, args[i+1])
+			i++
+			continue
+		}
+		remaining = append(remaining, arg)
+	}
+	return workspaces, remaining, nil
+}
+
+func rejectUnknownArgs(args []string, allowedFlags ...string) error {
+	allowed := map[string]bool{}
+	for _, flag := range allowedFlags {
+		allowed[flag] = true
+	}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return nil
+		}
+		if !strings.HasPrefix(arg, "-") {
+			continue
+		}
+		if !allowed[arg] {
+			return fmt.Errorf("unknown option %q", arg)
+		}
+		switch arg {
+		case "--value-file", "--key-file", "--output-file", "--agent", "--dir", "--limit":
+			i++
+		}
+	}
+	return nil
+}
+
+func (a App) workspaceSlugTarget(st *store.FileStore, value, command string) (string, error) {
+	slug, err := localWorkspaceSlug(value)
+	if err == nil {
+		return slug, nil
+	}
+	if st == nil || st.State.ControlPlane == nil {
+		return "", fmt.Errorf("%s --workspace must be a workspace slug before login", command)
+	}
+	accessToken, accessErr := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	if accessErr != nil {
+		return "", accessErr
+	}
+	workspaces, listErr := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken)
+	if listErr != nil {
+		return "", listErr
+	}
+	workspace, ok := findWorkspace(workspaces, strings.TrimSpace(value))
+	if !ok {
+		return "", fmt.Errorf("workspace %s is not visible", value)
+	}
+	if workspace.Slug == "" {
+		return "", fmt.Errorf("workspace %s does not have a slug", value)
+	}
+	return workspace.Slug, nil
+}
+
+func (a App) workspaceFilterSet(st *store.FileStore, values []string, command string) (map[string]bool, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	filters := map[string]bool{}
+	for _, value := range values {
+		slug, err := a.workspaceSlugTarget(st, value, command)
+		if err != nil {
+			return nil, err
+		}
+		filters[slug] = true
+	}
+	return filters, nil
+}
+
+func localWorkspaceFilterSet(values []string, command string) (map[string]bool, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	filters := map[string]bool{}
+	for _, value := range values {
+		slug, err := localWorkspaceSlug(value)
+		if err != nil {
+			return nil, fmt.Errorf("%s --workspace must be a workspace slug", command)
+		}
+		filters[slug] = true
+	}
+	return filters, nil
+}
+
+func (a App) rejectWorkspacePrefixedFilter(st *store.FileStore, filter string, workspaceSet map[string]bool, command string, includeRemoteKnown bool) error {
+	trimmed := strings.Trim(filter, "/")
+	if trimmed == "" {
+		return nil
+	}
+	known := knownWorkspaceSlugs(st)
+	for slug := range workspaceSet {
+		known[slug] = true
+	}
+	if includeRemoteKnown && st != nil && st.State.ControlPlane != nil {
+		if accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st); err == nil {
+			if workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken); err == nil {
+				for _, workspace := range workspaces {
+					if workspace.Slug != "" {
+						known[workspace.Slug] = true
+					}
+				}
+			}
+		}
+	}
+	prefix := store.WorkspacePrefix(trimmed)
+	if !known[prefix] {
+		return nil
+	}
+	short := strings.TrimPrefix(trimmed, prefix+"/")
+	return fmt.Errorf("%s accepts short paths; use %q with --workspace %s, not %q", command, short, prefix, trimmed)
+}
+
+type workspacePathTarget struct {
+	Slug       string
+	KnownSlugs map[string]bool
+}
+
+func (target workspacePathTarget) knowsWorkspacePrefix(prefix string) bool {
+	if prefix == "" {
+		return false
+	}
+	return prefix == target.Slug || target.KnownSlugs[prefix]
+}
+
+func (a App) workspacePathTarget(st *store.FileStore, value, command string) (workspacePathTarget, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return workspacePathTarget{}, errors.New("--workspace requires a slug")
+	}
+	known := knownWorkspaceSlugs(st)
+	if st != nil && st.State.ControlPlane != nil && time.Until(st.State.ControlPlane.AccessTokenExpiresAt) > 30*time.Second {
+		if accessToken, err := st.ControlPlaneAccessToken(); err == nil && accessToken != "" {
+			if workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken); err == nil {
+				for _, workspace := range workspaces {
+					if workspace.Slug != "" {
+						known[workspace.Slug] = true
+					}
+				}
+				if workspace, ok := findWorkspace(workspaces, trimmed); ok {
+					if workspace.Slug == "" {
+						return workspacePathTarget{}, fmt.Errorf("workspace %s does not have a slug", value)
+					}
+					known[workspace.Slug] = true
+					return workspacePathTarget{Slug: workspace.Slug, KnownSlugs: known}, nil
+				}
+			}
+		}
+	}
+	slug, err := localWorkspaceSlug(trimmed)
+	if err != nil {
+		if st == nil || st.State.ControlPlane == nil {
+			return workspacePathTarget{}, fmt.Errorf("%s --workspace must be a workspace slug before login", command)
+		}
+		return workspacePathTarget{}, fmt.Errorf("%s --workspace must be a workspace slug", command)
+	}
+	known[slug] = true
+	return workspacePathTarget{Slug: slug, KnownSlugs: known}, nil
+}
+
+func knownWorkspaceSlugs(st *store.FileStore) map[string]bool {
+	known := map[string]bool{}
+	if st == nil {
+		return known
+	}
+	if st.State.ControlPlane != nil && st.State.ControlPlane.WorkspaceSlug != "" {
+		known[st.State.ControlPlane.WorkspaceSlug] = true
+	}
+	for prefix, binding := range st.State.RemoteBindings {
+		if prefix != "" {
+			known[prefix] = true
+		}
+		if binding.WorkspaceSlug != "" {
+			known[binding.WorkspaceSlug] = true
+		}
+	}
+	for _, secret := range st.State.Secrets {
+		if prefix := store.WorkspacePrefix(secret.Scope); prefix != "" {
+			known[prefix] = true
+		}
+	}
+	for _, policy := range st.State.Policies {
+		if prefix := store.WorkspacePrefix(policy.ScopePattern); prefix != "" {
+			known[prefix] = true
+		}
+	}
+	return known
+}
+
+func localWorkspaceSlug(value string) (string, error) {
+	slug := strings.TrimSpace(value)
+	if slug == "" {
+		return "", errors.New("--workspace requires a slug")
+	}
+	if err := store.ValidateWorkspaceSlug(slug); err != nil {
+		return "", err
+	}
+	return slug, nil
+}
+
+func workspacePrefixedPath(target workspacePathTarget, shortPath, command string) (string, error) {
+	trimmed := strings.Trim(shortPath, "/")
+	if trimmed == "" {
+		return "", fmt.Errorf("%s requires a short scope/name path", command)
+	}
+	scope, name, err := store.ParseSecretPath(trimmed)
+	if err != nil {
+		return "", err
+	}
+	prefix := store.WorkspacePrefix(scope)
+	if target.knowsWorkspacePrefix(prefix) {
+		short := strings.TrimPrefix(trimmed, prefix+"/")
+		return "", fmt.Errorf("%s accepts short paths; use %q with --workspace %s, not %q", command, short, target.Slug, trimmed)
+	}
+	return store.SecretKey(target.Slug+"/"+scope, name), nil
+}
+
+func workspacePrefixedPattern(target workspacePathTarget, shortPattern, command string) (string, error) {
+	trimmed := strings.Trim(shortPattern, "/")
+	if trimmed == "" {
+		return "", fmt.Errorf("%s requires a short scope pattern", command)
+	}
+	prefix := store.WorkspacePrefix(trimmed)
+	if target.knowsWorkspacePrefix(prefix) {
+		short := strings.TrimPrefix(trimmed, prefix+"/")
+		return "", fmt.Errorf("%s accepts short paths; use %q with --workspace %s, not %q", command, short, target.Slug, trimmed)
+	}
+	return target.Slug + "/" + trimmed, nil
+}
+
+func workspacePrefixedSelection(target workspacePathTarget, shortSelection, command string) (string, error) {
+	trimmed := strings.Trim(shortSelection, "/")
+	if trimmed == "" {
+		return "", fmt.Errorf("%s requires a short scope or scope/name path", command)
+	}
+	prefix := store.WorkspacePrefix(trimmed)
+	if target.knowsWorkspacePrefix(prefix) {
+		short := strings.TrimPrefix(trimmed, prefix+"/")
+		return "", fmt.Errorf("%s accepts short paths; use %q with --workspace %s, not %q", command, short, target.Slug, trimmed)
+	}
+	return target.Slug + "/" + trimmed, nil
+}
+
+func (a App) readSensitiveInput(args []string, label, fileFlag string, rejectedFlags ...string) (string, error) {
+	for _, flag := range rejectedFlags {
+		if _, present, err := optionalFlagValue(args, flag); present || err != nil {
+			if err != nil {
+				return "", err
+			}
+			return "", fmt.Errorf("%s is unsafe because values in arguments can leak; use --stdin, %s, or the interactive prompt", flag, fileFlag)
+		}
+	}
+	filePath, hasFile, err := optionalFlagValue(args, fileFlag)
+	if err != nil {
+		return "", err
+	}
+	hasStdin := hasFlag(args, "--stdin")
+	if hasFile && hasStdin {
+		return "", fmt.Errorf("use either --stdin or %s, not both", fileFlag)
+	}
+	if hasFile {
+		bytes, err := os.ReadFile(filePath)
+		if err != nil {
+			return "", err
+		}
+		return normalizeSensitiveInput(string(bytes), label)
+	}
+	if hasStdin {
+		bytes, err := io.ReadAll(a.In)
+		if err != nil {
+			return "", err
+		}
+		return normalizeSensitiveInput(string(bytes), label)
+	}
+	file, ok := a.In.(*os.File)
+	if !ok || !term.IsTerminal(int(file.Fd())) {
+		return "", fmt.Errorf("%s input requires --stdin or %s in non-interactive mode", strings.ToLower(label), fileFlag)
+	}
+	fmt.Fprintf(a.Err, "%s: ", label)
+	bytes, err := term.ReadPassword(int(file.Fd()))
+	fmt.Fprintln(a.Err)
+	if err != nil {
+		return "", err
+	}
+	return normalizeSensitiveInput(string(bytes), label)
+}
+
+func normalizeSensitiveInput(value, label string) (string, error) {
+	value = strings.TrimRight(value, "\r\n")
+	if value == "" {
+		return "", fmt.Errorf("%s must not be empty", strings.ToLower(label))
+	}
+	return value, nil
+}
+
+func validateControlPlaneOrigin(origin string) error {
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Scheme == "" || parsed.Hostname() == "" {
+		return fmt.Errorf("invalid control-plane origin %q", origin)
+	}
+	switch parsed.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if isLoopbackHost(parsed.Hostname()) || os.Getenv("ASIRI_ALLOW_INSECURE_ORIGIN") == "1" {
+			return nil
+		}
+		return errors.New("control-plane origin must use HTTPS unless it is loopback")
+	default:
+		return fmt.Errorf("unsupported control-plane origin scheme %q", parsed.Scheme)
+	}
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func validListStatus(status string) bool {
+	switch status {
+	case "local-only", "remote-only", "synced", "read-only", "writable":
+		return true
+	default:
+		return false
+	}
+}
+
+func writeExclusiveSecretFile(path string, value []byte) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("mount target already exists: %s", path)
+		}
+		return err
+	}
+	defer file.Close()
+	return writeReservedSecretFile(file, value)
+}
+
+func reserveExclusiveSecretFile(path string) (*os.File, error) {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("mount target already exists: %s", path)
+		}
+		return nil, err
+	}
+	return file, nil
+}
+
+func writeReservedSecretFile(file *os.File, value []byte) error {
+	if _, err := file.Write(value); err != nil {
+		return err
+	}
+	return file.Chmod(0o600)
+}
+
+func (a App) fail(err error) int {
+	fmt.Fprintf(a.Err, "asiri: %s\n", err)
+	return 1
+}
