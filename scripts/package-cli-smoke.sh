@@ -2,7 +2,7 @@
 set -euo pipefail
 
 OUT_DIR="${ASIRI_CLI_DIST:-dist/cli}"
-VERSION="${ASIRI_VERSION:-$(node -p "require('./package.json').version")}"
+VERSION="${ASIRI_VERSION:-$(tr -d '[:space:]' < VERSION)}"
 SIGNING_DIR="$(mktemp -d)"
 trap 'rm -rf "$SIGNING_DIR"' EXIT
 SIGNING_KEY="${ASIRI_RELEASE_SIGNING_KEY:-}"

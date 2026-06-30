@@ -1565,7 +1565,6 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 	}
 	secretPushCount := 0
 	syncSeen := false
-	rewrapSeen := false
 	devicePublicKey := ""
 	var pushedSecret map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1634,12 +1633,19 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 					t.Fatalf("unexpected pushed secret body: %#v", body)
 				}
 				wrapped, ok := body["wrappedKeys"].([]any)
-				if !ok || len(wrapped) != 1 {
+				if !ok || len(wrapped) != 2 {
 					t.Fatalf("missing wrapped keys: %#v", body["wrappedKeys"])
 				}
-				wrappedKey := wrapped[0].(map[string]any)
-				if wrappedKey["recipientId"] != "dev_remote" || wrappedKey["wrapAlgorithm"] != "p256-hkdf-aes256gcm" {
-					t.Fatalf("unexpected wrapped key: %#v", wrappedKey)
+				recipients := map[string]bool{}
+				for _, item := range wrapped {
+					wrappedKey := item.(map[string]any)
+					if wrappedKey["wrapAlgorithm"] != "p256-hkdf-aes256gcm" {
+						t.Fatalf("unexpected wrapped key: %#v", wrappedKey)
+					}
+					recipients[fmt.Sprint(wrappedKey["recipientId"])] = true
+				}
+				if !recipients["dev_remote"] || !recipients["dev_other"] {
+					t.Fatalf("unexpected wrapped recipients: %#v", wrapped)
 				}
 				pushedSecret = body
 				pushedSecret["id"] = "secv_remote"
@@ -1692,7 +1698,7 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 				},
 			})
 		case "/v1/secrets/secv_remote/wrapped-keys":
-			rewrapSeen = true
+			t.Fatal("rewrap endpoint should not be called after push wrapped all trusted devices")
 			if r.Header.Get("authorization") != "Bearer at_push" {
 				t.Fatalf("unexpected rewrap auth header: %s", r.Header.Get("authorization"))
 			}
@@ -1728,8 +1734,8 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
 		}
 	}
-	if secretPushCount != 1 || !syncSeen || !rewrapSeen {
-		t.Fatalf("expected push, pull, and rewrap endpoints to be called")
+	if secretPushCount != 1 || !syncSeen {
+		t.Fatalf("expected push and pull endpoints to be called")
 	}
 	if strings.Contains(out.String(), "secret_value") || strings.Contains(errb.String(), "secret_value") {
 		t.Fatalf("push/pull leaked secret stdout=%q stderr=%q", out.String(), errb.String())
@@ -1755,7 +1761,7 @@ func TestPushDryRunFirstWorkspaceEvaluatesRemoteState(t *testing.T) {
 		{
 			name:     "no-op",
 			wantCode: 0,
-			wantOut:  []string{"Would push 0 encrypted secret version(s)", "1 would be skipped"},
+			wantOut:  []string{"Would push 0 encrypted secret version(s)", "1 would be skipped", "Would rewrap 1 trusted-device key(s) across 1 existing secret version(s)"},
 		},
 		{
 			name:                 "metadata-only-inactive-conflict",
@@ -1774,13 +1780,21 @@ func TestPushDryRunFirstWorkspaceEvaluatesRemoteState(t *testing.T) {
 			}
 			var remoteVersion *asiri.SecretVersion
 			writeOptionsSeen := false
+			devicesSeen := false
 			encryptedSeen := false
 			metadataSeen := false
 			postSeen := false
+			rewrapPostSeen := false
+			devicePublicKey := ""
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("content-type", "application/json")
 				switch r.URL.Path {
 				case "/v1/auth/device-code/start":
+					var body map[string]string
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						t.Fatal(err)
+					}
+					devicePublicKey = body["encryptionPublicKey"]
 					_ = json.NewEncoder(w).Encode(map[string]any{
 						"deviceCode":              "dc_dry_run",
 						"userCode":                "DRY-1234",
@@ -1823,6 +1837,14 @@ func TestPushDryRunFirstWorkspaceEvaluatesRemoteState(t *testing.T) {
 					})
 				case "/v1/recovery-recipient":
 					http.NotFound(w, r)
+				case "/v1/devices":
+					devicesSeen = true
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"devices": []map[string]any{
+							{"id": "dev_dry_run", "name": "qa-laptop", "status": "trusted", "kind": "laptop", "encryptionPublicKey": devicePublicKey},
+							{"id": "dev_other", "name": "server", "status": "trusted", "kind": "server", "encryptionPublicKey": devicePublicKey},
+						},
+					})
 				case "/v1/secrets/encrypted":
 					encryptedSeen = true
 					if r.URL.Query().Get("orgId") != "org_dry_run" {
@@ -1886,6 +1908,11 @@ func TestPushDryRunFirstWorkspaceEvaluatesRemoteState(t *testing.T) {
 						postSeen = true
 					}
 					http.NotFound(w, r)
+				case "/v1/secrets/sec_dry_run/wrapped-keys":
+					if r.Method == http.MethodPost {
+						rewrapPostSeen = true
+					}
+					http.NotFound(w, r)
 				default:
 					http.NotFound(w, r)
 				}
@@ -1929,8 +1956,8 @@ func TestPushDryRunFirstWorkspaceEvaluatesRemoteState(t *testing.T) {
 			if tc.wantErr != "" && !strings.Contains(errb.String(), tc.wantErr) {
 				t.Fatalf("dry-run error missing %q: %s", tc.wantErr, errb.String())
 			}
-			if !writeOptionsSeen || !encryptedSeen || !metadataSeen || postSeen {
-				t.Fatalf("dry-run should evaluate write options and remote state without posting, write=%v encrypted=%v metadata=%v post=%v", writeOptionsSeen, encryptedSeen, metadataSeen, postSeen)
+			if !writeOptionsSeen || !devicesSeen || !encryptedSeen || !metadataSeen || postSeen || rewrapPostSeen {
+				t.Fatalf("dry-run should evaluate write options, devices, encrypted state, and metadata without posting, write=%v devices=%v encrypted=%v metadata=%v post=%v rewrapPost=%v", writeOptionsSeen, devicesSeen, encryptedSeen, metadataSeen, postSeen, rewrapPostSeen)
 			}
 			reloaded, err := store.LoadDefault()
 			if err != nil {
@@ -2024,6 +2051,8 @@ func TestPushDryRunRemoteWorkspaceDoesNotPersistSessionSwitch(t *testing.T) {
 				t.Fatalf("unexpected recovery query: %s", r.URL.RawQuery)
 			}
 			http.NotFound(w, r)
+		case "/v1/devices":
+			_ = json.NewEncoder(w).Encode(map[string]any{"devices": []map[string]any{}})
 		case "/v1/secrets/encrypted":
 			encryptedSeen = true
 			if r.Header.Get("authorization") != "Bearer at_asiri" || r.URL.Query().Get("orgId") != "org_asiri" {
@@ -2072,6 +2101,93 @@ func TestPushDryRunRemoteWorkspaceDoesNotPersistSessionSwitch(t *testing.T) {
 	}
 	if _, ok := reloaded.RemoteBindingForPrefix("asiri-dev"); ok {
 		t.Fatal("dry-run should not persist remote workspace binding")
+	}
+}
+
+func TestPushFailsWhenTrustedDeviceDiscoveryUnavailable(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	postSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_devices_fail",
+				"userCode":                "DVC-FAIL",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=DVC-FAIL",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_devices_fail",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_devices_fail",
+				"accessToken":      "at_devices_fail",
+				"refreshToken":     "rt_devices_fail",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/sync/write-options":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"requestedWorkspaceSlug": "oclan-co",
+				"activeWorkspace": map[string]any{
+					"id":       "org_devices_fail",
+					"slug":     "oclan-co",
+					"canWrite": true,
+					"paths": []map[string]any{{
+						"fullPath": "oclan-co/local/asiri/API_KEY",
+						"canWrite": true,
+					}},
+				},
+			})
+		case "/v1/recovery-recipient":
+			http.NotFound(w, r)
+		case "/v1/devices":
+			http.Error(w, `{"error":"temporarily unavailable"}`, http.StatusServiceUnavailable)
+		case "/v1/secrets":
+			if r.Method == http.MethodPost {
+				postSeen = true
+			}
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"push", "--workspace", "oclan-co"}); code == 0 {
+		t.Fatal("push should fail when trusted-device discovery fails")
+	}
+	if postSeen {
+		t.Fatal("push should not upload secrets after trusted-device discovery fails")
+	}
+	if !strings.Contains(errb.String(), "trusted device discovery failed") {
+		t.Fatalf("missing device discovery failure: %s", errb.String())
 	}
 }
 
@@ -2160,7 +2276,7 @@ func TestPushReconcileRejectsIncompleteRemoteEnvelope(t *testing.T) {
 	}
 }
 
-func TestPushReconcileRejectsWrappedRecipientMismatch(t *testing.T) {
+func TestPushReconcileRepairsMissingDeviceRecipient(t *testing.T) {
 	localWrapped := store.RemoteWrappedKey{RecipientType: "device", RecipientID: "dev_remote", WrapAlgorithm: "p256-hkdf-aes256gcm", WrappedKey: "wrapped-local"}
 	remoteWrapped := store.RemoteWrappedKey{RecipientType: "device", RecipientID: "dev_other", WrapAlgorithm: "p256-hkdf-aes256gcm", WrappedKey: "wrapped-remote"}
 	result, err := reconcilePushVersions([]store.RemoteSecretVersion{{
@@ -2174,6 +2290,7 @@ func TestPushReconcileRejectsWrappedRecipientMismatch(t *testing.T) {
 		AAD:         "aad",
 		WrappedKeys: []store.RemoteWrappedKey{localWrapped},
 	}}, []remoteSecretRecord{{
+		ID:          "secv_existing",
 		OrgID:       "org_remote",
 		Scope:       "oclan-co/prod/github",
 		Name:        "SYNC_KEY",
@@ -2185,11 +2302,14 @@ func TestPushReconcileRejectsWrappedRecipientMismatch(t *testing.T) {
 		Status:      "active",
 		WrappedKeys: []store.RemoteWrappedKey{remoteWrapped},
 	}})
-	if err == nil {
-		t.Fatal("same envelope with different wrapped recipients should conflict")
+	if err != nil {
+		t.Fatalf("same envelope with a missing device recipient should be repairable: %v", err)
 	}
-	if len(result.Upload) != 0 || result.SkippedExisting != 0 {
-		t.Fatalf("wrapped recipient mismatch should not upload or skip: %#v", result)
+	if len(result.Upload) != 0 || result.SkippedExisting != 1 || len(result.Rewrap) != 1 {
+		t.Fatalf("wrapped recipient mismatch should schedule rewrap: %#v", result)
+	}
+	if result.Rewrap[0].SecretID == "" || len(result.Rewrap[0].Missing) != 1 || result.Rewrap[0].Missing[0].RecipientID != "dev_remote" {
+		t.Fatalf("unexpected rewrap candidate: %#v", result.Rewrap)
 	}
 }
 
@@ -2591,6 +2711,8 @@ func TestRecoverySetupShowsKeyOnceAndWrapsRemoteSecrets(t *testing.T) {
 				"publicKeyFingerprint": recoveryCreateBody["publicKeyFingerprint"],
 				"status":               "active",
 			})
+		case "/v1/devices":
+			_ = json.NewEncoder(w).Encode(map[string]any{"devices": []map[string]any{}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -2942,6 +3064,8 @@ func TestTargetedPushPreservesRecoveryWrappedCount(t *testing.T) {
 				"publicKeyFingerprint": activeRecovery.PublicKeyFingerprint,
 				"status":               "active",
 			})
+		case "/v1/devices":
+			_ = json.NewEncoder(w).Encode(map[string]any{"devices": []map[string]any{}})
 		case "/v1/secrets/encrypted":
 			if activeRecovery == nil || r.URL.Query().Get("recoveryRecipientId") != activeRecovery.RecipientID {
 				t.Fatalf("targeted push should request recovery-wrapped remote state, got query %s", r.URL.RawQuery)
@@ -3088,6 +3212,8 @@ func TestRecoverySetupSkipsWrappingWhenRemoteRegistrationFails(t *testing.T) {
 				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{pushedSecret}})
+		case "/v1/devices":
+			_ = json.NewEncoder(w).Encode(map[string]any{"devices": []map[string]any{}})
 		case "/v1/recovery-recipient":
 			if r.Method == http.MethodGet {
 				http.NotFound(w, r)
@@ -3209,6 +3335,8 @@ func TestRecoverySetupFailsWhenRemoteReplacementFails(t *testing.T) {
 				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{pushedSecret}})
+		case "/v1/devices":
+			_ = json.NewEncoder(w).Encode(map[string]any{"devices": []map[string]any{}})
 		case "/v1/recovery-recipient":
 			if r.Method != http.MethodGet || !remoteRecoveryActive {
 				http.NotFound(w, r)
@@ -3399,6 +3527,8 @@ func TestRecoverySetupForceCommitsWhenPreviousRecipientIsRetired(t *testing.T) {
 				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{pushedSecret}})
+		case "/v1/devices":
+			_ = json.NewEncoder(w).Encode(map[string]any{"devices": []map[string]any{}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -6092,6 +6222,162 @@ func TestEnvDirectScopeExport(t *testing.T) {
 		if code := app.Run(step); code != 0 {
 			t.Fatalf("%v failed code=%d stderr=%s", step, code, errb.String())
 		}
+	}
+}
+
+func TestEnvRemoteHintFallsBackToSlashyScopeSelection(t *testing.T) {
+	tmp := t.TempDir()
+	oldHome := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", oldHome) })
+	_ = os.Setenv("ASIRI_HOME", tmp)
+
+	visibleSeen := false
+	remoteVisibleSecrets := []map[string]any{{
+		"id":                     "sec_remote_child",
+		"orgId":                  "org_runtime",
+		"workspaceSlug":          "oclan-co",
+		"scope":                  "oclan-co/prod/github",
+		"name":                   "SYNC_KEY",
+		"version":                1,
+		"status":                 "active",
+		"canWrite":               true,
+		"wrappedToCurrentDevice": false,
+	}, {
+		"id":                     "sec_denied_child",
+		"orgId":                  "org_runtime",
+		"workspaceSlug":          "oclan-co",
+		"scope":                  "oclan-co/prod/github",
+		"name":                   "DENIED_KEY",
+		"version":                1,
+		"status":                 "active",
+		"canWrite":               true,
+		"wrappedToCurrentDevice": false,
+	}}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/secrets/visible":
+			visibleSeen = true
+			if r.Header.Get("authorization") != "Bearer at_runtime" {
+				t.Fatalf("unexpected visible auth header: %s", r.Header.Get("authorization"))
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"secrets": remoteVisibleSecrets,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed code=%d stderr=%s", step, code, errb.String())
+		}
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkControlPlaneForDevice(server.URL, "org_runtime", "oclan-co", "usr_owner", "dev_remote", device.ID, "at_runtime", "rt_runtime", 3600, time.Now().UTC().Add(7*24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"env", "--workspace", "oclan-co", "prod/github", "--", "sh", "-c", "true"}); code == 0 {
+		t.Fatal("expected remote-only scope selection to fail before execution")
+	}
+	if visibleSeen {
+		t.Fatal("remote lookup should not run without an inject grant")
+	}
+	if !strings.Contains(errb.String(), "no exact secret or direct child secrets found") {
+		t.Fatalf("unexpected ungranted stderr: %s", errb.String())
+	}
+
+	st, err = store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.State.Policies = append(st.State.Policies, asiri.Policy{
+		ID:            "pol_remote_scope_hint",
+		Subject:       "sh",
+		ScopePattern:  "oclan-co/prod/github",
+		SecretPattern: "*",
+		Actions:       []string{"inject"},
+		ApprovalMode:  "none",
+		CreatedAt:     time.Now().UTC(),
+	}, asiri.Policy{
+		ID:            "pol_remote_scope_hint_denied",
+		Subject:       "sh",
+		ScopePattern:  "oclan-co/prod/github",
+		SecretPattern: "DENIED_KEY",
+		Actions:       []string{"deny"},
+		ApprovalMode:  "require-owner",
+		CreatedAt:     time.Now().UTC(),
+	})
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	visibleSeen = false
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"env", "--workspace", "oclan-co", "prod/github", "--", "sh", "-c", "true"}); code == 0 {
+		t.Fatal("expected remote-only scope selection to fail before execution")
+	}
+	if !visibleSeen {
+		t.Fatal("expected visible remote lookup")
+	}
+	for _, expected := range []string{
+		"1 direct child secret(s) exist remotely under oclan-co/prod/github",
+		"not locally usable on this device",
+		"asiri rewrap --workspace oclan-co",
+		"asiri pull --workspace oclan-co",
+	} {
+		if !strings.Contains(errb.String(), expected) {
+			t.Fatalf("missing %q in stderr: %s", expected, errb.String())
+		}
+	}
+	if strings.Contains(errb.String(), "2 direct child") {
+		t.Fatalf("denied remote child should not be counted in hint: %s", errb.String())
+	}
+
+	remoteVisibleSecrets = []map[string]any{{
+		"id":                     "sec_denied_child",
+		"orgId":                  "org_runtime",
+		"workspaceSlug":          "oclan-co",
+		"scope":                  "oclan-co/prod/github",
+		"name":                   "DENIED_KEY",
+		"version":                1,
+		"status":                 "active",
+		"canWrite":               true,
+		"wrappedToCurrentDevice": false,
+	}}
+	visibleSeen = false
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"env", "--workspace", "oclan-co", "prod/github", "--", "sh", "-c", "true"}); code == 0 {
+		t.Fatal("expected denied-only remote scope selection to fail before execution")
+	}
+	if !visibleSeen {
+		t.Fatal("expected visible remote lookup for denied-only scope")
+	}
+	if !strings.Contains(errb.String(), "no exact secret or direct child secrets found") || strings.Contains(errb.String(), "direct child secret(s) exist remotely") {
+		t.Fatalf("denied-only remote children should not produce inventory hint: %s", errb.String())
 	}
 }
 

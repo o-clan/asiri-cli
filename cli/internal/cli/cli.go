@@ -40,7 +40,7 @@ type App struct {
 	In  io.Reader
 }
 
-var Version = "0.1.20"
+var Version = "0.1.21"
 
 var defaultControlPlaneOrigin = "http://127.0.0.1:4173"
 
@@ -1238,6 +1238,13 @@ func (a App) push(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
+	devices, err := listRemoteDevices(st, st.State.ControlPlane.Origin, target.ID, accessToken, false)
+	if err != nil {
+		return a.fail(fmt.Errorf("trusted device discovery failed; refusing to push incomplete wrapped-key coverage: %w", err))
+	}
+	if err := addTrustedDeviceWrappedKeysToVersions(st, versions, devices); err != nil {
+		return a.fail(err)
+	}
 	recoveryRecipientID := ""
 	if recovery != nil {
 		recoveryRecipientID = recovery.RecipientID
@@ -1269,6 +1276,15 @@ func (a App) push(st *store.FileStore, args []string) int {
 			return a.fail(err)
 		}
 	}
+	rewrappedKeys := 0
+	rewrappedSecrets := 0
+	for _, candidate := range reconciled.Rewrap {
+		if err := addRemoteWrappedKeys(st, st.State.ControlPlane.Origin, candidate.SecretID, accessToken, candidate.Missing); err != nil {
+			return a.fail(err)
+		}
+		rewrappedSecrets++
+		rewrappedKeys += len(candidate.Missing)
+	}
 	if recovery != nil {
 		if st.State.Recoveries == nil {
 			st.State.Recoveries = map[string]asiri.RecoveryConfig{}
@@ -1291,7 +1307,7 @@ func (a App) push(st *store.FileStore, args []string) int {
 	} else if st.ActiveRecovery() != nil {
 		delete(st.State.Recoveries, target.ID)
 	}
-	st.Audit(st.State.UserID, "control_plane_push", "allowed", "", "", "pushed encrypted local secret versions", map[string]string{"count": fmt.Sprintf("%d", len(reconciled.Upload)), "workspace": target.Slug, "skipped": fmt.Sprintf("%d", reconciled.SkippedExisting+reconciled.SkippedOlder)})
+	st.Audit(st.State.UserID, "control_plane_push", "allowed", "", "", "pushed encrypted local secret versions", map[string]string{"count": fmt.Sprintf("%d", len(reconciled.Upload)), "workspace": target.Slug, "skipped": fmt.Sprintf("%d", reconciled.SkippedExisting+reconciled.SkippedOlder), "rewrappedKeys": fmt.Sprintf("%d", rewrappedKeys)})
 	if err := st.Save(); err != nil {
 		return a.fail(err)
 	}
@@ -1305,6 +1321,9 @@ func (a App) push(st *store.FileStore, args []string) int {
 		fmt.Fprintf(a.Out, "✓ Pushed %d encrypted secret version(s) to workspace %s; %d skipped\n", len(reconciled.Upload), target.Slug, reconciled.SkippedExisting+reconciled.SkippedOlder)
 	} else {
 		fmt.Fprintf(a.Out, "✓ Pushed %d encrypted secret version(s) to workspace %s; %d skipped\n", len(reconciled.Upload), target.Slug, reconciled.SkippedExisting+reconciled.SkippedOlder)
+	}
+	if rewrappedKeys > 0 {
+		fmt.Fprintf(a.Out, "✓ Rewrapped %d trusted-device key(s) across %d existing secret version(s)\n", rewrappedKeys, rewrappedSecrets)
 	}
 	return 0
 }
@@ -1435,9 +1454,15 @@ func selectPushRefs(st *store.FileStore, refs []store.LocalSecretRef, target rem
 
 type pushReconcileResult struct {
 	Upload          []store.RemoteSecretVersion
+	Rewrap          []pushRewrapCandidate
 	SkippedExisting int
 	SkippedOlder    int
 	Conflicts       []string
+}
+
+type pushRewrapCandidate struct {
+	SecretID string
+	Missing  []store.RemoteWrappedKey
 }
 
 func reconcilePushVersions(local []store.RemoteSecretVersion, remote []remoteSecretRecord) (pushReconcileResult, error) {
@@ -1455,9 +1480,17 @@ func reconcilePushVersions(local []store.RemoteSecretVersion, remote []remoteSec
 	for _, item := range local {
 		key := store.SecretKey(item.Scope, item.Name)
 		if existing, ok := byVersion[pushVersionKey(item.Scope, item.Name, item.Version)]; ok {
-			if existing.Status == "active" && remoteSecretEnvelopeComparable(existing) && remoteSecretEnvelopeMatches(item, existing) && remoteSecretWrappedKeysMatch(item.WrappedKeys, existing.WrappedKeys) {
-				result.SkippedExisting++
-				continue
+			if existing.Status == "active" && remoteSecretEnvelopeComparable(existing) && remoteSecretEnvelopeMatches(item, existing) {
+				missing := missingRemoteWrappedKeys(item.WrappedKeys, existing.WrappedKeys)
+				if len(missing) == 0 {
+					result.SkippedExisting++
+					continue
+				}
+				if allDeviceWrappedKeys(missing) {
+					result.Rewrap = append(result.Rewrap, pushRewrapCandidate{SecretID: existing.ID, Missing: missing})
+					result.SkippedExisting++
+					continue
+				}
 			}
 			conflicts = append(conflicts, fmt.Sprintf("%s v%d", key, item.Version))
 			continue
@@ -1474,6 +1507,40 @@ func reconcilePushVersions(local []store.RemoteSecretVersion, remote []remoteSec
 		return result, fmt.Errorf("remote secret version conflict for %s; pull first or rotate locally to a newer version", strings.Join(conflicts, ", "))
 	}
 	return result, nil
+}
+
+func addTrustedDeviceWrappedKeysToVersions(st *store.FileStore, versions []store.RemoteSecretVersion, devices []remoteDeviceResponse) error {
+	targets := make([]remoteDeviceResponse, 0)
+	for _, device := range devices {
+		if device.Status == "trusted" && device.ID != "" && device.EncryptionPublicKey != "" {
+			targets = append(targets, device)
+		}
+	}
+	sort.Slice(targets, func(i, j int) bool {
+		return targets[i].ID < targets[j].ID
+	})
+	for i := range versions {
+		for _, device := range targets {
+			if remoteVersionHasRecipient(versions[i], device.ID) {
+				continue
+			}
+			wrapped, err := st.RemoteWrappedKeyForSecretVersionPublicKey(versions[i].Scope, versions[i].Name, versions[i].Version, device.ID, device.EncryptionPublicKey)
+			if err != nil {
+				return err
+			}
+			versions[i].WrappedKeys = append(versions[i].WrappedKeys, wrapped)
+		}
+	}
+	return nil
+}
+
+func remoteVersionHasRecipient(version store.RemoteSecretVersion, deviceID string) bool {
+	for _, key := range version.WrappedKeys {
+		if key.RecipientType == "device" && key.RecipientID == deviceID {
+			return true
+		}
+	}
+	return false
 }
 
 func pushVersionKey(scope, name string, version int) string {
@@ -1499,12 +1566,26 @@ func remoteSecretEnvelopeComparable(remote remoteSecretRecord) bool {
 }
 
 func remoteSecretWrappedKeysMatch(local []store.RemoteWrappedKey, remote []store.RemoteWrappedKey) bool {
+	return len(missingRemoteWrappedKeys(local, remote)) == 0
+}
+
+func missingRemoteWrappedKeys(local []store.RemoteWrappedKey, remote []store.RemoteWrappedKey) []store.RemoteWrappedKey {
 	remoteKeys := map[string]bool{}
 	for _, key := range remote {
 		remoteKeys[remoteWrappedKeyIdentity(key)] = true
 	}
+	missing := []store.RemoteWrappedKey{}
 	for _, key := range local {
 		if !remoteKeys[remoteWrappedKeyIdentity(key)] {
+			missing = append(missing, key)
+		}
+	}
+	return missing
+}
+
+func allDeviceWrappedKeys(keys []store.RemoteWrappedKey) bool {
+	for _, key := range keys {
+		if key.RecipientType != "device" {
 			return false
 		}
 	}
@@ -1522,6 +1603,13 @@ func printPushDryRun(out io.Writer, workspace string, result pushReconcileResult
 		fmt.Fprintf(out, "; %d would be skipped", skipped)
 	}
 	fmt.Fprintln(out)
+	rewrappedKeys := 0
+	for _, candidate := range result.Rewrap {
+		rewrappedKeys += len(candidate.Missing)
+	}
+	if rewrappedKeys > 0 {
+		fmt.Fprintf(out, "Would rewrap %d trusted-device key(s) across %d existing secret version(s)\n", rewrappedKeys, len(result.Rewrap))
+	}
 	if len(result.Conflicts) > 0 {
 		fmt.Fprintf(out, "Conflicts (pull first or rotate locally to a newer version):\n")
 		for _, c := range result.Conflicts {
@@ -1984,13 +2072,40 @@ func (a App) rewrap(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	devices, err := listRemoteDevices(st, st.State.ControlPlane.Origin, target.ID, accessToken, false)
+	stats, err := a.rewrapWorkspace(st, accessToken, target)
 	if err != nil {
 		return a.fail(err)
 	}
+	st.Audit(st.State.UserID, "control_plane_rewrap", "allowed", "", "", "wrapped local data keys to trusted remote devices", map[string]string{"secrets": fmt.Sprintf("%d", stats.Updated), "wrappedKeys": fmt.Sprintf("%d", stats.Added), "workspace": target.Slug})
+	if err := st.Save(); err != nil {
+		return a.fail(err)
+	}
+	if stats.Added == 0 && stats.SkippedMissingLocal > 0 {
+		fmt.Fprintf(a.Out, "No remote secrets can be rewrapped from this machine; %d active remote secret version(s) are missing matching local key material\n", stats.SkippedMissingLocal)
+		return 0
+	}
+	if stats.Added == 0 {
+		fmt.Fprintln(a.Out, "No trusted devices need wrapped keys")
+		return 0
+	}
+	fmt.Fprintf(a.Out, "✓ Rewrapped %d key(s) across %d secret version(s) in workspace %s\n", stats.Added, stats.Updated, target.Slug)
+	return 0
+}
+
+type rewrapStats struct {
+	Updated             int
+	Added               int
+	SkippedMissingLocal int
+}
+
+func (a App) rewrapWorkspace(st *store.FileStore, accessToken string, target remoteWorkspaceResponse) (rewrapStats, error) {
+	devices, err := listRemoteDevices(st, st.State.ControlPlane.Origin, target.ID, accessToken, false)
+	if err != nil {
+		return rewrapStats{}, err
+	}
 	secrets, err := listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, "", false)
 	if err != nil {
-		return a.fail(err)
+		return rewrapStats{}, err
 	}
 	targets := map[string]remoteDeviceResponse{}
 	for _, device := range devices {
@@ -1999,18 +2114,15 @@ func (a App) rewrap(st *store.FileStore, args []string) int {
 		}
 	}
 	if len(targets) == 0 {
-		fmt.Fprintln(a.Out, "No trusted devices need wrapped keys")
-		return 0
+		return rewrapStats{}, nil
 	}
-	updated := 0
-	added := 0
-	skippedMissingLocal := 0
+	stats := rewrapStats{}
 	for _, secret := range secrets {
 		if secret.Status != "active" {
 			continue
 		}
 		if !localSecretVersionExists(st, secret.Scope, secret.Name, secret.Version) {
-			skippedMissingLocal++
+			stats.SkippedMissingLocal++
 			continue
 		}
 		missing := make([]store.RemoteWrappedKey, 0)
@@ -2020,7 +2132,7 @@ func (a App) rewrap(st *store.FileStore, args []string) int {
 			}
 			wrapped, err := st.RemoteWrappedKeyForSecretVersionPublicKey(secret.Scope, secret.Name, secret.Version, device.ID, device.EncryptionPublicKey)
 			if err != nil {
-				return a.fail(err)
+				return rewrapStats{}, err
 			}
 			missing = append(missing, wrapped)
 		}
@@ -2028,21 +2140,12 @@ func (a App) rewrap(st *store.FileStore, args []string) int {
 			continue
 		}
 		if err := addRemoteWrappedKeys(st, st.State.ControlPlane.Origin, secret.ID, accessToken, missing); err != nil {
-			return a.fail(err)
+			return rewrapStats{}, err
 		}
-		updated++
-		added += len(missing)
+		stats.Updated++
+		stats.Added += len(missing)
 	}
-	st.Audit(st.State.UserID, "control_plane_rewrap", "allowed", "", "", "wrapped local data keys to trusted remote devices", map[string]string{"secrets": fmt.Sprintf("%d", updated), "wrappedKeys": fmt.Sprintf("%d", added), "workspace": target.Slug})
-	if err := st.Save(); err != nil {
-		return a.fail(err)
-	}
-	if added == 0 && skippedMissingLocal > 0 {
-		fmt.Fprintf(a.Out, "No remote secrets can be rewrapped from this machine; %d active remote secret version(s) are missing matching local key material\n", skippedMissingLocal)
-		return 0
-	}
-	fmt.Fprintf(a.Out, "✓ Rewrapped %d key(s) across %d secret version(s) in workspace %s\n", added, updated, target.Slug)
-	return 0
+	return stats, nil
 }
 
 func (a App) recovery(st *store.FileStore, args []string) int {
@@ -2660,6 +2763,21 @@ func (a App) trustDeviceInWorkspace(st *store.FileStore, origin, workspaceSlug s
 		return result, err
 	}
 	fmt.Fprintf(a.Out, "✓ This device is trusted for workspace %s\n", result.WorkspaceSlug)
+	target := remoteWorkspaceResponse{ID: result.OrgID, Slug: result.WorkspaceSlug, CurrentDeviceTrusted: boolPtr(true), CanPull: boolPtr(true), CurrentDeviceID: result.DeviceID}
+	stats, err := a.rewrapWorkspace(st, result.AccessToken, target)
+	if err != nil {
+		fmt.Fprintf(a.Err, "asiri: trusted device, but automatic rewrap could not run: %s\n", err)
+		return result, nil
+	}
+	if stats.Added > 0 {
+		st.Audit(st.State.UserID, "control_plane_rewrap", "allowed", "", "", "automatically wrapped local data keys after device trust", map[string]string{"secrets": fmt.Sprintf("%d", stats.Updated), "wrappedKeys": fmt.Sprintf("%d", stats.Added), "workspace": result.WorkspaceSlug})
+		if err := st.Save(); err != nil {
+			return result, err
+		}
+		fmt.Fprintf(a.Out, "✓ Automatically rewrapped %d key(s) across %d secret version(s) in workspace %s\n", stats.Added, stats.Updated, result.WorkspaceSlug)
+	} else if stats.SkippedMissingLocal > 0 {
+		fmt.Fprintf(a.Out, "No local key material available to rewrap %d active remote secret version(s) in workspace %s\n", stats.SkippedMissingLocal, result.WorkspaceSlug)
+	}
 	return result, nil
 }
 
@@ -3981,6 +4099,11 @@ func (a App) resolveSecretSelection(st *store.FileStore, pathSpec, agent, runtim
 		}
 	}
 	if len(keys) == 0 {
+		if allowHint, allowScopeHint := remoteHintPolicy(st, pathSpec, agent, action); allowHint {
+			if hint := a.remoteSelectionHint(st, pathSpec, agent, action, allowScopeHint); hint != "" {
+				return nil, errors.New(hint)
+			}
+		}
 		return nil, fmt.Errorf("no exact secret or direct child secrets found for %s", pathSpec)
 	}
 	sort.Strings(keys)
@@ -3994,6 +4117,114 @@ func (a App) resolveSecretSelection(st *store.FileStore, pathSpec, agent, runtim
 		resolved = append(resolved, item)
 	}
 	return resolved, nil
+}
+
+func remoteHintPolicy(st *store.FileStore, pathSpec, agent, action string) (bool, bool) {
+	if agent == "" {
+		return true, true
+	}
+	if allowed, _ := st.CheckPolicy(agent, pathSpec, action); allowed {
+		return true, false
+	}
+	if remoteScopeHintPolicyAllowed(st, pathSpec, agent, action) {
+		return true, true
+	}
+	return false, false
+}
+
+func remoteScopeHintPolicyAllowed(st *store.FileStore, pathSpec, agent, action string) bool {
+	agent = store.NormalizeSubjectLabel(agent)
+	pathSpec = strings.Trim(pathSpec, "/")
+	now := time.Now().UTC()
+	for _, policy := range st.State.Policies {
+		if policy.ExpiresAt != nil && !policy.ExpiresAt.After(now) {
+			continue
+		}
+		if policy.Subject == agent && store.MatchPattern(policy.ScopePattern, pathSpec) && policy.SecretPattern == "*" && cliStringSliceContains(policy.Actions, "deny") {
+			return false
+		}
+	}
+	for _, policy := range st.State.Policies {
+		if policy.ExpiresAt != nil && !policy.ExpiresAt.After(now) {
+			continue
+		}
+		if policy.Subject == agent && policy.ApprovalMode == "none" && store.MatchPattern(policy.ScopePattern, pathSpec) && policy.SecretPattern == "*" && cliStringSliceContains(policy.Actions, action) {
+			return true
+		}
+	}
+	return false
+}
+
+func cliStringSliceContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func (a App) remoteSelectionHint(st *store.FileStore, pathSpec, agent, action string, allowScopeHint bool) string {
+	if st.State.ControlPlane == nil || st.State.ControlPlane.Origin == "" {
+		return ""
+	}
+	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	if err != nil {
+		return ""
+	}
+	secrets, err := listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken, false)
+	if err != nil {
+		return ""
+	}
+	matches := []visibleRemoteSecretRecord{}
+	exactMatch := false
+	if scope, name, err := store.ParseSecretPath(pathSpec); err == nil {
+		for _, secret := range secrets {
+			if secret.Status == "active" && secret.Scope == scope && secret.Name == name && remoteHintSecretAllowed(st, secret, agent, action) {
+				matches = append(matches, secret)
+			}
+		}
+		exactMatch = len(matches) > 0
+	}
+	if len(matches) == 0 && allowScopeHint {
+		for _, secret := range secrets {
+			if secret.Status == "active" && secret.Scope == pathSpec && remoteHintSecretAllowed(st, secret, agent, action) {
+				matches = append(matches, secret)
+			}
+		}
+	}
+	if len(matches) == 0 {
+		return ""
+	}
+	workspace := matches[0].WorkspaceSlug
+	if workspace == "" {
+		workspace = store.WorkspacePrefix(matches[0].Scope)
+	}
+	if exactMatch && len(matches) == 1 {
+		secret := matches[0]
+		if secret.WrappedToCurrentDevice != nil && *secret.WrappedToCurrentDevice {
+			return fmt.Sprintf("secret %s exists remotely in workspace %s and is wrapped to this device, but it is not in the local vault; run `asiri pull --workspace %s` and retry", store.SecretKey(secret.Scope, secret.Name), workspace, workspace)
+		}
+		return fmt.Sprintf("secret %s exists remotely in workspace %s, but it is not locally usable on this device; run `asiri rewrap --workspace %s` from a device that can use it, then run `asiri pull --workspace %s` here", store.SecretKey(secret.Scope, secret.Name), workspace, workspace, workspace)
+	}
+	if allVisibleMatchesWrappedToCurrentDevice(matches) {
+		return fmt.Sprintf("%d direct child secret(s) exist remotely under %s in workspace %s and are wrapped to this device, but are not in the local vault; run `asiri pull --workspace %s` and retry", len(matches), pathSpec, workspace, workspace)
+	}
+	return fmt.Sprintf("%d direct child secret(s) exist remotely under %s in workspace %s, but are not locally usable on this device; run `asiri rewrap --workspace %s` from a device that can use them, then run `asiri pull --workspace %s` here", len(matches), pathSpec, workspace, workspace, workspace)
+}
+
+func remoteHintSecretAllowed(st *store.FileStore, secret visibleRemoteSecretRecord, agent, action string) bool {
+	allowed, _ := st.CheckPolicy(agent, store.SecretKey(secret.Scope, secret.Name), action)
+	return allowed
+}
+
+func allVisibleMatchesWrappedToCurrentDevice(secrets []visibleRemoteSecretRecord) bool {
+	for _, secret := range secrets {
+		if secret.WrappedToCurrentDevice == nil || !*secret.WrappedToCurrentDevice {
+			return false
+		}
+	}
+	return true
 }
 
 func (a App) resolveOneSecret(st *store.FileStore, agent, runtimeType, action, auditAction, fullPath string) (resolvedSecret, error) {

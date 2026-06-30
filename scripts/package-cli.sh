@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="${ASIRI_VERSION:-$(node -p "require('./package.json').version")}"
+VERSION="${ASIRI_VERSION:-$(tr -d '[:space:]' < VERSION)}"
 OUT_DIR="${ASIRI_CLI_DIST:-dist/cli}"
 TARGETS="${ASIRI_CLI_TARGETS:-linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64}"
 PACKAGE="./cli/cmd/asiri"
