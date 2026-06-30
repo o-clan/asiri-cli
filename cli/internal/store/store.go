@@ -31,6 +31,11 @@ var workspaceSlugPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,62}$`)
 var scopePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9/_-]{1,96}$`)
 var namePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{1,96}$`)
 
+const (
+	KeyStorePlatform = "platform"
+	KeyStoreFile     = "file"
+)
+
 type FileStore struct {
 	Path  string
 	State asiri.State
@@ -184,6 +189,7 @@ func Load(path string) (*FileStore, error) {
 	if store.State.RemoteBindings == nil {
 		store.State.RemoteBindings = map[string]asiri.RemoteWorkspaceBinding{}
 	}
+	store.configureKeyStore()
 	return store, nil
 }
 
@@ -247,7 +253,10 @@ func (s *FileStore) InitializeLocal() error {
 	s.State.Version = 1
 	s.State.VaultID = NewID("vault")
 	s.State.UserID = "local-human"
-	s.State.KeyStore = "platform"
+	s.State.KeyStore = KeyStorePlatform
+	if keystore.FileKeyStoreDir() != "" {
+		s.State.KeyStore = KeyStoreFile
+	}
 	if s.State.Secrets == nil {
 		s.State.Secrets = map[string]asiri.Secret{}
 	}
@@ -259,10 +268,29 @@ func (s *FileStore) InitializeLocal() error {
 }
 
 func (s *FileStore) RequireInitialized() error {
-	if s.State.VaultID == "" || s.State.UserID == "" || s.State.KeyStore != "platform" {
+	if s.State.VaultID == "" || s.State.UserID == "" || !validKeyStore(s.State.KeyStore) {
 		return errors.New("asiri is not initialized; run `asiri init` first")
 	}
 	return nil
+}
+
+func (s *FileStore) UseDefaultFileKeyStore() {
+	keystore.ConfigureFileKeyStoreDir(DefaultFileKeyStoreDir(s.Path))
+	s.State.KeyStore = KeyStoreFile
+}
+
+func DefaultFileKeyStoreDir(statePath string) string {
+	return filepath.Join(filepath.Dir(statePath), "key-store")
+}
+
+func (s *FileStore) configureKeyStore() {
+	if s.State.KeyStore == KeyStoreFile {
+		keystore.ConfigureFileKeyStoreDir(DefaultFileKeyStoreDir(s.Path))
+	}
+}
+
+func validKeyStore(keyStore string) bool {
+	return keyStore == KeyStorePlatform || keyStore == KeyStoreFile
 }
 
 func (s *FileStore) ActiveDevice() (*asiri.Device, error) {

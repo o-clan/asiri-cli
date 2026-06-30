@@ -285,9 +285,9 @@ func (a App) helpFor(path []string) int {
 	case "secret delete":
 		fmt.Fprint(a.Out, "Usage: asiri secret delete --workspace <slug> <scope/name> [--yes]\n       asiri secret delete --workspace <slug> --remote-only-unwrapped [--yes]\n\nMarks active remote secret versions as deleted in the control plane. Use short paths without the workspace prefix. --remote-only-unwrapped deletes only active visible remote secrets that are remote-only locally and not wrapped to this device. Without --yes, type the requested confirmation text.\n")
 	case "local":
-		fmt.Fprint(a.Out, "Usage: asiri local <command>\n\nCommands:\n  wipe  Delete local state and platform-stored Asiri keys.\n")
+		fmt.Fprint(a.Out, "Usage: asiri local <command>\n\nCommands:\n  wipe  Delete local state and Asiri key material.\n")
 	case "local wipe":
-		fmt.Fprint(a.Out, "Usage: asiri local wipe [--yes]\n\nDeletes local state and platform-stored Asiri keys for this machine. This never calls remote APIs. Without --yes, type `wipe local` to confirm.\n")
+		fmt.Fprint(a.Out, "Usage: asiri local wipe [--yes]\n\nDeletes local state and Asiri key material for this machine. This never calls remote APIs. Without --yes, type `wipe local` to confirm.\n")
 	case "add":
 		fmt.Fprint(a.Out, "Usage: asiri add --workspace <slug> <scope/name> --stdin|--value-file <path>\n\nAdds a local encrypted secret. Use short paths without the workspace prefix. Values are accepted only through stdin or a file to avoid shell history exposure.\n")
 	case "get":
@@ -321,9 +321,9 @@ func (a App) helpFor(path []string) int {
 	case "audit tail":
 		fmt.Fprint(a.Out, "Usage: asiri audit tail [--limit N] [--workspace <slug>...]\n\nShows the most recent local audit events, newest first.\n")
 	case "cache":
-		fmt.Fprint(a.Out, "Usage: asiri cache wipe\n\nAlias for local wipe. Deletes local state and platform-stored Asiri keys for this machine.\n")
+		fmt.Fprint(a.Out, "Usage: asiri cache wipe\n\nAlias for local wipe. Deletes local state and Asiri key material for this machine.\n")
 	case "cache wipe":
-		fmt.Fprint(a.Out, "Usage: asiri cache wipe\n\nAlias for local wipe. Deletes local state and platform-stored Asiri keys for this machine.\n")
+		fmt.Fprint(a.Out, "Usage: asiri cache wipe\n\nAlias for local wipe. Deletes local state and Asiri key material for this machine.\n")
 	default:
 		return a.fail(fmt.Errorf("unknown help topic %q", topic))
 	}
@@ -347,6 +347,12 @@ func (a App) initLocal(st *store.FileStore, args []string) int {
 		return a.fail(err)
 	}
 	device, refs, err := createDevice(deviceName)
+	usedFileKeyStore := false
+	if errors.Is(err, keystore.ErrPlatformUnavailable) && keystore.FileKeyStoreDir() == "" {
+		st.UseDefaultFileKeyStore()
+		device, refs, err = createDevice(deviceName)
+		usedFileKeyStore = err == nil
+	}
 	if err != nil {
 		_ = st.DeletePlatformKeys()
 		_ = os.Remove(st.Path)
@@ -364,6 +370,9 @@ func (a App) initLocal(st *store.FileStore, args []string) int {
 		return a.fail(err)
 	}
 	fmt.Fprintf(a.Out, "✓ Initialized local Asiri vault with trusted device %s\n", deviceName)
+	if usedFileKeyStore {
+		fmt.Fprintf(a.Out, "  Platform keyring unavailable; using local file key store at %s\n", keystore.FileKeyStoreDir())
+	}
 	return 0
 }
 

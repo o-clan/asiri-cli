@@ -30,6 +30,8 @@ Start with a local encrypted vault:
 asiri init --device local-laptop
 ```
 
+On machines with a native keyring, Asiri stores local key material there. On headless Linux boxes or other systems without one, `asiri init` falls back to a local file key store under the Asiri state directory. Keep that directory protected like any other local secret store.
+
 Add a secret without putting the value in shell history:
 
 ```bash

@@ -5,15 +5,24 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/zalando/go-keyring"
 )
 
 const Service = "asiri"
+
+var ErrPlatformUnavailable = errors.New("platform key storage unavailable")
+
+var configuredFileKeyStore struct {
+	sync.RWMutex
+	dir string
+}
 
 func DataKeyAccount(workspaceID, keyID string) string {
 	return fmt.Sprintf("workspace:%s:data:%s", workspaceID, keyID)
@@ -50,7 +59,7 @@ func Store(account, value string) error {
 		return nil
 	}
 	if err := keyring.Set(Service, account, value); err != nil {
-		return fmt.Errorf("platform key storage unavailable: %w", err)
+		return fmt.Errorf("%w: %v", ErrPlatformUnavailable, err)
 	}
 	return nil
 }
@@ -83,8 +92,24 @@ func Delete(account string) error {
 	return nil
 }
 
+func ConfigureFileKeyStoreDir(dir string) {
+	configuredFileKeyStore.Lock()
+	defer configuredFileKeyStore.Unlock()
+	configuredFileKeyStore.dir = dir
+}
+
+func ClearConfiguredFileKeyStoreDir() {
+	ConfigureFileKeyStoreDir("")
+}
+
+func FileKeyStoreDir() string {
+	return fileKeyStoreDir()
+}
+
 func fileKeyStoreDir() string {
-	return os.Getenv("ASIRI_FILE_KEYSTORE_DIR")
+	configuredFileKeyStore.RLock()
+	defer configuredFileKeyStore.RUnlock()
+	return configuredFileKeyStore.dir
 }
 
 func fileKeyStorePath(dir, account string) string {

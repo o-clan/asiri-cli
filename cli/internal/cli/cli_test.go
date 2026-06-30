@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/o-clan/asiri/cli/internal/asiri"
+	"github.com/o-clan/asiri/cli/internal/keystore"
 	"github.com/o-clan/asiri/cli/internal/store"
 	"github.com/zalando/go-keyring"
 )
@@ -37,6 +38,64 @@ func testSecretFile(t *testing.T, value string) string {
 func TestDefaultControlPlaneOriginMatchesLocalDev(t *testing.T) {
 	if defaultControlPlaneOrigin != "http://127.0.0.1:4173" {
 		t.Fatalf("source default control-plane origin must match local dev, got %s", defaultControlPlaneOrigin)
+	}
+}
+
+func TestInitFallsBackToLocalFileKeyStoreWhenPlatformKeyringUnavailable(t *testing.T) {
+	tmp := t.TempDir()
+	oldHome := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() {
+		_ = os.Setenv("ASIRI_HOME", oldHome)
+		keystore.ClearConfiguredFileKeyStoreDir()
+		keyring.MockInit()
+	})
+	_ = os.Setenv("ASIRI_HOME", tmp)
+	keystore.ClearConfiguredFileKeyStoreDir()
+	keyring.MockInitWithError(errors.New("no platform keyring"))
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "headless-box"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	if !strings.Contains(out.String(), "using local file key store") {
+		t.Fatalf("init did not explain file keystore fallback: %s", out.String())
+	}
+	statePath := filepath.Join(tmp, "local-state.json")
+	st, err := store.Load(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State.KeyStore != store.KeyStoreFile {
+		t.Fatalf("expected file keystore state, got %q", st.State.KeyStore)
+	}
+	keyStoreDir := store.DefaultFileKeyStoreDir(statePath)
+	entries, err := os.ReadDir(keyStoreDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected device private keys in file keystore, got %d entries", len(entries))
+	}
+
+	keystore.ClearConfiguredFileKeyStoreDir()
+	out.Reset()
+	errb.Reset()
+	app = New(&out, &errb)
+	app.In = strings.NewReader("secret_value\n")
+	if code := app.Run([]string{"add", "--workspace", "personal", "dev/API_KEY", "--stdin"}); code != 0 {
+		t.Fatalf("add failed after reloading file keystore state: %s", errb.String())
+	}
+
+	keystore.ClearConfiguredFileKeyStoreDir()
+	out.Reset()
+	errb.Reset()
+	app = New(&out, &errb)
+	if code := app.Run([]string{"get", "--workspace", "personal", "dev/API_KEY"}); code != 0 {
+		t.Fatalf("get failed after reloading file keystore state: %s", errb.String())
+	}
+	if strings.TrimSpace(out.String()) != "secret_value" {
+		t.Fatalf("unexpected secret value: %q", out.String())
 	}
 }
 
