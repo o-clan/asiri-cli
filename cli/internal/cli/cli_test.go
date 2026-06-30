@@ -1340,7 +1340,7 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
 		t.Fatal(err)
 	}
-	secretPushSeen := false
+	secretPushCount := 0
 	syncSeen := false
 	rewrapSeen := false
 	devicePublicKey := ""
@@ -1399,7 +1399,7 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 			})
 		case "/v1/secrets":
 			if r.Method == http.MethodPost {
-				secretPushSeen = true
+				secretPushCount++
 				if r.Header.Get("authorization") != "Bearer at_push" {
 					t.Fatalf("unexpected push auth header: %s", r.Header.Get("authorization"))
 				}
@@ -1429,10 +1429,18 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 				http.NotFound(w, r)
 				return
 			}
+			if pushedSecret == nil {
+				_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{}})
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{pushedSecret}})
 		case "/v1/secrets/encrypted":
 			if r.Method != http.MethodGet {
 				http.NotFound(w, r)
+				return
+			}
+			if pushedSecret == nil {
+				_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{}})
 				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{pushedSecret}})
@@ -1487,6 +1495,7 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
 		{"login", "--origin", server.URL},
 		{"push", "--workspace", "oclan-co"},
+		{"push", "--workspace", "oclan-co"},
 		{"pull"},
 		{"rewrap", "--workspace", "oclan-co"},
 	} {
@@ -1496,11 +1505,466 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
 		}
 	}
-	if !secretPushSeen || !syncSeen || !rewrapSeen {
+	if secretPushCount != 1 || !syncSeen || !rewrapSeen {
 		t.Fatalf("expected push, pull, and rewrap endpoints to be called")
 	}
 	if strings.Contains(out.String(), "secret_value") || strings.Contains(errb.String(), "secret_value") {
 		t.Fatalf("push/pull leaked secret stdout=%q stderr=%q", out.String(), errb.String())
+	}
+}
+
+func TestPushDryRunFirstWorkspaceEvaluatesRemoteState(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		conflict bool
+		wantCode int
+		wantOut  []string
+		wantErr  string
+	}{
+		{
+			name:     "conflict",
+			conflict: true,
+			wantCode: 1,
+			wantOut:  []string{"Would push 0 encrypted secret version(s)", "Conflicts", "oclan-co/local/asiri/API_KEY v1"},
+			wantErr:  "remote secret version conflict",
+		},
+		{
+			name:     "no-op",
+			wantCode: 0,
+			wantOut:  []string{"Would push 0 encrypted secret version(s)", "1 would be skipped"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			old := os.Getenv("ASIRI_HOME")
+			t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+			if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+				t.Fatal(err)
+			}
+			var remoteVersion *asiri.SecretVersion
+			writeOptionsSeen := false
+			encryptedSeen := false
+			postSeen := false
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("content-type", "application/json")
+				switch r.URL.Path {
+				case "/v1/auth/device-code/start":
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"deviceCode":              "dc_dry_run",
+						"userCode":                "DRY-1234",
+						"verificationUriComplete": serverURL(r) + "/auth/device?code=DRY-1234",
+						"expiresIn":               30,
+						"interval":                0,
+					})
+				case "/v1/auth/device-code/token":
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"status":           "approved",
+						"orgId":            "org_dry_run",
+						"workspaceSlug":    "oclan-co",
+						"userId":           "usr_owner",
+						"deviceId":         "dev_dry_run",
+						"accessToken":      "at_dry_run",
+						"refreshToken":     "rt_dry_run",
+						"expiresIn":        3600,
+						"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+					})
+				case "/v1/orgs":
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"activeOrgId": "org_dry_run",
+						"organizations": []map[string]any{
+							{"id": "org_dry_run", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true},
+						},
+					})
+				case "/v1/sync/write-options":
+					writeOptionsSeen = true
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"requestedWorkspaceSlug": "oclan-co",
+						"activeWorkspace": map[string]any{
+							"id":       "org_dry_run",
+							"slug":     "oclan-co",
+							"canWrite": true,
+							"paths": []map[string]any{{
+								"fullPath": "oclan-co/local/asiri/API_KEY",
+								"canWrite": true,
+							}},
+						},
+					})
+				case "/v1/recovery-recipient":
+					http.NotFound(w, r)
+				case "/v1/secrets/encrypted":
+					encryptedSeen = true
+					if r.URL.Query().Get("orgId") != "org_dry_run" {
+						t.Fatalf("unexpected secrets query: %s", r.URL.RawQuery)
+					}
+					if remoteVersion == nil {
+						t.Fatal("remote version was not prepared before dry-run push")
+					}
+					ciphertext := remoteVersion.Ciphertext
+					if tc.conflict {
+						ciphertext = "conflicting-ciphertext"
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"secrets": []map[string]any{{
+							"id":         "sec_dry_run",
+							"orgId":      "org_dry_run",
+							"scope":      "oclan-co/local/asiri",
+							"name":       "API_KEY",
+							"version":    remoteVersion.Version,
+							"algorithm":  remoteVersion.Algorithm,
+							"nonce":      remoteVersion.Nonce,
+							"ciphertext": ciphertext,
+							"aad":        remoteVersion.AAD,
+							"status":     "active",
+							"wrappedKeys": []map[string]any{{
+								"recipientType": "device",
+								"recipientId":   "dev_dry_run",
+								"wrapAlgorithm": "p256-hkdf-aes256gcm",
+								"wrappedKey":    "remote-wrapped",
+							}},
+						}},
+					})
+				case "/v1/secrets":
+					if r.Method == http.MethodPost {
+						postSeen = true
+					}
+					http.NotFound(w, r)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			var out bytes.Buffer
+			var errb bytes.Buffer
+			app := New(&out, &errb)
+			for _, step := range [][]string{
+				{"init", "--device", "qa-laptop"},
+				{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
+				{"login", "--origin", server.URL},
+			} {
+				out.Reset()
+				errb.Reset()
+				if code := app.Run(step); code != 0 {
+					t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+				}
+			}
+			st, err := store.LoadDefault()
+			if err != nil {
+				t.Fatal(err)
+			}
+			secret := st.State.Secrets[store.SecretKey("oclan-co/local/asiri", "API_KEY")]
+			if len(secret.Versions) != 1 {
+				t.Fatalf("expected one local secret version, got %#v", secret.Versions)
+			}
+			remoteVersion = &secret.Versions[0]
+			out.Reset()
+			errb.Reset()
+			code := app.Run([]string{"push", "--workspace", "oclan-co", "--dry-run"})
+			if code != tc.wantCode {
+				t.Fatalf("dry-run push got code %d want %d stdout=%s stderr=%s", code, tc.wantCode, out.String(), errb.String())
+			}
+			for _, want := range tc.wantOut {
+				if !strings.Contains(out.String(), want) {
+					t.Fatalf("dry-run output missing %q: %s", want, out.String())
+				}
+			}
+			if tc.wantErr != "" && !strings.Contains(errb.String(), tc.wantErr) {
+				t.Fatalf("dry-run error missing %q: %s", tc.wantErr, errb.String())
+			}
+			if !writeOptionsSeen || !encryptedSeen || postSeen {
+				t.Fatalf("dry-run should evaluate write options and remote state without posting, write=%v encrypted=%v post=%v", writeOptionsSeen, encryptedSeen, postSeen)
+			}
+			reloaded, err := store.LoadDefault()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := reloaded.RemoteBindingForPrefix("oclan-co"); ok {
+				t.Fatal("dry-run should not persist a workspace prefix binding")
+			}
+		})
+	}
+}
+
+func TestPushDryRunRemoteWorkspaceDoesNotPersistSessionSwitch(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	switchSeen := false
+	encryptedSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_dry_switch",
+				"userCode":                "DRYS-1234",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=DRYS-1234",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      "at_oclan",
+				"refreshToken":     "rt_oclan",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/orgs":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"activeOrgId": "org_oclan",
+				"organizations": []map[string]any{
+					{"id": "org_oclan", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true},
+					{"id": "org_asiri", "name": "Asiri Dev", "slug": "asiri-dev", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true},
+				},
+			})
+		case "/v1/auth/session/switch":
+			switchSeen = true
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["workspace"] != "org_asiri" {
+				t.Fatalf("unexpected switch body: %#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_asiri",
+				"workspaceSlug":    "asiri-dev",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_asiri",
+				"accessToken":      "at_asiri",
+				"refreshToken":     "rt_asiri",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/sync/write-options":
+			if r.Header.Get("authorization") != "Bearer at_asiri" {
+				t.Fatalf("dry-run should use transient switched token, got %s", r.Header.Get("authorization"))
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"requestedWorkspaceSlug": "asiri-dev",
+				"activeWorkspace": map[string]any{
+					"id":       "org_asiri",
+					"slug":     "asiri-dev",
+					"canWrite": true,
+					"paths": []map[string]any{{
+						"fullPath": "asiri-dev/local/asiri/API_KEY",
+						"canWrite": true,
+					}},
+				},
+			})
+		case "/v1/recovery-recipient":
+			if r.URL.Query().Get("orgId") != "org_asiri" {
+				t.Fatalf("unexpected recovery query: %s", r.URL.RawQuery)
+			}
+			http.NotFound(w, r)
+		case "/v1/secrets/encrypted":
+			encryptedSeen = true
+			if r.Header.Get("authorization") != "Bearer at_asiri" || r.URL.Query().Get("orgId") != "org_asiri" {
+				t.Fatalf("unexpected encrypted secrets request auth=%s query=%s", r.Header.Get("authorization"), r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{}})
+		case "/v1/secrets":
+			if r.Method == http.MethodPost {
+				t.Fatal("dry-run should not post secrets")
+			}
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "asiri-dev", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"push", "--workspace", "asiri-dev", "--dry-run"}); code != 0 {
+		t.Fatalf("remote workspace dry-run failed: %s", errb.String())
+	}
+	if !switchSeen || !encryptedSeen {
+		t.Fatalf("dry-run should switch transiently and evaluate remote state, switch=%v encrypted=%v", switchSeen, encryptedSeen)
+	}
+	reloaded, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.State.ControlPlane == nil || reloaded.State.ControlPlane.WorkspaceID != "org_oclan" || reloaded.State.ControlPlane.WorkspaceSlug != "oclan-co" {
+		t.Fatalf("dry-run persisted workspace session switch: %#v", reloaded.State.ControlPlane)
+	}
+	if _, ok := reloaded.RemoteBindingForPrefix("asiri-dev"); ok {
+		t.Fatal("dry-run should not persist remote workspace binding")
+	}
+}
+
+func TestParsePushArgsAcceptsLegacyYes(t *testing.T) {
+	options, err := parsePushArgs([]string{"--workspace", "oclan-co", "--yes", "--dry-run", "--secret", "prod/github/SYNC_KEY"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.Workspace != "oclan-co" || !options.DryRun || len(options.Secrets) != 1 || options.Secrets[0] != "prod/github/SYNC_KEY" {
+		t.Fatalf("unexpected parsed push options: %#v", options)
+	}
+}
+
+func TestPushTargetSelectionSupportsScopesSecretsAndVersions(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
+		{"add", "--workspace", "oclan-co", "prod/github/SYNC_KEY", "--value-file", testSecretFile(t, "sync_value")},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs := st.ActiveSecretRefs()
+	target := remoteWorkspaceResponse{Slug: "oclan-co"}
+	secretRefs, err := selectPushRefs(st, refs, target, pushOptions{Secrets: []string{"prod/github/SYNC_KEY"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(secretRefs) != 1 || secretRefs[0].Scope != "oclan-co/prod/github" || secretRefs[0].Name != "SYNC_KEY" {
+		t.Fatalf("unexpected secret refs: %#v", secretRefs)
+	}
+	scopeRefs, err := selectPushRefs(st, refs, target, pushOptions{Scopes: []string{"local/asiri"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scopeRefs) != 1 || scopeRefs[0].Scope != "oclan-co/local/asiri" || scopeRefs[0].Name != "API_KEY" {
+		t.Fatalf("unexpected scope refs: %#v", scopeRefs)
+	}
+	versionRefs, err := selectPushRefs(st, refs, target, pushOptions{Secrets: []string{"prod/github/SYNC_KEY"}, Version: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(versionRefs) != 1 || versionRefs[0].Version != 1 {
+		t.Fatalf("unexpected version refs: %#v", versionRefs)
+	}
+}
+
+func TestPushReconcileRejectsIncompleteRemoteEnvelope(t *testing.T) {
+	result, err := reconcilePushVersions([]store.RemoteSecretVersion{{
+		OrgID:      "org_remote",
+		Scope:      "oclan-co/prod/github",
+		Name:       "SYNC_KEY",
+		Version:    1,
+		Algorithm:  "aes-256-gcm",
+		Nonce:      "nonce",
+		Ciphertext: "ciphertext",
+		AAD:        "aad",
+	}}, []remoteSecretRecord{{
+		OrgID:   "org_remote",
+		Scope:   "oclan-co/prod/github",
+		Name:    "SYNC_KEY",
+		Version: 1,
+		Status:  "active",
+	}})
+	if err == nil {
+		t.Fatal("incomplete encrypted remote envelope should conflict")
+	}
+	if len(result.Upload) != 0 || result.SkippedExisting != 0 {
+		t.Fatalf("incomplete remote envelope should not upload or skip: %#v", result)
+	}
+}
+
+func TestPushReconcileRejectsWrappedRecipientMismatch(t *testing.T) {
+	localWrapped := store.RemoteWrappedKey{RecipientType: "device", RecipientID: "dev_remote", WrapAlgorithm: "p256-hkdf-aes256gcm", WrappedKey: "wrapped-local"}
+	remoteWrapped := store.RemoteWrappedKey{RecipientType: "device", RecipientID: "dev_other", WrapAlgorithm: "p256-hkdf-aes256gcm", WrappedKey: "wrapped-remote"}
+	result, err := reconcilePushVersions([]store.RemoteSecretVersion{{
+		OrgID:       "org_remote",
+		Scope:       "oclan-co/prod/github",
+		Name:        "SYNC_KEY",
+		Version:     1,
+		Algorithm:   "aes-256-gcm",
+		Nonce:       "nonce",
+		Ciphertext:  "ciphertext",
+		AAD:         "aad",
+		WrappedKeys: []store.RemoteWrappedKey{localWrapped},
+	}}, []remoteSecretRecord{{
+		OrgID:       "org_remote",
+		Scope:       "oclan-co/prod/github",
+		Name:        "SYNC_KEY",
+		Version:     1,
+		Algorithm:   "aes-256-gcm",
+		Nonce:       "nonce",
+		Ciphertext:  "ciphertext",
+		AAD:         "aad",
+		Status:      "active",
+		WrappedKeys: []store.RemoteWrappedKey{remoteWrapped},
+	}})
+	if err == nil {
+		t.Fatal("same envelope with different wrapped recipients should conflict")
+	}
+	if len(result.Upload) != 0 || result.SkippedExisting != 0 {
+		t.Fatalf("wrapped recipient mismatch should not upload or skip: %#v", result)
+	}
+}
+
+func TestPushReconcileSkipsRemoteWrappedRecipientSuperset(t *testing.T) {
+	localWrapped := store.RemoteWrappedKey{RecipientType: "device", RecipientID: "dev_remote", WrapAlgorithm: "p256-hkdf-aes256gcm", WrappedKey: "wrapped-local"}
+	extraWrapped := store.RemoteWrappedKey{RecipientType: "device", RecipientID: "dev_other", WrapAlgorithm: "p256-hkdf-aes256gcm", WrappedKey: "wrapped-extra"}
+	result, err := reconcilePushVersions([]store.RemoteSecretVersion{{
+		OrgID:       "org_remote",
+		Scope:       "oclan-co/prod/github",
+		Name:        "SYNC_KEY",
+		Version:     1,
+		Algorithm:   "aes-256-gcm",
+		Nonce:       "nonce",
+		Ciphertext:  "ciphertext",
+		AAD:         "aad",
+		WrappedKeys: []store.RemoteWrappedKey{localWrapped},
+	}}, []remoteSecretRecord{{
+		OrgID:       "org_remote",
+		Scope:       "oclan-co/prod/github",
+		Name:        "SYNC_KEY",
+		Version:     1,
+		Algorithm:   "aes-256-gcm",
+		Nonce:       "nonce",
+		Ciphertext:  "ciphertext",
+		AAD:         "aad",
+		Status:      "active",
+		WrappedKeys: []store.RemoteWrappedKey{localWrapped, extraWrapped},
+	}})
+	if err != nil {
+		t.Fatalf("remote wrapped recipient superset should skip: %v", err)
+	}
+	if len(result.Upload) != 0 || result.SkippedExisting != 1 {
+		t.Fatalf("remote wrapped recipient superset should skip existing: %#v", result)
 	}
 }
 
@@ -1786,6 +2250,10 @@ func TestRecoverySetupShowsKeyOnceAndWrapsRemoteSecrets(t *testing.T) {
 			if r.URL.Query().Get("orgId") != "org_recovery" {
 				t.Fatalf("unexpected secrets query: %s", r.URL.RawQuery)
 			}
+			if !secretPushSeen {
+				_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{}})
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"secrets": []map[string]any{{
 					"id":      "secv_recovery",
@@ -1809,6 +2277,10 @@ func TestRecoverySetupShowsKeyOnceAndWrapsRemoteSecrets(t *testing.T) {
 			}
 			if r.URL.Query().Get("orgId") != "org_recovery" {
 				t.Fatalf("unexpected secrets query: %s", r.URL.RawQuery)
+			}
+			if !secretPushSeen {
+				_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{}})
+				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"secrets": []map[string]any{{
@@ -2149,6 +2621,153 @@ func TestRecoveryStatusPreservesSameRecipientLocalWrappingCounters(t *testing.T)
 	}
 }
 
+func TestTargetedPushPreservesRecoveryWrappedCount(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	var activeRecovery *asiri.RecoveryConfig
+	pushSeen := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_targeted_push",
+				"userCode":                "TPUS-1234",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=TPUS-1234",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_targeted_push",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_targeted_push",
+				"accessToken":      "at_targeted_push",
+				"refreshToken":     "rt_targeted_push",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/orgs":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"activeOrgId": "org_targeted_push",
+				"organizations": []map[string]any{
+					{"id": "org_targeted_push", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true},
+				},
+			})
+		case "/v1/sync/write-options":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"requestedWorkspaceSlug": "oclan-co",
+				"activeWorkspace": map[string]any{
+					"id":       "org_targeted_push",
+					"slug":     "oclan-co",
+					"canWrite": true,
+					"paths": []map[string]any{{
+						"fullPath": "oclan-co/local/asiri/API_KEY",
+						"canWrite": true,
+					}},
+				},
+			})
+		case "/v1/recovery-recipient":
+			if activeRecovery == nil {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"recipientId":          activeRecovery.RecipientID,
+				"publicKey":            activeRecovery.PublicKey,
+				"publicKeyFingerprint": activeRecovery.PublicKeyFingerprint,
+				"status":               "active",
+			})
+		case "/v1/secrets/encrypted":
+			if activeRecovery == nil || r.URL.Query().Get("recoveryRecipientId") != activeRecovery.RecipientID {
+				t.Fatalf("targeted push should request recovery-wrapped remote state, got query %s", r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{}})
+		case "/v1/secrets":
+			if r.Method != http.MethodPost {
+				http.NotFound(w, r)
+				return
+			}
+			pushSeen++
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "secv_targeted_push", "status": "active"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
+		{"add", "--workspace", "oclan-co", "prod/asiri/OTHER_KEY", "--value-file", testSecretFile(t, "other_value")},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SetupRecovery(false); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkRecoveryWrapped("oclan-co", 3); err != nil {
+		t.Fatal(err)
+	}
+	activeRecovery = st.ActiveRecovery()
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"push", "--workspace", "oclan-co", "--secret", "local/asiri/API_KEY"}); code != 0 {
+		t.Fatalf("targeted push failed: %s", errb.String())
+	}
+	if pushSeen == 0 {
+		t.Fatal("expected targeted push to upload selected secret")
+	}
+	reloaded, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count := reloaded.RecoveryWrappedCountForPrefix("oclan-co"); count != 3 {
+		t.Fatalf("targeted push should preserve existing recovery wrapped count, got %d", count)
+	}
+	resetRecovery := reloaded.State.Recoveries["org_targeted_push"]
+	resetRecovery.WrappedSecretCount = 0
+	resetRecovery.LastWrappedAt = time.Time{}
+	reloaded.State.Recoveries["org_targeted_push"] = resetRecovery
+	if err := reloaded.Save(); err != nil {
+		t.Fatal(err)
+	}
+	activeRecovery = &resetRecovery
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"push", "--workspace", "oclan-co", "--secret", "prod/asiri/OTHER_KEY"}); code != 0 {
+		t.Fatalf("first targeted push failed: %s", errb.String())
+	}
+	reloaded, err = store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count := reloaded.RecoveryWrappedCountForPrefix("oclan-co"); count != 1 {
+		t.Fatalf("first targeted push should record selected recovery wrapped count, got %d", count)
+	}
+}
+
 func TestRecoverySetupSkipsWrappingWhenRemoteRegistrationFails(t *testing.T) {
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")
@@ -2157,6 +2776,7 @@ func TestRecoverySetupSkipsWrappingWhenRemoteRegistrationFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	recoveryCreateSeen := false
+	var pushedSecret map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "application/json")
 		switch r.URL.Path {
@@ -2195,27 +2815,21 @@ func TestRecoverySetupSkipsWrappingWhenRemoteRegistrationFails(t *testing.T) {
 			})
 		case "/v1/secrets":
 			if r.Method == http.MethodPost {
+				if err := json.NewDecoder(r.Body).Decode(&pushedSecret); err != nil {
+					t.Fatal(err)
+				}
+				pushedSecret["id"] = "secv_recovery"
+				pushedSecret["status"] = "active"
 				_ = json.NewEncoder(w).Encode(map[string]any{"id": "secv_recovery", "status": "active"})
 				return
 			}
 			http.NotFound(w, r)
 		case "/v1/secrets/encrypted":
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"secrets": []map[string]any{{
-					"id":      "secv_recovery",
-					"orgId":   "org_recovery",
-					"scope":   "oclan-co/local/asiri",
-					"name":    "API_KEY",
-					"version": 1,
-					"status":  "active",
-					"wrappedKeys": []map[string]any{{
-						"recipientType": "device",
-						"recipientId":   "dev_recovery",
-						"wrapAlgorithm": "p256-hkdf-aes256gcm",
-						"wrappedKey":    "wrapped",
-					}},
-				}},
-			})
+			if pushedSecret == nil {
+				_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{}})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{pushedSecret}})
 		case "/v1/recovery-recipient":
 			if r.Method == http.MethodGet {
 				http.NotFound(w, r)
@@ -2283,6 +2897,7 @@ func TestRecoverySetupFailsWhenRemoteReplacementFails(t *testing.T) {
 	}
 	recoveryReplaceSeen := false
 	remoteRecoveryActive := false
+	var pushedSecret map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "application/json")
 		switch r.URL.Path {
@@ -2321,27 +2936,21 @@ func TestRecoverySetupFailsWhenRemoteReplacementFails(t *testing.T) {
 			})
 		case "/v1/secrets":
 			if r.Method == http.MethodPost {
+				if err := json.NewDecoder(r.Body).Decode(&pushedSecret); err != nil {
+					t.Fatal(err)
+				}
+				pushedSecret["id"] = "secv_recovery"
+				pushedSecret["status"] = "active"
 				_ = json.NewEncoder(w).Encode(map[string]any{"id": "secv_recovery", "status": "active"})
 				return
 			}
 			http.NotFound(w, r)
 		case "/v1/secrets/encrypted":
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"secrets": []map[string]any{{
-					"id":      "secv_recovery",
-					"orgId":   "org_recovery",
-					"scope":   "oclan-co/local/asiri",
-					"name":    "API_KEY",
-					"version": 1,
-					"status":  "active",
-					"wrappedKeys": []map[string]any{{
-						"recipientType": "device",
-						"recipientId":   "dev_recovery",
-						"wrapAlgorithm": "p256-hkdf-aes256gcm",
-						"wrappedKey":    "wrapped",
-					}},
-				}},
-			})
+			if pushedSecret == nil {
+				_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{}})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{pushedSecret}})
 		case "/v1/recovery-recipient":
 			if r.Method != http.MethodGet || !remoteRecoveryActive {
 				http.NotFound(w, r)
@@ -2415,6 +3024,7 @@ func TestRecoverySetupForceCommitsWhenPreviousRecipientIsRetired(t *testing.T) {
 	replacementCount := 0
 	staleRecoveryListRejected := false
 	unscopedRecoveryListSeen := false
+	var pushedSecret map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "application/json")
 		switch r.URL.Path {
@@ -2453,6 +3063,11 @@ func TestRecoverySetupForceCommitsWhenPreviousRecipientIsRetired(t *testing.T) {
 			})
 		case "/v1/secrets":
 			if r.Method == http.MethodPost {
+				if err := json.NewDecoder(r.Body).Decode(&pushedSecret); err != nil {
+					t.Fatal(err)
+				}
+				pushedSecret["id"] = "secv_recovery"
+				pushedSecret["status"] = "active"
 				_ = json.NewEncoder(w).Encode(map[string]any{"id": "secv_recovery", "status": "active"})
 				return
 			}
@@ -2521,22 +3136,11 @@ func TestRecoverySetupForceCommitsWhenPreviousRecipientIsRetired(t *testing.T) {
 			if len(registeredRecipients) >= 1 && recoveryRecipientID == "" {
 				unscopedRecoveryListSeen = true
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"secrets": []map[string]any{{
-					"id":      "secv_recovery",
-					"orgId":   "org_recovery",
-					"scope":   "oclan-co/local/asiri",
-					"name":    "API_KEY",
-					"version": 1,
-					"status":  "active",
-					"wrappedKeys": []map[string]any{{
-						"recipientType": "device",
-						"recipientId":   "dev_recovery",
-						"wrapAlgorithm": "p256-hkdf-aes256gcm",
-						"wrappedKey":    "wrapped",
-					}},
-				}},
-			})
+			if pushedSecret == nil {
+				_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{}})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{pushedSecret}})
 		default:
 			http.NotFound(w, r)
 		}

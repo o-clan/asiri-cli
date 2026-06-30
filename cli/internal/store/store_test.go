@@ -1092,6 +1092,46 @@ func TestRotateDataKeysReencryptsActiveSecrets(t *testing.T) {
 	}
 }
 
+func TestRemoteSecretVersionsRejectsStaleSelectedVersion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	st, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InitializeLocal(); err != nil {
+		t.Fatal(err)
+	}
+	device := testDevice(t, "push-device")
+	st.State.Devices = append(st.State.Devices, device)
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddSecret("oclan-co/prod/asiri/API_KEY", "rotate-me"); err != nil {
+		t.Fatal(err)
+	}
+	expires := time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339)
+	if err := st.LinkControlPlaneForDevice("http://control.test", "org_oclan", "oclan-co", "usr_owner", "dev_remote", device.ID, "at", "rt", 3600, expires); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.BindWorkspacePrefix("oclan-co", "org_oclan", "oclan-co"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.RotateDataKeysForPrefix("oclan-co"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = st.RemoteSecretVersionsForRefsWithRecovery("oclan-co", []LocalSecretRef{{
+		Scope:   "oclan-co/prod/asiri",
+		Name:    "API_KEY",
+		Version: 1,
+	}}, nil)
+	if err == nil {
+		t.Fatal("stale selected version should be rejected")
+	}
+	if !strings.Contains(err.Error(), "push only supports active versions") {
+		t.Fatalf("unexpected stale version error: %v", err)
+	}
+}
+
 func testPublicKey(t *testing.T) string {
 	t.Helper()
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

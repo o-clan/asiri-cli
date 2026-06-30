@@ -116,8 +116,9 @@ type preparedRemoteSecretVersion struct {
 }
 
 type LocalSecretRef struct {
-	Scope string
-	Name  string
+	Scope   string
+	Name    string
+	Version int
 }
 
 type RecoverySetup struct {
@@ -773,6 +774,16 @@ func (s *FileStore) RemoteSecretVersionsForPrefix(prefix string) ([]RemoteSecret
 }
 
 func (s *FileStore) RemoteSecretVersionsForPrefixWithRecovery(prefix string, recovery *asiri.RecoveryConfig) ([]RemoteSecretVersion, error) {
+	refs := []LocalSecretRef{}
+	for _, ref := range s.ActiveSecretRefs() {
+		if WorkspacePrefix(ref.Scope) == prefix {
+			refs = append(refs, ref)
+		}
+	}
+	return s.RemoteSecretVersionsForRefsWithRecovery(prefix, refs, recovery)
+}
+
+func (s *FileStore) RemoteSecretVersionsForRefsWithRecovery(prefix string, refs []LocalSecretRef, recovery *asiri.RecoveryConfig) ([]RemoteSecretVersion, error) {
 	if err := s.RequireInitialized(); err != nil {
 		return nil, err
 	}
@@ -786,21 +797,43 @@ func (s *FileStore) RemoteSecretVersionsForPrefixWithRecovery(prefix string, rec
 	if err != nil {
 		return nil, err
 	}
-	keys := make([]string, 0, len(s.State.Secrets))
-	for key := range s.State.Secrets {
+	selected := map[string]LocalSecretRef{}
+	keys := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		if WorkspacePrefix(ref.Scope) != prefix {
+			return nil, fmt.Errorf("secret %s is not under workspace prefix %s", SecretKey(ref.Scope, ref.Name), prefix)
+		}
+		key := SecretKey(ref.Scope, ref.Name)
+		if _, ok := selected[key]; ok {
+			continue
+		}
+		selected[key] = ref
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 	versions := make([]RemoteSecretVersion, 0, len(keys))
 	for _, key := range keys {
 		secret := s.State.Secrets[key]
-		if WorkspacePrefix(secret.Scope) != prefix {
-			continue
+		if secret.Scope == "" {
+			return nil, fmt.Errorf("local secret %s not found", key)
 		}
+		ref := selected[key]
+		targetVersion := ref.Version
+		if targetVersion == 0 {
+			targetVersion = secret.ActiveVersion
+		}
+		found := false
 		for i := range secret.Versions {
 			version := secret.Versions[i]
-			if version.Version != secret.ActiveVersion || version.Status != "active" {
+			if version.Version != targetVersion {
 				continue
+			}
+			found = true
+			if version.Status == "deleted" {
+				return nil, fmt.Errorf("local secret %s version %d is deleted", key, targetVersion)
+			}
+			if version.Status != "active" {
+				return nil, fmt.Errorf("local secret %s version %d is %s; push only supports active versions", key, targetVersion, version.Status)
 			}
 			dataKey, err := s.dataKeyForVersion(version)
 			if err != nil {
@@ -830,6 +863,10 @@ func (s *FileStore) RemoteSecretVersionsForPrefixWithRecovery(prefix string, rec
 				WrappedKeys:       wrappedKeys,
 				CreatedByDeviceID: s.State.ControlPlane.DeviceID,
 			})
+			break
+		}
+		if !found {
+			return nil, fmt.Errorf("local secret %s version %d not found", key, targetVersion)
 		}
 	}
 	return versions, nil
@@ -1371,7 +1408,7 @@ func (s *FileStore) ActiveSecretRefs() []LocalSecretRef {
 		secret := s.State.Secrets[key]
 		for _, version := range secret.Versions {
 			if version.Version == secret.ActiveVersion && version.Status == "active" {
-				refs = append(refs, LocalSecretRef{Scope: secret.Scope, Name: secret.Name})
+				refs = append(refs, LocalSecretRef{Scope: secret.Scope, Name: secret.Name, Version: version.Version})
 				break
 			}
 		}
