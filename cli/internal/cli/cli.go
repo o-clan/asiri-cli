@@ -40,7 +40,7 @@ type App struct {
 	In  io.Reader
 }
 
-var Version = "0.1.17"
+var Version = "0.1.18"
 
 var defaultControlPlaneOrigin = "http://127.0.0.1:4173"
 
@@ -273,7 +273,7 @@ func (a App) helpFor(path []string) int {
 	case "device enroll":
 		fmt.Fprint(a.Out, "Usage: asiri device enroll --name <device>\n\nCreates a new local device keypair and local trusted-device record.\n")
 	case "device list":
-		fmt.Fprint(a.Out, "Usage: asiri device list [--remote] [--workspace <slug>...]\n\nLists local devices, or remote devices in visible workspaces with --remote.\n")
+		fmt.Fprint(a.Out, "Usage: asiri device list [--local|--remote] [--workspace <slug>...]\n\nLists remote devices in visible workspaces when linked to the control plane. Use --local to show only this machine's local device records.\n")
 	case "device status":
 		fmt.Fprint(a.Out, "Usage: asiri device status [--workspace <slug>...]\n\nShows whether this device is trusted in visible workspaces and whether visible remote secrets are wrapped to it.\n")
 	case "device trust":
@@ -2708,15 +2708,17 @@ func (a App) device(st *store.FileStore, args []string) int {
 		if err != nil {
 			return a.fail(err)
 		}
-		if err := rejectUnknownArgs(remaining, "--remote"); err != nil {
+		if err := rejectUnknownArgs(remaining, "--local", "--remote"); err != nil {
 			return a.fail(err)
 		}
-		if hasFlag(remaining, "--remote") {
+		local := hasFlag(remaining, "--local")
+		remote := hasFlag(remaining, "--remote")
+		if local && remote {
+			return a.fail(errors.New("use either --local or --remote, not both"))
+		}
+		if remote || (!local && st.State.ControlPlane != nil) {
 			if st.State.ControlPlane == nil {
 				return a.fail(errors.New("asiri is not linked to a control plane"))
-			}
-			if err := rejectWorkloadControlPlaneMutation(st); err != nil {
-				return a.fail(err)
 			}
 			accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
 			if err != nil {
@@ -2784,7 +2786,7 @@ func (a App) device(st *store.FileStore, args []string) int {
 			return 0
 		}
 		if len(workspaceFilters) > 0 {
-			return a.fail(errors.New("device list --workspace requires --remote"))
+			return a.fail(errors.New("device list --workspace requires a control-plane session or --remote"))
 		}
 		if len(st.State.Devices) == 0 {
 			fmt.Fprintln(a.Out, "No devices enrolled")

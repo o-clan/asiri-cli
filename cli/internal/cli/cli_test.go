@@ -925,6 +925,106 @@ func TestLoginReportsCloudflareChallengeInsteadOfJSONDecodeError(t *testing.T) {
 	}
 }
 
+func TestDeviceListDefaultsToRemoteWhenLinked(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	deviceListSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_devices",
+				"userCode":                "DEVS-1234",
+				"verificationUri":         serverURL(r) + "/auth/device",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=DEVS-1234",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_remote",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_remote_current",
+				"accessToken":      "at_devices",
+				"refreshToken":     "rt_devices",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/orgs":
+			if r.Header.Get("authorization") != "Bearer at_devices" {
+				t.Fatalf("unexpected org list auth header: %s", r.Header.Get("authorization"))
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"activeOrgId": "org_remote",
+				"organizations": []map[string]any{
+					{"id": "org_remote", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_remote_current", "canApproveDevice": true},
+				},
+			})
+		case "/v1/devices":
+			deviceListSeen = true
+			if r.URL.Query().Get("orgId") != "org_remote" {
+				t.Fatalf("unexpected device list query: %s", r.URL.RawQuery)
+			}
+			if r.Header.Get("authorization") != "Bearer at_devices" {
+				t.Fatalf("unexpected device list auth header: %s", r.Header.Get("authorization"))
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"devices": []map[string]any{
+					{"id": "dev_remote_current", "name": "manor-box", "status": "trusted", "kind": "laptop"},
+					{"id": "dev_remote_server", "name": "prod-server", "status": "trusted", "kind": "server"},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "manor-box"},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed: %s", step, errb.String())
+		}
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"device", "list"}); code != 0 {
+		t.Fatalf("device list failed: %s", errb.String())
+	}
+	if !deviceListSeen {
+		t.Fatal("device list should call the remote device endpoint when linked")
+	}
+	for _, expected := range []string{"WORKSPACE", "oclan-co", "dev_remote_current", "manor-box", "dev_remote_server", "prod-server"} {
+		if !strings.Contains(out.String(), expected) {
+			t.Fatalf("remote device list missing %q: %s", expected, out.String())
+		}
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"device", "list", "--local"}); code != 0 {
+		t.Fatalf("device list --local failed: %s", errb.String())
+	}
+	if !strings.Contains(out.String(), "manor-box") || strings.Contains(out.String(), "prod-server") {
+		t.Fatalf("local device list should only show local device records: %s", out.String())
+	}
+}
+
 func TestRemoteSelfRevokeClearsLocalRuntime(t *testing.T) {
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")
