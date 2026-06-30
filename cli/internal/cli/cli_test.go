@@ -934,6 +934,7 @@ func TestDeviceListDefaultsToRemoteWhenLinked(t *testing.T) {
 	}
 
 	deviceListSeen := false
+	includeRevokedSeen := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "application/json")
 		switch r.URL.Path {
@@ -970,6 +971,9 @@ func TestDeviceListDefaultsToRemoteWhenLinked(t *testing.T) {
 			})
 		case "/v1/devices":
 			deviceListSeen = true
+			if r.URL.Query().Get("includeInactive") == "1" {
+				includeRevokedSeen = true
+			}
 			if r.URL.Query().Get("orgId") != "org_remote" {
 				t.Fatalf("unexpected device list query: %s", r.URL.RawQuery)
 			}
@@ -980,6 +984,7 @@ func TestDeviceListDefaultsToRemoteWhenLinked(t *testing.T) {
 				"devices": []map[string]any{
 					{"id": "dev_remote_current", "name": "manor-box", "status": "trusted", "kind": "laptop"},
 					{"id": "dev_remote_server", "name": "prod-server", "status": "trusted", "kind": "server"},
+					{"id": "dev_remote_old", "name": "old-laptop", "status": "revoked", "kind": "laptop"},
 				},
 			})
 		default:
@@ -1012,6 +1017,25 @@ func TestDeviceListDefaultsToRemoteWhenLinked(t *testing.T) {
 	for _, expected := range []string{"WORKSPACE", "oclan-co", "dev_remote_current", "manor-box", "dev_remote_server", "prod-server"} {
 		if !strings.Contains(out.String(), expected) {
 			t.Fatalf("remote device list missing %q: %s", expected, out.String())
+		}
+	}
+	for _, unexpected := range []string{"dev_remote_old", "old-laptop", "revoked"} {
+		if strings.Contains(out.String(), unexpected) {
+			t.Fatalf("remote device list should hide revoked device %q by default: %s", unexpected, out.String())
+		}
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"device", "list", "--include-revoked"}); code != 0 {
+		t.Fatalf("device list --include-revoked failed: %s", errb.String())
+	}
+	if !includeRevokedSeen {
+		t.Fatal("device list --include-revoked should request inactive remote devices")
+	}
+	for _, expected := range []string{"dev_remote_old", "old-laptop", "revoked"} {
+		if !strings.Contains(out.String(), expected) {
+			t.Fatalf("remote device list with --include-revoked missing %q: %s", expected, out.String())
 		}
 	}
 
@@ -1714,11 +1738,12 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 
 func TestPushDryRunFirstWorkspaceEvaluatesRemoteState(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		conflict bool
-		wantCode int
-		wantOut  []string
-		wantErr  string
+		name                 string
+		conflict             bool
+		metadataOnlyConflict bool
+		wantCode             int
+		wantOut              []string
+		wantErr              string
 	}{
 		{
 			name:     "conflict",
@@ -1732,6 +1757,13 @@ func TestPushDryRunFirstWorkspaceEvaluatesRemoteState(t *testing.T) {
 			wantCode: 0,
 			wantOut:  []string{"Would push 0 encrypted secret version(s)", "1 would be skipped"},
 		},
+		{
+			name:                 "metadata-only-inactive-conflict",
+			metadataOnlyConflict: true,
+			wantCode:             1,
+			wantOut:              []string{"Would push 0 encrypted secret version(s)", "Conflicts", "oclan-co/local/asiri/API_KEY v1"},
+			wantErr:              "remote secret version conflict",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tmp := t.TempDir()
@@ -1743,6 +1775,7 @@ func TestPushDryRunFirstWorkspaceEvaluatesRemoteState(t *testing.T) {
 			var remoteVersion *asiri.SecretVersion
 			writeOptionsSeen := false
 			encryptedSeen := false
+			metadataSeen := false
 			postSeen := false
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("content-type", "application/json")
@@ -1798,6 +1831,10 @@ func TestPushDryRunFirstWorkspaceEvaluatesRemoteState(t *testing.T) {
 					if remoteVersion == nil {
 						t.Fatal("remote version was not prepared before dry-run push")
 					}
+					if tc.metadataOnlyConflict {
+						_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{}})
+						return
+					}
 					ciphertext := remoteVersion.Ciphertext
 					if tc.conflict {
 						ciphertext = "conflicting-ciphertext"
@@ -1823,6 +1860,28 @@ func TestPushDryRunFirstWorkspaceEvaluatesRemoteState(t *testing.T) {
 						}},
 					})
 				case "/v1/secrets":
+					if r.Method == http.MethodGet {
+						metadataSeen = true
+						if r.URL.Query().Get("includeInactive") != "1" {
+							t.Fatalf("metadata preflight should request inactive records, got query %s", r.URL.RawQuery)
+						}
+						status := "active"
+						if tc.metadataOnlyConflict {
+							status = "stale"
+						}
+						_ = json.NewEncoder(w).Encode(map[string]any{
+							"secrets": []map[string]any{{
+								"id":        "sec_dry_run_meta",
+								"orgId":     "org_dry_run",
+								"scope":     "oclan-co/local/asiri",
+								"name":      "API_KEY",
+								"version":   remoteVersion.Version,
+								"algorithm": remoteVersion.Algorithm,
+								"status":    status,
+							}},
+						})
+						return
+					}
 					if r.Method == http.MethodPost {
 						postSeen = true
 					}
@@ -1870,8 +1929,8 @@ func TestPushDryRunFirstWorkspaceEvaluatesRemoteState(t *testing.T) {
 			if tc.wantErr != "" && !strings.Contains(errb.String(), tc.wantErr) {
 				t.Fatalf("dry-run error missing %q: %s", tc.wantErr, errb.String())
 			}
-			if !writeOptionsSeen || !encryptedSeen || postSeen {
-				t.Fatalf("dry-run should evaluate write options and remote state without posting, write=%v encrypted=%v post=%v", writeOptionsSeen, encryptedSeen, postSeen)
+			if !writeOptionsSeen || !encryptedSeen || !metadataSeen || postSeen {
+				t.Fatalf("dry-run should evaluate write options and remote state without posting, write=%v encrypted=%v metadata=%v post=%v", writeOptionsSeen, encryptedSeen, metadataSeen, postSeen)
 			}
 			reloaded, err := store.LoadDefault()
 			if err != nil {
@@ -3932,10 +3991,17 @@ func TestListMergesActiveWorkspaceRemoteSecrets(t *testing.T) {
 			if r.Header.Get("authorization") != "Bearer at_list" {
 				t.Fatalf("unexpected visible list auth header: %s", r.Header.Get("authorization"))
 			}
+			secrets := []map[string]any{
+				{"id": "sec_synced", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "PUSHED", "version": 1, "status": "active", "canWrite": true},
+			}
+			if r.URL.Query().Get("includeInactive") == "1" {
+				secrets = append(secrets,
+					map[string]any{"id": "sec_history_old", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "HISTORY", "version": 1, "status": "stale", "canWrite": true},
+					map[string]any{"id": "sec_history_active", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "HISTORY", "version": 2, "status": "active", "canWrite": true},
+				)
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"secrets": []map[string]any{
-					{"id": "sec_synced", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "PUSHED", "version": 1, "status": "active", "canWrite": true},
-				},
+				"secrets": secrets,
 			})
 		default:
 			http.NotFound(w, r)
@@ -3974,6 +4040,26 @@ func TestListMergesActiveWorkspaceRemoteSecrets(t *testing.T) {
 	}
 	if strings.Contains(all, "REMOTE_ONLY") || strings.Contains(all, "remote-only,read-only") {
 		t.Fatalf("list output included filtered workspace remote secret: %s", all)
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"list", "--include-inactive"}); code != 0 {
+		t.Fatalf("inactive list failed: %s", errb.String())
+	}
+	historyLines := []string{}
+	for _, line := range strings.Split(out.String(), "\n") {
+		if strings.Contains(line, "local/asiri/HISTORY") {
+			historyLines = append(historyLines, line)
+		}
+	}
+	if len(historyLines) != 2 {
+		t.Fatalf("expected inactive history versions to render as separate rows, got %d in %s", len(historyLines), out.String())
+	}
+	if !(strings.Contains(historyLines[0], "v1") && strings.Contains(historyLines[0], "stale") || strings.Contains(historyLines[1], "v1") && strings.Contains(historyLines[1], "stale")) {
+		t.Fatalf("expected stale history row in %v", historyLines)
+	}
+	if !(strings.Contains(historyLines[0], "v2") && strings.Contains(historyLines[0], "active") || strings.Contains(historyLines[1], "v2") && strings.Contains(historyLines[1], "active")) {
+		t.Fatalf("expected active history row in %v", historyLines)
 	}
 	out.Reset()
 	errb.Reset()

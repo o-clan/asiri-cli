@@ -273,7 +273,7 @@ func (a App) helpFor(path []string) int {
 	case "device enroll":
 		fmt.Fprint(a.Out, "Usage: asiri device enroll --name <device>\n\nCreates a new local device keypair and local trusted-device record.\n")
 	case "device list":
-		fmt.Fprint(a.Out, "Usage: asiri device list [--local|--remote] [--workspace <slug>...]\n\nLists remote devices in visible workspaces when linked to the control plane. Use --local to show only this machine's local device records.\n")
+		fmt.Fprint(a.Out, "Usage: asiri device list [--local|--remote] [--workspace <slug>...] [--include-revoked]\n\nLists remote devices in visible workspaces when linked to the control plane. Use --local to show only this machine's local device records. Revoked devices are hidden unless --include-revoked is set.\n")
 	case "device status":
 		fmt.Fprint(a.Out, "Usage: asiri device status [--workspace <slug>...]\n\nShows whether this device is trusted in visible workspaces and whether visible remote secrets are wrapped to it.\n")
 	case "device trust":
@@ -293,7 +293,7 @@ func (a App) helpFor(path []string) int {
 	case "get":
 		fmt.Fprint(a.Out, "Usage: asiri get --workspace <slug> <scope/name> [--agent <agent>]\n\nReads a local secret when policy allows raw read for the human user or named agent label. Use short paths without the workspace prefix.\n")
 	case "list":
-		fmt.Fprint(a.Out, "Usage: asiri list [filter] [--workspace <slug>...] [--local|--remote] [--status <status>]\n\nShows secret metadata only. Values are never printed by list. Without --workspace, visible workspaces are included.\n")
+		fmt.Fprint(a.Out, "Usage: asiri list [filter] [--workspace <slug>...] [--local|--remote] [--status <status>] [--include-inactive]\n\nShows secret metadata only. Values are never printed by list. Without --workspace, visible workspaces are included. Inactive remote versions are hidden unless --include-inactive is set.\n")
 	case "rotate":
 		fmt.Fprint(a.Out, "Usage: asiri rotate --workspace <slug> <scope/name> --stdin|--value-file <path>\n\nAdds a new local encrypted version for an existing secret. Use short paths without the workspace prefix.\n")
 	case "rm":
@@ -884,7 +884,7 @@ func (a App) workspace(st *store.FileStore, args []string) int {
 		var secretsErr error
 		secretsKnown := false
 		if st.State.ControlPlane.Source != "oidc" {
-			remoteSecrets, secretsErr = listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken)
+			remoteSecrets, secretsErr = listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken, false)
 			secretsKnown = secretsErr == nil
 		}
 		keySummaries := workspaceKeySummaries(st, workspaces, remoteSecrets, st.State.ControlPlane.WorkspaceID, secretsKnown)
@@ -1070,7 +1070,7 @@ func (a App) setupDoctor(st *store.FileStore, args []string) int {
 
 	var remoteSecrets []visibleRemoteSecretRecord
 	secretsKnown := false
-	if secrets, err := listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken); err == nil {
+	if secrets, err := listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken, false); err == nil {
 		remoteSecrets = secrets
 		secretsKnown = true
 	} else {
@@ -1242,9 +1242,16 @@ func (a App) push(st *store.FileStore, args []string) int {
 	if recovery != nil {
 		recoveryRecipientID = recovery.RecipientID
 	}
-	remoteSecrets, err := listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, recoveryRecipientID)
+	remoteSecrets, err := listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, recoveryRecipientID, false)
 	if err != nil {
 		return a.fail(err)
+	}
+	remoteMetadata, status, err := listRemoteSecretMetadata(st, st.State.ControlPlane.Origin, target.ID, accessToken, true)
+	if err != nil {
+		return a.fail(err)
+	}
+	if status != http.StatusNotFound {
+		remoteSecrets = mergeRemoteSecretRecords(remoteSecrets, remoteMetadata)
 	}
 	reconciled, err := reconcilePushVersions(versions, remoteSecrets)
 	if pushOptions.DryRun {
@@ -1471,6 +1478,13 @@ func reconcilePushVersions(local []store.RemoteSecretVersion, remote []remoteSec
 
 func pushVersionKey(scope, name string, version int) string {
 	return store.SecretKey(scope, name) + "\x00" + strconv.Itoa(version)
+}
+
+func listOutputRowKey(scope, name string, version int, includeInactive bool) string {
+	if includeInactive {
+		return pushVersionKey(scope, name, version)
+	}
+	return store.SecretKey(scope, name)
 }
 
 func remoteSecretEnvelopeMatches(local store.RemoteSecretVersion, remote remoteSecretRecord) bool {
@@ -1970,11 +1984,11 @@ func (a App) rewrap(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	devices, err := listRemoteDevices(st, st.State.ControlPlane.Origin, target.ID, accessToken)
+	devices, err := listRemoteDevices(st, st.State.ControlPlane.Origin, target.ID, accessToken, false)
 	if err != nil {
 		return a.fail(err)
 	}
-	secrets, err := listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, "")
+	secrets, err := listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, "", false)
 	if err != nil {
 		return a.fail(err)
 	}
@@ -2267,7 +2281,7 @@ func (a App) recoveryRestore(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	secrets, err := listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, identity.RecipientID)
+	secrets, err := listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, identity.RecipientID, false)
 	if err != nil {
 		return a.fail(err)
 	}
@@ -2345,10 +2359,10 @@ func (a App) prepareRemoteRecoveryReplacementKeys(st *store.FileStore, accessTok
 	if binding, ok := st.RemoteBindingForPrefix(st.State.ControlPlane.WorkspaceSlug); !ok || binding.WorkspaceID != st.State.ControlPlane.WorkspaceID {
 		return nil, 0, nil
 	}
-	secrets, err := listRemoteSecrets(st, st.State.ControlPlane.Origin, st.State.ControlPlane.WorkspaceID, accessToken, previousRecoveryRecipientID)
+	secrets, err := listRemoteSecrets(st, st.State.ControlPlane.Origin, st.State.ControlPlane.WorkspaceID, accessToken, previousRecoveryRecipientID, false)
 	if err != nil {
 		if previousRecoveryRecipientID != "" && strings.Contains(err.Error(), "HTTP 403") {
-			secrets, err = listRemoteSecrets(st, st.State.ControlPlane.Origin, st.State.ControlPlane.WorkspaceID, accessToken, "")
+			secrets, err = listRemoteSecrets(st, st.State.ControlPlane.Origin, st.State.ControlPlane.WorkspaceID, accessToken, "", false)
 		}
 		if err != nil {
 			return nil, 0, err
@@ -2510,7 +2524,7 @@ func (a App) deviceStatus(st *store.FileStore, args []string) int {
 	var secretsErr error
 	secretsKnown := false
 	if st.State.ControlPlane.Source != "oidc" {
-		remoteSecrets, secretsErr = listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken)
+		remoteSecrets, secretsErr = listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken, false)
 		secretsKnown = secretsErr == nil
 	}
 	keySummaries := workspaceKeySummaries(st, targets, remoteSecrets, st.State.ControlPlane.WorkspaceID, secretsKnown)
@@ -2708,11 +2722,12 @@ func (a App) device(st *store.FileStore, args []string) int {
 		if err != nil {
 			return a.fail(err)
 		}
-		if err := rejectUnknownArgs(remaining, "--local", "--remote"); err != nil {
+		if err := rejectUnknownArgs(remaining, "--local", "--remote", "--include-revoked"); err != nil {
 			return a.fail(err)
 		}
 		local := hasFlag(remaining, "--local")
 		remote := hasFlag(remaining, "--remote")
+		includeRevoked := hasFlag(remaining, "--include-revoked")
 		if local && remote {
 			return a.fail(errors.New("use either --local or --remote, not both"))
 		}
@@ -2766,12 +2781,15 @@ func (a App) device(st *store.FileStore, args []string) int {
 					target.ID = st.State.ControlPlane.WorkspaceID
 					target.Slug = st.State.ControlPlane.WorkspaceSlug
 				}
-				devices, err := listRemoteDevices(st, st.State.ControlPlane.Origin, target.ID, currentToken)
+				devices, err := listRemoteDevices(st, st.State.ControlPlane.Origin, target.ID, currentToken, includeRevoked)
 				if err != nil {
 					rows = append(rows, deviceListRow{Workspace: target.Slug, Status: "failed", Note: err.Error()})
 					continue
 				}
 				for _, device := range devices {
+					if !includeRevoked && device.Status == "revoked" {
+						continue
+					}
 					rows = append(rows, deviceListRow{Workspace: target.Slug, ID: device.ID, Name: device.Name, Kind: device.Kind, Status: device.Status})
 				}
 			}
@@ -2793,6 +2811,9 @@ func (a App) device(st *store.FileStore, args []string) int {
 			return 0
 		}
 		for _, device := range st.State.Devices {
+			if !includeRevoked && device.Status == asiri.DeviceRevoked {
+				continue
+			}
 			fmt.Fprintf(a.Out, "%s\t%s\t%s\t%s\n", device.ID, device.Name, device.Kind, device.Status)
 		}
 		return 0
@@ -2973,7 +2994,7 @@ func (a App) list(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	if err := rejectUnknownArgs(remaining, "--local", "--remote", "--status"); err != nil {
+	if err := rejectUnknownArgs(remaining, "--local", "--remote", "--status", "--include-inactive"); err != nil {
 		return a.fail(err)
 	}
 	statusFilter, _, err := optionalFlagValue(remaining, "--status")
@@ -2985,6 +3006,7 @@ func (a App) list(st *store.FileStore, args []string) int {
 	}
 	localOnly := hasFlag(remaining, "--local")
 	remoteOnly := hasFlag(remaining, "--remote")
+	includeInactive := hasFlag(remaining, "--include-inactive")
 	if localOnly && remoteOnly {
 		return a.fail(errors.New("use either --local or --remote, not both"))
 	}
@@ -3007,19 +3029,20 @@ func (a App) list(st *store.FileStore, args []string) int {
 		if version == nil {
 			continue
 		}
-		fullPath := store.SecretKey(secret.Scope, secret.Name)
+		rowKey := listOutputRowKey(secret.Scope, secret.Name, version.Version, includeInactive)
 		workspace := store.WorkspacePrefix(secret.Scope)
-		rows[fullPath] = listRow{
-			Path:         shortSecretPath(secret.Scope, secret.Name),
-			Version:      secret.ActiveVersion,
-			NameHash:     secret.NameHash,
-			Status:       "local-only",
-			Keys:         "local",
-			Workspace:    workspace,
-			WorkspaceID:  boundWorkspaceID(st, workspace),
-			HasLocal:     true,
-			HasRemote:    false,
-			RemoteStatus: "",
+		rows[rowKey] = listRow{
+			Path:          shortSecretPath(secret.Scope, secret.Name),
+			Version:       secret.ActiveVersion,
+			NameHash:      secret.NameHash,
+			Status:        "local-only",
+			VersionStatus: version.Status,
+			Keys:          "local",
+			Workspace:     workspace,
+			WorkspaceID:   boundWorkspaceID(st, workspace),
+			HasLocal:      true,
+			HasRemote:     false,
+			RemoteStatus:  "",
 		}
 	}
 	if st.State.ControlPlane != nil && !localOnly && st.State.ControlPlane.Source != "oidc" {
@@ -3030,7 +3053,7 @@ func (a App) list(st *store.FileStore, args []string) int {
 			}
 			fmt.Fprintf(a.Err, "asiri: remote list unavailable: %s\n", err)
 		} else {
-			remoteSecrets, err := listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken)
+			remoteSecrets, err := listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken, includeInactive)
 			if err != nil {
 				if remoteOnly || len(rows) == 0 {
 					return a.fail(err)
@@ -3038,15 +3061,16 @@ func (a App) list(st *store.FileStore, args []string) int {
 				fmt.Fprintf(a.Err, "asiri: remote list unavailable: %s\n", err)
 			} else {
 				for _, secret := range remoteSecrets {
-					if secret.Status != "active" {
+					if !includeInactive && secret.Status != "active" {
 						continue
 					}
-					fullPath := store.SecretKey(secret.Scope, secret.Name)
-					row := rows[fullPath]
+					rowKey := listOutputRowKey(secret.Scope, secret.Name, secret.Version, includeInactive)
+					row := rows[rowKey]
 					if row.Path == "" {
 						row = listRow{Path: shortSecretPath(secret.Scope, secret.Name), NameHash: store.HashSecretName(secret.Scope, secret.Name), Workspace: secret.WorkspaceSlug, WorkspaceID: secret.OrgID}
 					}
 					row.Version = maxInt(row.Version, secret.Version)
+					row.VersionStatus = secret.Status
 					row.HasRemote = true
 					row.WorkspaceID = secret.OrgID
 					row.Keys = remoteSecretKeyLabel(st, secret)
@@ -3059,7 +3083,7 @@ func (a App) list(st *store.FileStore, args []string) int {
 					} else {
 						row.Status = "remote-only"
 					}
-					rows[fullPath] = row
+					rows[rowKey] = row
 				}
 			}
 		}
@@ -3081,14 +3105,18 @@ func (a App) list(st *store.FileStore, args []string) int {
 		return 0
 	}
 	w := tabwriter.NewWriter(a.Out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "WORKSPACE\tPATH\tVER\tHASH\tSTATE\tKEYS")
+	fmt.Fprintln(w, "WORKSPACE\tPATH\tVER\tHASH\tSTATE\tVERSION_STATUS\tKEYS")
 	for _, key := range keys {
 		row := rows[key]
 		status := row.Status
 		if row.RemoteStatus != "" {
 			status += "," + row.RemoteStatus
 		}
-		fmt.Fprintf(w, "%s\t%s\tv%d\t%s\t%s\t%s\n", row.Workspace, row.Path, row.Version, row.NameHash, status, row.Keys)
+		versionStatus := row.VersionStatus
+		if versionStatus == "" {
+			versionStatus = "active"
+		}
+		fmt.Fprintf(w, "%s\t%s\tv%d\t%s\t%s\t%s\t%s\n", row.Workspace, row.Path, row.Version, row.NameHash, status, versionStatus, row.Keys)
 	}
 	if err := w.Flush(); err != nil {
 		return a.fail(err)
@@ -3247,7 +3275,7 @@ func (a App) remoteSecretDeleteRemoteOnlyUnwrapped(st *store.FileStore, accessTo
 	if deviceID == "" {
 		return a.fail(errors.New("control-plane session is missing current device id"))
 	}
-	secrets, err := listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken)
+	secrets, err := listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken, false)
 	if err != nil {
 		return a.fail(err)
 	}
@@ -5143,25 +5171,70 @@ func revokeRemoteDevice(st *store.FileStore, origin, deviceID, accessToken strin
 	return result, nil
 }
 
-func listRemoteDevices(st *store.FileStore, origin, orgID, accessToken string) ([]remoteDeviceResponse, error) {
+func listRemoteDevices(st *store.FileStore, origin, orgID, accessToken string, includeRevoked bool) ([]remoteDeviceResponse, error) {
 	var result remoteDevicesResponse
 	endpoint := fmt.Sprintf("%s/v1/devices?orgId=%s", strings.TrimRight(origin, "/"), url.QueryEscape(orgID))
+	if includeRevoked {
+		endpoint += "&includeInactive=1"
+	}
 	if err := getJSONBearer(st, endpoint, accessToken, &result); err != nil {
 		return nil, err
 	}
 	return result.Devices, nil
 }
 
-func listRemoteSecrets(st *store.FileStore, origin, orgID, accessToken, recoveryRecipientID string) ([]remoteSecretRecord, error) {
+func listRemoteSecrets(st *store.FileStore, origin, orgID, accessToken, recoveryRecipientID string, includeInactive bool) ([]remoteSecretRecord, error) {
 	var result remoteSecretsResponse
 	endpoint := fmt.Sprintf("%s/v1/secrets/encrypted?orgId=%s", strings.TrimRight(origin, "/"), url.QueryEscape(orgID))
 	if recoveryRecipientID != "" {
 		endpoint += "&recoveryRecipientId=" + url.QueryEscape(recoveryRecipientID)
 	}
+	if includeInactive {
+		endpoint += "&includeInactive=1"
+	}
 	if err := getJSONBearer(st, endpoint, accessToken, &result); err != nil {
 		return nil, err
 	}
 	return result.Secrets, nil
+}
+
+func listRemoteSecretMetadata(st *store.FileStore, origin, orgID, accessToken string, includeInactive bool) ([]remoteSecretRecord, int, error) {
+	var result remoteSecretsResponse
+	endpoint := fmt.Sprintf("%s/v1/secrets?orgId=%s", strings.TrimRight(origin, "/"), url.QueryEscape(orgID))
+	if includeInactive {
+		endpoint += "&includeInactive=1"
+	}
+	status, err := getJSONBearerStatus(st, endpoint, accessToken, &result)
+	if err != nil {
+		return nil, status, err
+	}
+	if status == http.StatusNotFound {
+		return nil, status, nil
+	}
+	if status < 200 || status >= 300 {
+		return nil, status, fmt.Errorf("control plane returned HTTP %d", status)
+	}
+	return result.Secrets, status, nil
+}
+
+func mergeRemoteSecretRecords(primary, secondary []remoteSecretRecord) []remoteSecretRecord {
+	if len(secondary) == 0 {
+		return primary
+	}
+	merged := make([]remoteSecretRecord, 0, len(primary)+len(secondary))
+	seen := map[string]bool{}
+	for _, item := range primary {
+		merged = append(merged, item)
+		seen[pushVersionKey(item.Scope, item.Name, item.Version)] = true
+	}
+	for _, item := range secondary {
+		key := pushVersionKey(item.Scope, item.Name, item.Version)
+		if seen[key] {
+			continue
+		}
+		merged = append(merged, item)
+	}
+	return merged
 }
 
 func getActiveRemoteRecoveryRecipient(st *store.FileStore, origin, orgID, accessToken string) (*asiri.RecoveryConfig, error) {
@@ -5188,9 +5261,12 @@ func getActiveRemoteRecoveryRecipient(st *store.FileStore, origin, orgID, access
 	}, nil
 }
 
-func listVisibleRemoteSecrets(st *store.FileStore, origin, accessToken string) ([]visibleRemoteSecretRecord, error) {
+func listVisibleRemoteSecrets(st *store.FileStore, origin, accessToken string, includeInactive bool) ([]visibleRemoteSecretRecord, error) {
 	var result visibleRemoteSecretsResponse
 	endpoint := strings.TrimRight(origin, "/") + "/v1/secrets/visible"
+	if includeInactive {
+		endpoint += "?includeInactive=1"
+	}
 	if err := getJSONBearer(st, endpoint, accessToken, &result); err != nil {
 		return nil, err
 	}
@@ -5198,7 +5274,7 @@ func listVisibleRemoteSecrets(st *store.FileStore, origin, accessToken string) (
 }
 
 func resolveActiveRemoteSecret(st *store.FileStore, origin, accessToken string, target remoteWorkspaceResponse, scope, name string) (visibleRemoteSecretRecord, error) {
-	secrets, err := listVisibleRemoteSecrets(st, origin, accessToken)
+	secrets, err := listVisibleRemoteSecrets(st, origin, accessToken, false)
 	if err != nil {
 		return visibleRemoteSecretRecord{}, err
 	}
@@ -5388,16 +5464,17 @@ func localSecretWorkspacePrefixes(refs []store.LocalSecretRef) []string {
 }
 
 type listRow struct {
-	Path         string
-	Version      int
-	NameHash     string
-	Status       string
-	Keys         string
-	Workspace    string
-	WorkspaceID  string
-	HasLocal     bool
-	HasRemote    bool
-	RemoteStatus string
+	Path          string
+	Version       int
+	NameHash      string
+	Status        string
+	VersionStatus string
+	Keys          string
+	Workspace     string
+	WorkspaceID   string
+	HasLocal      bool
+	HasRemote     bool
+	RemoteStatus  string
 }
 
 func activeVersion(secret asiri.Secret) *asiri.SecretVersion {

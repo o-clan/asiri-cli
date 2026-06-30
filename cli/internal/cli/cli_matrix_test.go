@@ -152,7 +152,7 @@ func TestCLICommandMatrix(t *testing.T) {
 		t.Fatalf("removed secret still listed: %s", listing)
 	}
 	expectOK("device", "revoke", "qa-laptop")
-	if devices := expectOK("device", "list"); !strings.Contains(devices, "revoked") {
+	if devices := expectOK("device", "list", "--include-revoked"); !strings.Contains(devices, "revoked") {
 		t.Fatalf("device revoke not reflected in list: %s", devices)
 	}
 	expectOK("cache", "wipe")
