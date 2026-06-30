@@ -18,6 +18,12 @@ Asiri safely. The skill focuses on operational use first: inspect metadata, run
 commands with scoped secrets, track new secrets, grant narrow runtime access,
 and stop before changing trust or key material.
 
+Release builds also attach the skill as a GitHub release asset:
+
+```bash
+https://github.com/o-clan/asiri-cli/releases/latest/download/asiri-skill.tar.gz
+```
+
 ## Install
 
 ```bash

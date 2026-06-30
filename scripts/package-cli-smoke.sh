@@ -14,6 +14,7 @@ EXPECTED=(
   "asiri_${VERSION}_darwin_arm64"
   "asiri_${VERSION}_windows_amd64.exe"
   "asiri_${VERSION}_windows_arm64.exe"
+  "asiri-skill.tar.gz"
 )
 
 run() {
@@ -50,13 +51,21 @@ for artifact in "${EXPECTED[@]}"; do
   test -s "$path"
   run file "$path"
   case "$artifact" in
-    *.exe)
+    *.exe|*.tar.gz)
       ;;
     *)
       test -x "$path"
       ;;
   esac
 done
+
+skill_extract_dir="$(mktemp -d)"
+run tar -xzf "$OUT_DIR/asiri-skill.tar.gz" -C "$skill_extract_dir"
+test -f "$skill_extract_dir/asiri/SKILL.md"
+test -f "$skill_extract_dir/asiri/agents/openai.yaml"
+grep -q '^name: asiri$' "$skill_extract_dir/asiri/SKILL.md"
+grep -q '^description: ' "$skill_extract_dir/asiri/SKILL.md"
+grep -q '^interface:$' "$skill_extract_dir/asiri/agents/openai.yaml"
 
 test -f "$OUT_DIR/SHA256SUMS"
 test -s "$OUT_DIR/SHA256SUMS"

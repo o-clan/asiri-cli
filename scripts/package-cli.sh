@@ -13,6 +13,7 @@ GENERATED_SIGNING_DIR=""
 
 ASIRI_VERSION="$VERSION" node scripts/release-check.mjs
 command -v openssl >/dev/null 2>&1 || { echo "openssl is required to sign release artifacts" >&2; exit 1; }
+command -v tar >/dev/null 2>&1 || { echo "tar is required to package the Asiri skill" >&2; exit 1; }
 if [[ -z "$RELEASE_SIGNING_KEY" ]]; then
   if [[ "${ASIRI_ALLOW_UNTRUSTED_RELEASE_KEY:-}" != "1" ]]; then
     echo "ASIRI_RELEASE_SIGNING_KEY must point to the release signing private key" >&2
@@ -76,6 +77,10 @@ for target in $TARGETS; do
   artifacts+=("$artifact")
 done
 
+skill_artifact="asiri-skill.tar.gz"
+tar -czf "$OUT_DIR/$skill_artifact" -C skills asiri
+artifacts+=("$skill_artifact")
+
 (
   cd "$OUT_DIR"
   : > SHA256SUMS
@@ -104,6 +109,9 @@ Pick the binary matching your OS and CPU architecture:
 - macOS Apple: asiri_${VERSION}_darwin_arm64
 - Windows x64: asiri_${VERSION}_windows_amd64.exe
 - Windows ARM: asiri_${VERSION}_windows_arm64.exe
+
+Install the agent skill from this release:
+  https://github.com/o-clan/asiri-cli/releases/latest/download/asiri-skill.tar.gz
 
 Verify the signed checksum manifest with the trusted Asiri release public key,
 then verify checksums from this directory:
@@ -135,6 +143,7 @@ Verification:
 - All artifacts are listed in SHA256SUMS.
 - SHA256SUMS is signed with the Asiri release key.
 - The installer verifies the signed checksum manifest and the exact downloaded artifact before installing.
+- The Asiri agent skill is attached as asiri-skill.tar.gz for compatible agent harnesses.
 EOF_NOTES
 
 echo "wrote $OUT_DIR"
