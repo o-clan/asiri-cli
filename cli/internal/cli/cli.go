@@ -43,9 +43,16 @@ type App struct {
 var Version = "0.1.24"
 
 var defaultControlPlaneOrigin = "http://127.0.0.1:4173"
+var githubActionsOidcTokenTimeout = 10 * time.Second
 
 var envNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 var asiriRefPattern = regexp.MustCompile(`asiri://[A-Za-z0-9][A-Za-z0-9/_-]{1,96}/[A-Za-z0-9][A-Za-z0-9_.-]{1,96}`)
+
+func init() {
+	if len(os.Args) > 1 && os.Args[1] == "__workload-verify-env-smoke" {
+		os.Exit(workloadVerifyEnvSmokeHelper(os.Args[2:]))
+	}
+}
 
 func New(out, err io.Writer) App {
 	return App{Out: out, Err: err, In: os.Stdin}
@@ -65,6 +72,9 @@ func (a App) Run(args []string) int {
 	if args[0] == "--version" || args[0] == "version" {
 		fmt.Fprintf(a.Out, "asiri %s\n", Version)
 		return 0
+	}
+	if args[0] == "__workload-verify-env-smoke" {
+		return workloadVerifyEnvSmokeHelper(args[1:])
 	}
 	st, err := store.LoadDefault()
 	if err != nil {
@@ -243,13 +253,19 @@ func (a App) helpFor(path []string) int {
 	case "workspace list":
 		fmt.Fprint(a.Out, "Usage: asiri workspace list\n\nShows visible workspaces as a table. This device controls pull and workspace-scoped push. Account write means the user owns the workspace or has effective secret-write capability.\n")
 	case "workload":
-		fmt.Fprint(a.Out, "Usage: asiri workload <command>\n\nCommands:\n  create  Create a workload identity from a trusted device session.\n  trust   Add an OIDC trust rule to a workload from a trusted device session.\n  login   Exchange a platform OIDC token for a short-lived workload session.\n")
+		fmt.Fprint(a.Out, "Usage: asiri workload <command>\n\nCommands:\n  create  Create a workload identity from a trusted device session.\n  trust   Add an OIDC trust rule to a workload from a trusted device session.\n  grant   Add a remote service policy for a workload.\n  setup   Create or reuse a workload, OIDC trust, and service policy.\n  login   Exchange a platform OIDC token for a short-lived workload session.\n  verify  Exchange workload OIDC, sync, and verify expected access for CI.\n")
 	case "workload create":
 		fmt.Fprint(a.Out, "Usage: asiri workload create --workspace <slug> --slug <slug> --name <name>\n\nCreates a control-plane workload identity from a trusted device session using the linked control-plane origin.\n")
 	case "workload trust":
 		fmt.Fprint(a.Out, "Usage: asiri workload trust --workspace <slug> --workload <slug-or-id> --provider github|generic --issuer <url> --audience <aud> [--jwks-url <url>] [--subject <sub>] [--claim key=value] [--expires-at <iso>]\n\nAdds an OIDC trust rule to a workload. Generic trusts require --jwks-url. GitHub trusts default to GitHub's Actions JWKS when --jwks-url is omitted.\n")
+	case "workload grant":
+		fmt.Fprint(a.Out, "Usage: asiri workload grant --workspace <slug> --workload <slug-or-id> --scope <scope> --secret <pattern> --inject-only|--read|--mount|--sign|--proxy-local [--approval-mode none|require-owner] [--expires-at <iso>]\n\nAdds an idempotent remote service policy for a workload. Use short scope paths without the workspace prefix.\n")
+	case "workload setup":
+		fmt.Fprint(a.Out, "Usage: asiri workload setup --workspace <slug> --slug <slug> --name <name> --provider github|generic --issuer <url> --audience <aud> [--jwks-url <url>] [--subject <sub>] [--claim key=value] --scope <scope> --secret <pattern> --inject-only|--read|--mount|--sign|--proxy-local [--trust-expires-at <iso>] [--approval-mode none|require-owner] [--policy-expires-at <iso>]\n\nCreates or reuses a workload, adds a matching OIDC trust, and adds a matching remote service policy from a trusted user-device session.\n")
 	case "workload login":
 		fmt.Fprintf(a.Out, "Usage: asiri workload login --provider github|generic [--token <jwt>|--token-file <path>] [--audience <aud>] [--origin <url>]\n\nLinks this local device to the control plane as a workload. Default origin: %s.\n", defaultControlPlaneOrigin)
+	case "workload verify":
+		fmt.Fprintf(a.Out, "Usage: asiri workload verify --workspace <slug> [--provider github|generic] [--token <jwt>|--token-file <path>] [--audience <aud>] [--origin <url>] --expect-secret <scope/name> [--action <action>...] [--smoke-env NAME=<scope/name>] [--force]\n\nFor CI: exchanges workload OIDC, syncs the workload bundle, verifies expected secret metadata and service policy actions, and optionally injects selected secrets into a no-output child-process smoke check. Default origin: %s.\n", defaultControlPlaneOrigin)
 	case "push":
 		fmt.Fprint(a.Out, "Usage: asiri push --workspace <slug> [--scope <scope>...] [--secret <scope/name>...] [--version <n>] [--dry-run] [--yes]\n\nUploads new local encrypted versions for the specified workspace. Existing matching versions are skipped, older local versions are skipped with a warning, and same-version mismatches fail as conflicts. Use --scope for one envelope, --secret for one exact secret, and --version only with one --secret. Use short paths without the workspace prefix.\n")
 	case "pull":
@@ -472,8 +488,14 @@ func (a App) workload(st *store.FileStore, args []string) int {
 		return a.workloadCreate(st, args[1:])
 	case "trust":
 		return a.workloadTrust(st, args[1:])
+	case "grant":
+		return a.workloadGrant(st, args[1:])
+	case "setup":
+		return a.workloadSetup(st, args[1:])
 	case "login":
 		return a.workloadLogin(st, args[1:])
+	case "verify":
+		return a.workloadVerify(st, args[1:])
 	default:
 		return a.fail(fmt.Errorf("unknown workload command %q", args[0]))
 	}
@@ -603,7 +625,11 @@ func parseWorkloadTrustArgs(args []string) (workloadTrustOptions, error) {
 			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
 				return options, errors.New("--expires-at requires an ISO timestamp")
 			}
-			options.ExpiresAt = args[i+1]
+			expiresAt, err := normalizeFutureTimestamp(args[i+1], "--expires-at")
+			if err != nil {
+				return options, err
+			}
+			options.ExpiresAt = expiresAt
 			i++
 		default:
 			return options, fmt.Errorf("unknown workload trust argument %q", args[i])
@@ -625,6 +651,290 @@ func parseWorkloadTrustArgs(args []string) (workloadTrustOptions, error) {
 		return options, errors.New("workload trust requires --audience")
 	}
 	return options, nil
+}
+
+type workloadGrantOptions struct {
+	Workspace     string
+	Workload      string
+	ScopePattern  string
+	SecretPattern string
+	Actions       []string
+	ApprovalMode  string
+	ExpiresAt     string
+}
+
+func parseWorkloadGrantArgs(args []string) (workloadGrantOptions, error) {
+	options := workloadGrantOptions{ApprovalMode: "none"}
+	for i := 0; i < len(args); i++ {
+		if action, ok := workloadPolicyAction(args[i]); ok {
+			options.Actions = appendUniqueString(options.Actions, action)
+			continue
+		}
+		switch args[i] {
+		case "--workspace", "-w":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--workspace requires a slug")
+			}
+			slug, err := localWorkspaceSlug(args[i+1])
+			if err != nil {
+				return options, err
+			}
+			options.Workspace = slug
+			i++
+		case "--workload":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--workload requires a slug or id")
+			}
+			options.Workload = args[i+1]
+			i++
+		case "--scope":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--scope requires a scope pattern")
+			}
+			options.ScopePattern = args[i+1]
+			i++
+		case "--secret":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--secret requires a secret pattern")
+			}
+			options.SecretPattern = strings.TrimSpace(args[i+1])
+			i++
+		case "--approval-mode":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--approval-mode requires none or require-owner")
+			}
+			options.ApprovalMode = args[i+1]
+			i++
+		case "--expires-at":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--expires-at requires an ISO timestamp")
+			}
+			expiresAt, err := normalizeFutureTimestamp(args[i+1], "--expires-at")
+			if err != nil {
+				return options, err
+			}
+			options.ExpiresAt = expiresAt
+			i++
+		default:
+			return options, fmt.Errorf("unknown workload grant argument %q", args[i])
+		}
+	}
+	if options.Workspace == "" {
+		return options, errors.New("workload grant requires --workspace")
+	}
+	if options.Workload == "" {
+		return options, errors.New("workload grant requires --workload")
+	}
+	if options.ScopePattern == "" {
+		return options, errors.New("workload grant requires --scope")
+	}
+	if options.SecretPattern == "" {
+		return options, errors.New("workload grant requires --secret")
+	}
+	if len(options.Actions) == 0 {
+		return options, errors.New("workload grant requires --inject-only, --read, --mount, --sign, or --proxy-local")
+	}
+	if options.ApprovalMode != "none" && options.ApprovalMode != "require-owner" {
+		return options, errors.New("--approval-mode must be none or require-owner")
+	}
+	return options, nil
+}
+
+type workloadSetupOptions struct {
+	Workspace       string
+	Slug            string
+	Name            string
+	Provider        string
+	Issuer          string
+	Audience        string
+	JwksURL         string
+	Subject         string
+	Claims          map[string]string
+	TrustExpiresAt  string
+	ScopePattern    string
+	SecretPattern   string
+	Actions         []string
+	ApprovalMode    string
+	PolicyExpiresAt string
+}
+
+func parseWorkloadSetupArgs(args []string) (workloadSetupOptions, error) {
+	options := workloadSetupOptions{Claims: map[string]string{}, ApprovalMode: "none"}
+	for i := 0; i < len(args); i++ {
+		if action, ok := workloadPolicyAction(args[i]); ok {
+			options.Actions = appendUniqueString(options.Actions, action)
+			continue
+		}
+		switch args[i] {
+		case "--workspace", "-w":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--workspace requires a slug")
+			}
+			slug, err := localWorkspaceSlug(args[i+1])
+			if err != nil {
+				return options, err
+			}
+			options.Workspace = slug
+			i++
+		case "--slug":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--slug requires a value")
+			}
+			options.Slug = args[i+1]
+			i++
+		case "--name":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--name requires a value")
+			}
+			options.Name = args[i+1]
+			i++
+		case "--provider":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--provider requires github or generic")
+			}
+			options.Provider = args[i+1]
+			i++
+		case "--issuer":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--issuer requires a URL")
+			}
+			options.Issuer = args[i+1]
+			i++
+		case "--audience":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--audience requires a value")
+			}
+			options.Audience = args[i+1]
+			i++
+		case "--jwks-url":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--jwks-url requires a URL")
+			}
+			options.JwksURL = args[i+1]
+			i++
+		case "--subject":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--subject requires a value")
+			}
+			options.Subject = args[i+1]
+			i++
+		case "--claim":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--claim requires key=value")
+			}
+			key, value, ok := strings.Cut(args[i+1], "=")
+			if !ok || strings.TrimSpace(key) == "" || value == "" {
+				return options, errors.New("--claim requires key=value")
+			}
+			options.Claims[key] = value
+			i++
+		case "--expires-at", "--trust-expires-at":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--trust-expires-at requires an ISO timestamp")
+			}
+			expiresAt, err := normalizeFutureTimestamp(args[i+1], "--trust-expires-at")
+			if err != nil {
+				return options, err
+			}
+			options.TrustExpiresAt = expiresAt
+			i++
+		case "--scope":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--scope requires a scope pattern")
+			}
+			options.ScopePattern = args[i+1]
+			i++
+		case "--secret":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--secret requires a secret pattern")
+			}
+			options.SecretPattern = strings.TrimSpace(args[i+1])
+			i++
+		case "--approval-mode":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--approval-mode requires none or require-owner")
+			}
+			options.ApprovalMode = args[i+1]
+			i++
+		case "--policy-expires-at":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--policy-expires-at requires an ISO timestamp")
+			}
+			expiresAt, err := normalizeFutureTimestamp(args[i+1], "--policy-expires-at")
+			if err != nil {
+				return options, err
+			}
+			options.PolicyExpiresAt = expiresAt
+			i++
+		default:
+			return options, fmt.Errorf("unknown workload setup argument %q", args[i])
+		}
+	}
+	if options.Workspace == "" {
+		return options, errors.New("workload setup requires --workspace")
+	}
+	if options.Slug == "" {
+		return options, errors.New("workload setup requires --slug")
+	}
+	if options.Name == "" {
+		return options, errors.New("workload setup requires --name")
+	}
+	if options.Provider != "github" && options.Provider != "generic" {
+		return options, errors.New("--provider must be github or generic")
+	}
+	if options.Issuer == "" {
+		return options, errors.New("workload setup requires --issuer")
+	}
+	if options.Audience == "" {
+		return options, errors.New("workload setup requires --audience")
+	}
+	if options.ScopePattern == "" {
+		return options, errors.New("workload setup requires --scope")
+	}
+	if options.SecretPattern == "" {
+		return options, errors.New("workload setup requires --secret")
+	}
+	if len(options.Actions) == 0 {
+		return options, errors.New("workload setup requires --inject-only, --read, --mount, --sign, or --proxy-local")
+	}
+	if options.ApprovalMode != "none" && options.ApprovalMode != "require-owner" {
+		return options, errors.New("--approval-mode must be none or require-owner")
+	}
+	return options, nil
+}
+
+func workloadPolicyAction(flag string) (string, bool) {
+	switch flag {
+	case "--inject-only":
+		return "inject", true
+	case "--read":
+		return "read", true
+	case "--mount":
+		return "mount", true
+	case "--sign":
+		return "sign", true
+	case "--proxy-local":
+		return "proxy-local", true
+	default:
+		return "", false
+	}
+}
+
+func appendUniqueString(values []string, value string) []string {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func normalizeFutureTimestamp(value, flag string) (string, error) {
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil || !parsed.After(time.Now()) {
+		return "", fmt.Errorf("%s requires a valid future ISO timestamp", flag)
+	}
+	return parsed.UTC().Format(time.RFC3339Nano), nil
 }
 
 type workloadLoginOptions struct {
@@ -680,6 +990,137 @@ func parseWorkloadLoginArgs(args []string) (workloadLoginOptions, error) {
 		return options, errors.New("use either --token or --token-file, not both")
 	}
 	return options, nil
+}
+
+type workloadVerifyOptions struct {
+	workloadLoginOptions
+	Workspace       string
+	ExpectedSecrets []string
+	RequiredActions []string
+	SmokeEnv        []workloadVerifySmokeEnv
+	Force           bool
+}
+
+type workloadVerifySmokeEnv struct {
+	Name       string
+	SecretPath string
+}
+
+func parseWorkloadVerifyArgs(args []string) (workloadVerifyOptions, error) {
+	options := workloadVerifyOptions{
+		workloadLoginOptions: workloadLoginOptions{Provider: "github", Audience: "asiri"},
+	}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--workspace", "-w":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--workspace requires a slug")
+			}
+			slug, err := localWorkspaceSlug(args[i+1])
+			if err != nil {
+				return options, err
+			}
+			options.Workspace = slug
+			i++
+		case "--provider":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--provider requires github or generic")
+			}
+			options.Provider = args[i+1]
+			i++
+		case "--token":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--token requires a JWT")
+			}
+			options.Token = args[i+1]
+			i++
+		case "--token-file":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--token-file requires a path")
+			}
+			options.TokenFile = args[i+1]
+			i++
+		case "--audience":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--audience requires a value")
+			}
+			options.Audience = args[i+1]
+			i++
+		case "--origin":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--origin requires a URL")
+			}
+			options.Origin = strings.TrimRight(args[i+1], "/")
+			i++
+		case "--expect", "--expect-secret":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--expect-secret requires a scope/name path")
+			}
+			options.ExpectedSecrets = appendUniqueString(options.ExpectedSecrets, strings.TrimSpace(args[i+1]))
+			i++
+		case "--action", "--require-action":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--action requires read, inject, mount, sign, or proxy-local")
+			}
+			action := strings.TrimSpace(args[i+1])
+			if !validWorkloadPolicyAction(action) {
+				return options, errors.New("--action requires read, inject, mount, sign, or proxy-local")
+			}
+			options.RequiredActions = appendUniqueString(options.RequiredActions, action)
+			i++
+		case "--smoke-env":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--smoke-env requires NAME=scope/name")
+			}
+			name, path, ok := strings.Cut(args[i+1], "=")
+			if !ok || !envNamePattern.MatchString(name) || strings.TrimSpace(path) == "" {
+				return options, errors.New("--smoke-env requires NAME=scope/name with a valid environment variable name")
+			}
+			if containsSmokeEnvName(options.SmokeEnv, name) {
+				return options, fmt.Errorf("duplicate smoke env name %s", name)
+			}
+			options.SmokeEnv = append(options.SmokeEnv, workloadVerifySmokeEnv{Name: name, SecretPath: strings.TrimSpace(path)})
+			i++
+		case "--force":
+			options.Force = true
+		default:
+			return options, fmt.Errorf("unknown workload verify argument %q", args[i])
+		}
+	}
+	if options.Workspace == "" {
+		return options, errors.New("workload verify requires --workspace")
+	}
+	if options.Provider != "github" && options.Provider != "generic" {
+		return options, errors.New("--provider must be github or generic")
+	}
+	if options.Token != "" && options.TokenFile != "" {
+		return options, errors.New("use either --token or --token-file, not both")
+	}
+	if len(options.ExpectedSecrets) == 0 && len(options.SmokeEnv) == 0 {
+		return options, errors.New("workload verify requires --expect-secret or --smoke-env")
+	}
+	if len(options.RequiredActions) == 0 {
+		options.RequiredActions = []string{"inject"}
+	}
+	return options, nil
+}
+
+func containsSmokeEnvName(values []workloadVerifySmokeEnv, name string) bool {
+	for _, value := range values {
+		if value.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func validWorkloadPolicyAction(action string) bool {
+	switch action {
+	case "read", "inject", "mount", "sign", "proxy-local":
+		return true
+	default:
+		return false
+	}
 }
 
 func (a App) workloadCreate(st *store.FileStore, args []string) int {
@@ -750,6 +1191,137 @@ func (a App) workloadTrust(st *store.FileStore, args []string) int {
 	return 0
 }
 
+func (a App) workloadGrant(st *store.FileStore, args []string) int {
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	if st.State.ControlPlane == nil {
+		return a.fail(errors.New("asiri is not linked to a control plane"))
+	}
+	if err := rejectWorkloadControlPlaneMutation(st); err != nil {
+		return a.fail(err)
+	}
+	options, err := parseWorkloadGrantArgs(args)
+	if err != nil {
+		return a.fail(err)
+	}
+	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	if err != nil {
+		return a.fail(err)
+	}
+	target, accessToken, err := a.remoteWorkspaceTarget(st, accessToken, options.Workspace)
+	if err != nil {
+		return a.fail(err)
+	}
+	scopePattern, err := workspacePrefixedPattern(workspacePathTarget{Slug: target.Slug, KnownSlugs: knownWorkspaceSlugs(st)}, options.ScopePattern, "workload grant")
+	if err != nil {
+		return a.fail(err)
+	}
+	workload, err := requireRemoteWorkload(st, st.State.ControlPlane.Origin, target.ID, accessToken, options.Workload)
+	if err != nil {
+		return a.fail(err)
+	}
+	policy, created, err := ensureRemoteWorkloadPolicy(st, st.State.ControlPlane.Origin, accessToken, target.ID, workload.Slug, workloadGrantOptions{
+		ScopePattern:  scopePattern,
+		SecretPattern: options.SecretPattern,
+		Actions:       options.Actions,
+		ApprovalMode:  options.ApprovalMode,
+		ExpiresAt:     options.ExpiresAt,
+	})
+	if err != nil {
+		return a.fail(err)
+	}
+	if created {
+		fmt.Fprintf(a.Out, "✓ Added service policy %s for workload %s on %s/%s\n", policy.ID, workload.Slug, policy.ScopePattern, policy.SecretPattern)
+	} else {
+		fmt.Fprintf(a.Out, "✓ Service policy %s already grants workload %s on %s/%s\n", policy.ID, workload.Slug, policy.ScopePattern, policy.SecretPattern)
+	}
+	return 0
+}
+
+func (a App) workloadSetup(st *store.FileStore, args []string) int {
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	if st.State.ControlPlane == nil {
+		return a.fail(errors.New("asiri is not linked to a control plane"))
+	}
+	if err := rejectWorkloadControlPlaneMutation(st); err != nil {
+		return a.fail(err)
+	}
+	options, err := parseWorkloadSetupArgs(args)
+	if err != nil {
+		return a.fail(err)
+	}
+	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	if err != nil {
+		return a.fail(err)
+	}
+	target, accessToken, err := a.remoteWorkspaceTarget(st, accessToken, options.Workspace)
+	if err != nil {
+		return a.fail(err)
+	}
+	scopePattern, err := workspacePrefixedPattern(workspacePathTarget{Slug: target.Slug, KnownSlugs: knownWorkspaceSlugs(st)}, options.ScopePattern, "workload setup")
+	if err != nil {
+		return a.fail(err)
+	}
+	workloads, err := listRemoteWorkloads(st, st.State.ControlPlane.Origin, target.ID, accessToken)
+	if err != nil {
+		return a.fail(err)
+	}
+	workload, ok := findRemoteWorkload(workloads, options.Slug)
+	workloadCreated := false
+	if !ok {
+		workload, err = createRemoteWorkload(st, st.State.ControlPlane.Origin, accessToken, target.ID, options.Slug, options.Name)
+		if err != nil {
+			return a.fail(err)
+		}
+		workloadCreated = true
+	}
+	trustOptions := workloadTrustOptions{
+		Workspace: target.Slug,
+		Workload:  workload.Slug,
+		Provider:  options.Provider,
+		Issuer:    options.Issuer,
+		Audience:  options.Audience,
+		JwksURL:   options.JwksURL,
+		Subject:   options.Subject,
+		Claims:    options.Claims,
+		ExpiresAt: options.TrustExpiresAt,
+	}
+	trust, trustCreated, err := ensureRemoteOidcTrust(st, st.State.ControlPlane.Origin, accessToken, workload.ID, trustOptions)
+	if err != nil {
+		return a.fail(err)
+	}
+	policy, policyCreated, err := ensureRemoteWorkloadPolicy(st, st.State.ControlPlane.Origin, accessToken, target.ID, workload.Slug, workloadGrantOptions{
+		ScopePattern:  scopePattern,
+		SecretPattern: options.SecretPattern,
+		Actions:       options.Actions,
+		ApprovalMode:  options.ApprovalMode,
+		ExpiresAt:     options.PolicyExpiresAt,
+	})
+	if err != nil {
+		return a.fail(err)
+	}
+	if workloadCreated {
+		fmt.Fprintf(a.Out, "✓ Created workload %s in workspace %s (%s)\n", workload.Slug, target.Slug, workload.ID)
+	} else {
+		fmt.Fprintf(a.Out, "✓ Reused workload %s in workspace %s (%s)\n", workload.Slug, target.Slug, workload.ID)
+	}
+	if trustCreated {
+		fmt.Fprintf(a.Out, "✓ Added %s OIDC trust for workload %s (audience %s, rule %s)\n", trust.Provider, workload.Slug, trust.Audience, trust.ID)
+	} else {
+		fmt.Fprintf(a.Out, "✓ Reused %s OIDC trust for workload %s (audience %s, rule %s)\n", trust.Provider, workload.Slug, trust.Audience, trust.ID)
+	}
+	if policyCreated {
+		fmt.Fprintf(a.Out, "✓ Added service policy %s for workload %s on %s/%s\n", policy.ID, workload.Slug, policy.ScopePattern, policy.SecretPattern)
+	} else {
+		fmt.Fprintf(a.Out, "✓ Reused service policy %s for workload %s on %s/%s\n", policy.ID, workload.Slug, policy.ScopePattern, policy.SecretPattern)
+	}
+	fmt.Fprintf(a.Out, "✓ Workload setup verified\n")
+	return 0
+}
+
 func (a App) workloadLogin(st *store.FileStore, args []string) int {
 	if err := st.RequireInitialized(); err != nil {
 		return a.fail(err)
@@ -784,6 +1356,227 @@ func (a App) workloadLogin(st *store.FileStore, args []string) int {
 	return 0
 }
 
+func (a App) workloadVerify(st *store.FileStore, args []string) int {
+	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	options, err := parseWorkloadVerifyArgs(args)
+	if err != nil {
+		return a.fail(err)
+	}
+	origin := options.Origin
+	if origin == "" {
+		origin = loginOrigin(nil, st)
+	}
+	if err := validateControlPlaneOrigin(origin); err != nil {
+		return a.fail(err)
+	}
+	token, err := workloadOidcToken(options.workloadLoginOptions)
+	if err != nil {
+		return a.fail(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		return a.fail(err)
+	}
+	result, err := exchangeWorkloadOidcForWorkspace(origin, options.Provider, token, options.Workspace, *device)
+	if err != nil {
+		return a.fail(err)
+	}
+	if result.WorkspaceSlug != options.Workspace {
+		return a.fail(fmt.Errorf("workload OIDC resolved workspace %s, not requested workspace %s", result.WorkspaceSlug, options.Workspace))
+	}
+	if err := st.LinkWorkloadControlPlane(origin, result.OrgID, result.WorkspaceSlug, result.UserID, result.WorkloadID, result.WorkloadSlug, result.DeviceID, device.ID, result.AccessToken, result.ExpiresIn); err != nil {
+		return a.fail(err)
+	}
+	target := remoteWorkspaceResponse{ID: result.OrgID, Slug: result.WorkspaceSlug, CurrentDeviceTrusted: boolPtr(true), CanPull: boolPtr(true), CurrentDeviceID: result.DeviceID}
+	imported, remote, _, bundle, err := a.pullOneWorkspaceWithBundle(st, result.AccessToken, target, options.Force)
+	if err != nil {
+		return a.fail(err)
+	}
+	pathTarget := workspacePathTarget{Slug: result.WorkspaceSlug, KnownSlugs: knownWorkspaceSlugs(st)}
+	verifiedSecrets, verifiedActions, err := verifyWorkloadExpectedSecrets(st, pathTarget, result.WorkloadSlug, bundle, options.ExpectedSecrets, options.RequiredActions)
+	if err != nil {
+		return a.fail(err)
+	}
+	smokeCount, err := a.verifyWorkloadSmokeEnv(st, pathTarget, result.WorkloadSlug, bundle, options.SmokeEnv)
+	if err != nil {
+		_ = st.Save()
+		return a.fail(err)
+	}
+	if smokeCount > 0 {
+		if err := st.Save(); err != nil {
+			return a.fail(err)
+		}
+	}
+	fmt.Fprintf(a.Out, "✓ Linked workload %s to workspace %s\n", result.WorkloadSlug, result.WorkspaceSlug)
+	fmt.Fprintf(a.Out, "✓ Synced %d remote secret version(s), imported %d\n", remote, imported)
+	if verifiedSecrets > 0 {
+		fmt.Fprintf(a.Out, "✓ Verified %d expected secret(s) and %d policy action(s)\n", verifiedSecrets, verifiedActions)
+	}
+	if smokeCount > 0 {
+		fmt.Fprintf(a.Out, "✓ No-output injection smoke passed for %d secret(s)\n", smokeCount)
+	}
+	return 0
+}
+
+func verifyWorkloadExpectedSecrets(st *store.FileStore, target workspacePathTarget, workload string, bundle syncBundleResponse, secrets, actions []string) (int, int, error) {
+	verifiedActions := 0
+	for _, secretPath := range secrets {
+		fullPath, err := workspacePrefixedPath(target, secretPath, "workload verify")
+		if err != nil {
+			return 0, 0, err
+		}
+		if err := requireCurrentSyncedSecret(st, bundle, fullPath, "expected"); err != nil {
+			return 0, 0, err
+		}
+		for _, action := range actions {
+			if !syncBundleAllowsWorkloadAction(bundle, workload, fullPath, action) {
+				return 0, 0, fmt.Errorf("expected workload policy missing from current sync bundle: %s cannot %s %s", workload, action, fullPath)
+			}
+			allowed, reason := st.CheckPolicy(workload, fullPath, action)
+			if !allowed {
+				return 0, 0, fmt.Errorf("expected workload policy missing: %s cannot %s %s (%s)", workload, action, fullPath, reason)
+			}
+			verifiedActions++
+		}
+	}
+	return len(secrets), verifiedActions, nil
+}
+
+func syncBundleSecret(bundle syncBundleResponse, fullPath string) (store.RemoteSecretVersion, bool) {
+	scope, name, err := store.ParseSecretPath(fullPath)
+	if err != nil {
+		return store.RemoteSecretVersion{}, false
+	}
+	for _, secret := range bundle.EncryptedSecrets {
+		if secret.Scope == scope && secret.Name == name && (secret.Status == "" || secret.Status == "active") {
+			return secret, true
+		}
+	}
+	return store.RemoteSecretVersion{}, false
+}
+
+func syncBundleAllowsWorkloadAction(bundle syncBundleResponse, workload, fullPath, action string) bool {
+	scope, name, err := store.ParseSecretPath(fullPath)
+	if err != nil {
+		return false
+	}
+	now := time.Now().UTC()
+	for _, policy := range bundle.Policies {
+		if policy.SubjectType != "service" || store.NormalizeSubjectLabel(policy.SubjectID) != workload || policy.ApprovalMode != "none" {
+			continue
+		}
+		if policy.ExpiresAt != nil && !policy.ExpiresAt.After(now) {
+			continue
+		}
+		if store.MatchPattern(policy.ScopePattern, scope) && store.MatchPattern(policy.SecretPattern, name) && containsStringSet(policy.Actions, []string{action}) {
+			return true
+		}
+	}
+	return false
+}
+
+func requireLocalActiveSecretMetadata(st *store.FileStore, fullPath string) error {
+	secret, err := st.SecretMetadata(fullPath)
+	if err != nil {
+		return err
+	}
+	for _, version := range secret.Versions {
+		if version.Version == secret.ActiveVersion && version.Status == "active" {
+			return nil
+		}
+	}
+	return fmt.Errorf("secret %s has no active version", fullPath)
+}
+
+func requireCurrentSyncedSecret(st *store.FileStore, bundle syncBundleResponse, fullPath, label string) error {
+	remote, ok := syncBundleSecret(bundle, fullPath)
+	if !ok {
+		return fmt.Errorf("%s secret %s was not present in the current workload sync bundle", label, fullPath)
+	}
+	secret, err := st.SecretMetadata(fullPath)
+	if err != nil {
+		return err
+	}
+	for _, version := range secret.Versions {
+		if version.Version != secret.ActiveVersion || version.Status != "active" {
+			continue
+		}
+		if version.Version == remote.Version && version.AAD == remote.AAD && version.Ciphertext == remote.Ciphertext {
+			return nil
+		}
+		return fmt.Errorf("%s secret %s did not match the current workload sync bundle", label, fullPath)
+	}
+	return fmt.Errorf("secret %s has no active version", fullPath)
+}
+
+func (a App) verifyWorkloadSmokeEnv(st *store.FileStore, target workspacePathTarget, workload string, bundle syncBundleResponse, mappings []workloadVerifySmokeEnv) (int, error) {
+	if len(mappings) == 0 {
+		return 0, nil
+	}
+	env := []string{}
+	names := make([]string, 0, len(mappings))
+	for _, mapping := range mappings {
+		fullPath, err := workspacePrefixedPath(target, mapping.SecretPath, "workload verify")
+		if err != nil {
+			return 0, err
+		}
+		if err := requireCurrentSyncedSecret(st, bundle, fullPath, "smoke"); err != nil {
+			return 0, err
+		}
+		if !syncBundleAllowsWorkloadAction(bundle, workload, fullPath, "inject") {
+			return 0, fmt.Errorf("expected workload policy missing from current sync bundle: %s cannot inject %s", workload, fullPath)
+		}
+		allowed, reason := st.CheckPolicy(workload, fullPath, "inject")
+		if !allowed {
+			a.auditDeniedSecretUse(st, workload, "service", fullPath, reason)
+			return 0, fmt.Errorf("%s: %s cannot inject %s", reason, workload, fullPath)
+		}
+		value, secret, err := st.GetSecret(fullPath)
+		if err != nil {
+			return 0, err
+		}
+		env = append(env, mapping.Name+"="+value)
+		names = append(names, mapping.Name)
+		st.Audit(workload, "secret_injected", "allowed", secret.Scope, secret.NameHash, "workload verify smoke", runtimeAuditMetadata(st, secret.Scope, workload, "service", map[string]string{"mode": "verify"}))
+	}
+	if err := runNoOutputEnvSmoke(env, names); err != nil {
+		return 0, err
+	}
+	return len(mappings), nil
+}
+
+func runNoOutputEnvSmoke(env []string, names []string) error {
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	command := exec.Command(executable, append([]string{"__workload-verify-env-smoke"}, names...)...)
+	command.Env = env
+	command.Stdout = io.Discard
+	command.Stderr = io.Discard
+	if err := command.Run(); err != nil {
+		return fmt.Errorf("no-output injection smoke failed: %w", err)
+	}
+	return nil
+}
+
+func workloadVerifyEnvSmokeHelper(names []string) int {
+	if len(names) == 0 {
+		return 1
+	}
+	for _, name := range names {
+		if !envNamePattern.MatchString(name) {
+			return 1
+		}
+		if _, ok := os.LookupEnv(name); !ok {
+			return 1
+		}
+	}
+	return 0
+}
+
 func workloadOidcToken(options workloadLoginOptions) (string, error) {
 	if options.Token != "" {
 		return strings.TrimSpace(options.Token), nil
@@ -805,6 +1598,10 @@ func workloadOidcToken(options workloadLoginOptions) (string, error) {
 }
 
 func githubActionsOidcToken(audience string) (string, error) {
+	return githubActionsOidcTokenWithClient(audience, &http.Client{Timeout: githubActionsOidcTokenTimeout})
+}
+
+func githubActionsOidcTokenWithClient(audience string, client *http.Client) (string, error) {
 	requestURL := os.Getenv("ACTIONS_ID_TOKEN_REQUEST_URL")
 	requestToken := os.Getenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
 	if requestURL == "" || requestToken == "" {
@@ -824,7 +1621,7 @@ func githubActionsOidcToken(audience string) (string, error) {
 		return "", err
 	}
 	request.Header.Set("authorization", "Bearer "+requestToken)
-	response, err := http.DefaultClient.Do(request)
+	response, err := client.Do(request)
 	if err != nil {
 		return "", err
 	}
@@ -1656,21 +2453,26 @@ func (a App) pull(st *store.FileStore, args []string) int {
 }
 
 func (a App) pullOneWorkspace(st *store.FileStore, accessToken string, workspace remoteWorkspaceResponse, force bool) (int, int, string, error) {
+	imported, remote, nextToken, _, err := a.pullOneWorkspaceWithBundle(st, accessToken, workspace, force)
+	return imported, remote, nextToken, err
+}
+
+func (a App) pullOneWorkspaceWithBundle(st *store.FileStore, accessToken string, workspace remoteWorkspaceResponse, force bool) (int, int, string, syncBundleResponse, error) {
 	nextToken := ""
 	if workspace.ID != st.State.ControlPlane.WorkspaceID {
 		if st.State.ControlPlane.Source == "oidc" {
-			return 0, 0, "", errors.New("OIDC workload sessions cannot switch workspace")
+			return 0, 0, "", syncBundleResponse{}, errors.New("OIDC workload sessions cannot switch workspace")
 		}
 		device, err := st.ActiveDevice()
 		if err != nil {
-			return 0, 0, "", err
+			return 0, 0, "", syncBundleResponse{}, err
 		}
 		result, err := switchRemoteWorkspace(st, st.State.ControlPlane.Origin, accessToken, workspace.ID, *device)
 		if err != nil {
-			return 0, 0, "", err
+			return 0, 0, "", syncBundleResponse{}, err
 		}
 		if err := st.LinkControlPlaneForDevice(st.State.ControlPlane.Origin, result.OrgID, result.WorkspaceSlug, result.UserID, result.DeviceID, device.ID, result.AccessToken, result.RefreshToken, result.ExpiresIn, result.RefreshExpiresAt); err != nil {
-			return 0, 0, "", err
+			return 0, 0, "", syncBundleResponse{}, err
 		}
 		nextToken = result.AccessToken
 		accessToken = result.AccessToken
@@ -1678,25 +2480,25 @@ func (a App) pullOneWorkspace(st *store.FileStore, accessToken string, workspace
 	var bundle syncBundleResponse
 	endpoint := fmt.Sprintf("%s/v1/sync?orgId=%s&deviceId=%s", strings.TrimRight(st.State.ControlPlane.Origin, "/"), url.QueryEscape(st.State.ControlPlane.WorkspaceID), url.QueryEscape(st.State.ControlPlane.DeviceID))
 	if err := getJSONBearer(st, endpoint, accessToken, &bundle); err != nil {
-		return 0, 0, nextToken, err
+		return 0, 0, nextToken, bundle, err
 	}
 	imported, err := a.importRemoteVersions(st, bundle.EncryptedSecrets, force)
 	if err != nil {
 		var partial *store.RemoteImportPartialError
 		if !errors.As(err, &partial) {
-			return 0, 0, nextToken, err
+			return 0, 0, nextToken, bundle, err
 		}
 		if imported == 0 {
-			return 0, 0, nextToken, err
+			return 0, 0, nextToken, bundle, err
 		}
 		fmt.Fprintf(a.Err, "Warning: %s\n", partial.Error())
 	}
 	importWorkloadSyncPolicies(st, bundle.Policies)
 	st.Audit(st.State.UserID, "control_plane_sync", "allowed", "", "", "fetched encrypted pull bundle", map[string]string{"secrets": fmt.Sprintf("%d", len(bundle.EncryptedSecrets)), "workspace": st.State.ControlPlane.WorkspaceSlug})
 	if err := st.Save(); err != nil {
-		return 0, 0, nextToken, err
+		return 0, 0, nextToken, bundle, err
 	}
-	return imported, len(bundle.EncryptedSecrets), nextToken, nil
+	return imported, len(bundle.EncryptedSecrets), nextToken, bundle, nil
 }
 
 type pullOptions struct {
@@ -4714,6 +5516,26 @@ type remoteOidcTrustResponse struct {
 	ExpiresAt  string            `json:"expiresAt"`
 }
 
+type remoteOidcTrustsResponse struct {
+	Trusts []remoteOidcTrustResponse `json:"trusts"`
+}
+
+type remotePolicyResponse struct {
+	ID            string   `json:"id"`
+	OrgID         string   `json:"orgId"`
+	SubjectType   string   `json:"subjectType"`
+	SubjectID     string   `json:"subjectId"`
+	ScopePattern  string   `json:"scopePattern"`
+	SecretPattern string   `json:"secretPattern"`
+	Actions       []string `json:"actions"`
+	ApprovalMode  string   `json:"approvalMode"`
+	ExpiresAt     string   `json:"expiresAt"`
+}
+
+type remotePoliciesResponse struct {
+	Policies []remotePolicyResponse `json:"policies"`
+}
+
 type writeOptionsResponse struct {
 	RequestedWorkspaceSlug string                 `json:"requestedWorkspaceSlug"`
 	SourceWorkspace        *writeWorkspaceOption  `json:"sourceWorkspace"`
@@ -4848,6 +5670,10 @@ func startDeviceCodeLogin(origin, workspaceSlug string, device asiri.Device) (de
 }
 
 func exchangeWorkloadOidc(origin, provider, token string, device asiri.Device) (deviceCodeTokenResponse, error) {
+	return exchangeWorkloadOidcForWorkspace(origin, provider, token, "", device)
+}
+
+func exchangeWorkloadOidcForWorkspace(origin, provider, token, expectedWorkspaceSlug string, device asiri.Device) (deviceCodeTokenResponse, error) {
 	body := map[string]string{
 		"provider":            provider,
 		"token":               token,
@@ -4855,6 +5681,9 @@ func exchangeWorkloadOidc(origin, provider, token string, device asiri.Device) (
 		"kind":                string(device.Kind),
 		"encryptionPublicKey": device.EncryptionPublicKey,
 		"signingPublicKey":    device.SigningPublicKey,
+	}
+	if expectedWorkspaceSlug != "" {
+		body["expectedWorkspaceSlug"] = expectedWorkspaceSlug
 	}
 	var result deviceCodeTokenResponse
 	if err := postJSON(strings.TrimRight(origin, "/")+"/v1/workload/oidc/token", body, &result); err != nil {
@@ -5028,6 +5857,157 @@ func createRemoteOidcTrust(st *store.FileStore, origin, accessToken, workloadID 
 		return result, errors.New("control plane created OIDC trust without metadata")
 	}
 	return result, nil
+}
+
+func listRemoteOidcTrusts(st *store.FileStore, origin, accessToken, workloadID string) ([]remoteOidcTrustResponse, error) {
+	var result remoteOidcTrustsResponse
+	endpoint := fmt.Sprintf("%s/v1/workloads/%s/oidc-trusts", strings.TrimRight(origin, "/"), url.PathEscape(workloadID))
+	if err := getJSONBearer(st, endpoint, accessToken, &result); err != nil {
+		return nil, err
+	}
+	return result.Trusts, nil
+}
+
+func ensureRemoteOidcTrust(st *store.FileStore, origin, accessToken, workloadID string, options workloadTrustOptions) (remoteOidcTrustResponse, bool, error) {
+	trusts, err := listRemoteOidcTrusts(st, origin, accessToken, workloadID)
+	if err != nil {
+		return remoteOidcTrustResponse{}, false, err
+	}
+	if trust, ok := findMatchingRemoteOidcTrust(trusts, options); ok {
+		return trust, false, nil
+	}
+	trust, err := createRemoteOidcTrust(st, origin, accessToken, workloadID, options)
+	return trust, true, err
+}
+
+func findMatchingRemoteOidcTrust(trusts []remoteOidcTrustResponse, options workloadTrustOptions) (remoteOidcTrustResponse, bool) {
+	expectedJwksURL := options.JwksURL
+	if expectedJwksURL == "" && options.Provider == "github" {
+		expectedJwksURL = "https://token.actions.githubusercontent.com/.well-known/jwks"
+	}
+	for _, trust := range trusts {
+		if trust.Provider == options.Provider &&
+			trust.Issuer == options.Issuer &&
+			trust.Audience == options.Audience &&
+			trust.JwksURL == expectedJwksURL &&
+			trust.Subject == options.Subject &&
+			normalizeTimestampForCompare(trust.ExpiresAt) == normalizeTimestampForCompare(options.ExpiresAt) &&
+			stringMapsEqual(trust.Claims, options.Claims) {
+			return trust, true
+		}
+	}
+	return remoteOidcTrustResponse{}, false
+}
+
+func requireRemoteWorkload(st *store.FileStore, origin, orgID, accessToken, workloadValue string) (remoteWorkloadResponse, error) {
+	workloads, err := listRemoteWorkloads(st, origin, orgID, accessToken)
+	if err != nil {
+		return remoteWorkloadResponse{}, err
+	}
+	workload, ok := findRemoteWorkload(workloads, workloadValue)
+	if !ok {
+		return remoteWorkloadResponse{}, fmt.Errorf("workload %s is not visible", workloadValue)
+	}
+	return workload, nil
+}
+
+func listRemotePolicies(st *store.FileStore, origin, orgID, accessToken string) ([]remotePolicyResponse, error) {
+	var result remotePoliciesResponse
+	endpoint := fmt.Sprintf("%s/v1/policies?orgId=%s", strings.TrimRight(origin, "/"), url.QueryEscape(orgID))
+	if err := getJSONBearer(st, endpoint, accessToken, &result); err != nil {
+		return nil, err
+	}
+	return result.Policies, nil
+}
+
+func createRemotePolicy(st *store.FileStore, origin, accessToken, orgID, workloadSlug string, options workloadGrantOptions) (remotePolicyResponse, error) {
+	var result remotePolicyResponse
+	body := map[string]any{
+		"orgId":         orgID,
+		"subjectType":   "service",
+		"subjectId":     workloadSlug,
+		"scopePattern":  options.ScopePattern,
+		"secretPattern": options.SecretPattern,
+		"actions":       options.Actions,
+		"approvalMode":  options.ApprovalMode,
+	}
+	if options.ExpiresAt != "" {
+		body["expiresAt"] = options.ExpiresAt
+	}
+	if err := postJSONBearer(st, strings.TrimRight(origin, "/")+"/v1/policies", accessToken, body, &result); err != nil {
+		return result, err
+	}
+	if result.ID == "" {
+		return result, errors.New("control plane created policy without metadata")
+	}
+	return result, nil
+}
+
+func ensureRemoteWorkloadPolicy(st *store.FileStore, origin, accessToken, orgID, workloadSlug string, options workloadGrantOptions) (remotePolicyResponse, bool, error) {
+	policies, err := listRemotePolicies(st, origin, orgID, accessToken)
+	if err != nil {
+		return remotePolicyResponse{}, false, err
+	}
+	if policy, ok := findMatchingRemoteWorkloadPolicy(policies, workloadSlug, options); ok {
+		return policy, false, nil
+	}
+	policy, err := createRemotePolicy(st, origin, accessToken, orgID, workloadSlug, options)
+	return policy, true, err
+}
+
+func findMatchingRemoteWorkloadPolicy(policies []remotePolicyResponse, workloadSlug string, options workloadGrantOptions) (remotePolicyResponse, bool) {
+	for _, policy := range policies {
+		if policy.SubjectType == "service" &&
+			policy.SubjectID == workloadSlug &&
+			policy.ScopePattern == options.ScopePattern &&
+			policy.SecretPattern == options.SecretPattern &&
+			policy.ApprovalMode == options.ApprovalMode &&
+			normalizeTimestampForCompare(policy.ExpiresAt) == normalizeTimestampForCompare(options.ExpiresAt) &&
+			sameStringSet(policy.Actions, options.Actions) {
+			return policy, true
+		}
+	}
+	return remotePolicyResponse{}, false
+}
+
+func sameStringSet(left, right []string) bool {
+	return containsStringSet(left, right) && containsStringSet(right, left)
+}
+
+func containsStringSet(available, required []string) bool {
+	availableSet := map[string]bool{}
+	for _, value := range available {
+		availableSet[value] = true
+	}
+	for _, value := range required {
+		if !availableSet[value] {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeTimestampForCompare(value string) string {
+	if value == "" {
+		return ""
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return value
+	}
+	return parsed.UTC().Format(time.RFC3339Nano)
+}
+
+func stringMapsEqual(left, right map[string]string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, leftValue := range left {
+		if right[key] != leftValue {
+			return false
+		}
+	}
+	return true
 }
 
 func requireRemoteWorkspace(workspaces []remoteWorkspaceResponse, requested string) (remoteWorkspaceResponse, error) {
