@@ -1,6 +1,6 @@
 ---
 name: asiri
-description: "Use when an agent needs to operate Asiri CLI or Asiri-managed secrets: inspect secret metadata, run commands with scoped secrets, add or rotate operational secrets, grant local runtime access, push or pull encrypted records, or diagnose Asiri workspace/device state without exposing secret values. Focus on safe operational use first; use trust, recovery, rekey, revocation, and workload setup only when explicitly requested."
+description: "Use when an agent needs to operate Asiri CLI or Asiri-managed secrets: inspect secret metadata, run commands with scoped secrets, add or rotate operational secrets, grant local runtime access, push or pull encrypted records, verify workload/OIDC CI access, or diagnose Asiri workspace/device state without exposing secret values. Focus on safe operational use first; use trust, recovery, rekey, revocation, workload setup, and remote policy changes only when explicitly requested."
 ---
 
 # Asiri
@@ -136,6 +136,30 @@ Use rewrap only when the user explicitly wants trusted devices or recovery recip
 asiri rewrap --workspace <workspace>
 ```
 
+## Workloads And CI
+
+Use workload/OIDC for CI and servers instead of long-lived shared tokens. Keep the setup and verification phases separate.
+
+Only create or configure workloads from a real authenticated user-device session:
+
+```sh
+asiri workload setup --workspace <workspace> --slug <workload> --name <name> --provider github --issuer https://token.actions.githubusercontent.com --audience asiri --subject <sub> --scope <scope> --secret <pattern> --inject-only
+```
+
+This is a remote control-plane mutation. Run it only when the user explicitly asked to create or update the workload, OIDC trust, or remote service policy. Do not run it from workload/OIDC sessions.
+
+In GitHub Actions, use isolated local state, let the CLI fetch the live Actions OIDC token from the runner environment, and verify without printing values:
+
+```sh
+export ASIRI_HOME="$RUNNER_TEMP/asiri-home"
+asiri init --device gha-runner
+asiri workload verify --origin <origin> --workspace <workspace> --audience asiri --expect-secret <scope/SECRET_NAME> --action inject --smoke-env ASIRI_VERIFY_SECRET=<scope/SECRET_NAME>
+```
+
+`workload verify` should exchange OIDC, sync as the workload, confirm the expected secret and policy are present in the current sync bundle, and optionally run a no-output injection smoke check. Prefer this over `workload login` plus ad hoc `pull`/`env` checks.
+
+Avoid passing raw OIDC tokens with `--token`; use the GitHub Actions OIDC environment or `--token-file` only for controlled tests.
+
 ## Stop And Ask
 
 Stop before running any of these unless the user directly requested that exact operation:
@@ -143,6 +167,7 @@ Stop before running any of these unless the user directly requested that exact o
 - `asiri init` on an existing install.
 - `asiri login --force`.
 - `asiri device trust`, `asiri device revoke`, or dashboard trust changes.
+- `asiri workload create`, `asiri workload trust`, `asiri workload grant`, or `asiri workload setup`.
 - `asiri recovery setup`, `asiri recovery restore`, or recovery key handling.
 - `asiri rekey`.
 - Deleting or editing local Asiri state, keychain entries, or keyring material.
