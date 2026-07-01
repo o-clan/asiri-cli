@@ -168,7 +168,7 @@ func TestTrustedCLIConfiguresWorkloadOIDC(t *testing.T) {
 				if r.URL.Query().Get("orgId") != "org_setup" {
 					t.Fatalf("unexpected workload list org: %s", r.URL.RawQuery)
 				}
-				if r.Header.Get("authorization") != "Bearer at_setup" || r.Header.Get("x-asiri-device") != "dev_remote" || r.Header.Get("x-asiri-signature") == "" {
+				if r.Header.Get("authorization") != "Bearer at_cached" || r.Header.Get("x-asiri-device") != "dev_remote" || r.Header.Get("x-asiri-signature") == "" {
 					t.Fatalf("workload list missing signed trusted session: auth=%s device=%s", r.Header.Get("authorization"), r.Header.Get("x-asiri-device"))
 				}
 				_ = json.NewEncoder(w).Encode(map[string]any{"workloads": []map[string]any{{
@@ -186,7 +186,7 @@ func TestTrustedCLIConfiguresWorkloadOIDC(t *testing.T) {
 				return
 			}
 			createSeen = true
-			if r.Header.Get("authorization") != "Bearer at_setup" || r.Header.Get("x-asiri-device") != "dev_remote" || r.Header.Get("x-asiri-signature") == "" {
+			if r.Header.Get("authorization") != "Bearer at_cached" || r.Header.Get("x-asiri-device") != "dev_remote" || r.Header.Get("x-asiri-signature") == "" {
 				t.Fatalf("workload create missing signed trusted session: auth=%s device=%s", r.Header.Get("authorization"), r.Header.Get("x-asiri-device"))
 			}
 			var body map[string]string
@@ -211,7 +211,7 @@ func TestTrustedCLIConfiguresWorkloadOIDC(t *testing.T) {
 				http.NotFound(w, r)
 				return
 			}
-			if r.Header.Get("authorization") != "Bearer at_setup" || r.Header.Get("x-asiri-device") != "dev_remote" || r.Header.Get("x-asiri-signature") == "" {
+			if r.Header.Get("authorization") != "Bearer at_cached" || r.Header.Get("x-asiri-device") != "dev_remote" || r.Header.Get("x-asiri-signature") == "" {
 				t.Fatalf("workload trust missing signed trusted session: auth=%s device=%s", r.Header.Get("authorization"), r.Header.Get("x-asiri-device"))
 			}
 			var body struct {
@@ -279,7 +279,7 @@ func TestTrustedCLIConfiguresWorkloadOIDC(t *testing.T) {
 	if code := app.Run([]string{"workload", "trust", "--workspace", "prod", "--workload", "prod-api", "--provider", "generic", "--issuer", "https://issuer.example.test", "--audience", "asiri-runtime", "--jwks-url", "https://issuer.example.test/jwks", "--subject", "repo:o-clan/asiri:ref:refs/heads/main", "--claim", "repository=o-clan/asiri"}); code != 0 {
 		t.Fatalf("workload trust failed: %s", errb.String())
 	}
-	if refreshes < 2 || !trustSeen || !strings.Contains(out.String(), "Added generic OIDC trust") {
+	if refreshes != 0 || !trustSeen || !strings.Contains(out.String(), "Added generic OIDC trust") {
 		t.Fatalf("workload trust did not complete as expected, refreshes=%d seen=%v output=%s", refreshes, trustSeen, out.String())
 	}
 }
@@ -329,7 +329,7 @@ func TestSetupDoctorReportsTrustedDeviceNextSteps(t *testing.T) {
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
 		case "/v1/orgs":
-			if r.Header.Get("authorization") != "Bearer at_doctor" || r.Header.Get("x-asiri-device") != "dev_remote" || r.Header.Get("x-asiri-signature") == "" {
+			if r.Header.Get("authorization") != "Bearer at_cached" || r.Header.Get("x-asiri-device") != "dev_remote" || r.Header.Get("x-asiri-signature") == "" {
 				t.Fatalf("workspace list missing signed trusted session: auth=%s device=%s", r.Header.Get("authorization"), r.Header.Get("x-asiri-device"))
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -734,7 +734,7 @@ func TestDeviceNamePrintsActiveLocalDevice(t *testing.T) {
 	}
 }
 
-func TestWhoamiShowsControlPlaneUserDetails(t *testing.T) {
+func TestWhoamiUsesFreshCachedControlPlaneToken(t *testing.T) {
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")
 	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
@@ -742,34 +742,18 @@ func TestWhoamiShowsControlPlaneUserDetails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	refreshSeen := false
+	refreshCalls := 0
 	whoamiSeen := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "application/json")
 		switch r.URL.Path {
 		case "/v1/auth/session/refresh":
-			refreshSeen = true
-			var body map[string]string
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				t.Fatal(err)
-			}
-			if body["refreshToken"] != "rt_cached" {
-				t.Fatalf("unexpected refresh body: %#v", body)
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"status":           "approved",
-				"orgId":            "org_remote",
-				"workspaceSlug":    "oclan-co",
-				"userId":           "usr_owner",
-				"deviceId":         "dev_remote",
-				"accessToken":      "at_whoami",
-				"expiresIn":        3600,
-				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
-			})
+			refreshCalls++
+			http.Error(w, "unexpected refresh", http.StatusInternalServerError)
 		case "/v1/whoami":
 			whoamiSeen = true
-			if r.Header.Get("authorization") != "Bearer at_whoami" || r.Header.Get("x-asiri-device") != "dev_remote" || r.Header.Get("x-asiri-signature") == "" {
-				t.Fatalf("whoami request missing signed refreshed session: auth=%s device=%s", r.Header.Get("authorization"), r.Header.Get("x-asiri-device"))
+			if r.Header.Get("authorization") != "Bearer at_cached" || r.Header.Get("x-asiri-device") != "dev_remote" || r.Header.Get("x-asiri-signature") == "" {
+				t.Fatalf("whoami request missing signed cached session: auth=%s device=%s", r.Header.Get("authorization"), r.Header.Get("x-asiri-device"))
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"user": map[string]any{
@@ -825,14 +809,178 @@ func TestWhoamiShowsControlPlaneUserDetails(t *testing.T) {
 	if code := app.Run([]string{"whoami"}); code != 0 {
 		t.Fatalf("whoami failed: %s", errb.String())
 	}
-	if !refreshSeen || !whoamiSeen {
-		t.Fatalf("expected refresh and whoami endpoints, refresh=%v whoami=%v", refreshSeen, whoamiSeen)
+	if refreshCalls != 0 || !whoamiSeen {
+		t.Fatalf("expected cached whoami without refresh, refreshes=%d whoami=%v", refreshCalls, whoamiSeen)
 	}
 	got := out.String()
 	for _, expected := range []string{"peter@example.com", "Peter Owner", "oclan-co", "LOCAL DEVICE", "qa-laptop", "REMOTE DEVICE", "dev_remote"} {
 		if !strings.Contains(got, expected) {
 			t.Fatalf("whoami output missing %q: %s", expected, got)
 		}
+	}
+}
+
+func TestEnsureControlPlaneAccessRefreshesNearExpiryToken(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	refreshSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		if r.URL.Path != "/v1/auth/session/refresh" {
+			http.NotFound(w, r)
+			return
+		}
+		refreshSeen = true
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body["refreshToken"] != "rt_cached" {
+			t.Fatalf("unexpected refresh body: %#v", body)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":           "approved",
+			"orgId":            "org_remote",
+			"workspaceSlug":    "oclan-co",
+			"userId":           "usr_owner",
+			"deviceId":         "dev_remote",
+			"accessToken":      "at_refreshed",
+			"expiresIn":        3600,
+			"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+		})
+	}))
+	defer server.Close()
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkControlPlaneForDevice(server.URL, "org_remote", "oclan-co", "usr_owner", "dev_remote", device.ID, "at_cached", "rt_cached", 30, time.Now().UTC().Add(7*24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+
+	token, err := ensureControlPlaneAccess(server.URL, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "at_refreshed" || !refreshSeen {
+		t.Fatalf("expected near-expiry token refresh, token=%q refresh=%v", token, refreshSeen)
+	}
+	stored, err := st.ControlPlaneAccessToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored != "at_refreshed" {
+		t.Fatalf("expected refreshed token to be stored, got %q", stored)
+	}
+}
+
+func TestBearerUnauthorizedRefreshesFreshCachedToken(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	whoamiCalls := 0
+	refreshCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/session/refresh":
+			refreshCalls++
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["refreshToken"] != "rt_cached" {
+				t.Fatalf("unexpected refresh body: %#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_remote",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_remote",
+				"accessToken":      "at_refreshed",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/whoami":
+			whoamiCalls++
+			if whoamiCalls == 1 {
+				if r.Header.Get("authorization") != "Bearer at_cached" {
+					t.Fatalf("unexpected first whoami auth: %s", r.Header.Get("authorization"))
+				}
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": "not_authenticated"})
+				return
+			}
+			if r.Header.Get("authorization") != "Bearer at_refreshed" || r.Header.Get("x-asiri-device") != "dev_remote" || r.Header.Get("x-asiri-signature") == "" {
+				t.Fatalf("whoami retry missing signed refreshed session: auth=%s device=%s", r.Header.Get("authorization"), r.Header.Get("x-asiri-device"))
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"user": map[string]any{"email": "peter@example.com", "displayName": "Peter Owner"},
+				"workspace": map[string]any{
+					"id": "org_remote", "slug": "oclan-co", "role": "owner", "deviceStatus": "trusted",
+				},
+				"device":  map[string]any{"id": "dev_remote", "name": "qa-laptop", "kind": "laptop", "status": "trusted"},
+				"session": map[string]any{"source": "device-code", "status": "active"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkControlPlaneForDevice(server.URL, "org_remote", "oclan-co", "usr_owner", "dev_remote", device.ID, "at_cached", "rt_cached", 3600, time.Now().UTC().Add(7*24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := app.Run([]string{"whoami"}); code != 0 {
+		t.Fatalf("whoami failed after refresh retry: %s", errb.String())
+	}
+	if refreshCalls != 1 || whoamiCalls != 2 {
+		t.Fatalf("expected one refresh retry, refresh=%d whoami=%d", refreshCalls, whoamiCalls)
+	}
+	st, err = store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := st.ControlPlaneAccessToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored != "at_refreshed" {
+		t.Fatalf("expected refreshed access token to be stored, got %q", stored)
 	}
 }
 
@@ -1509,6 +1657,14 @@ func TestRemoteRevocationClearsLocalKeyMaterial(t *testing.T) {
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
 		case "/v1/auth/session/refresh":
+			revoked = true
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "device_not_trusted"})
+		case "/v1/orgs":
+			revoked = true
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "request_failed", "message": "device not trusted"})
+		case "/v1/sync":
 			revoked = true
 			w.WriteHeader(http.StatusForbidden)
 			_ = json.NewEncoder(w).Encode(map[string]any{"error": "device_not_trusted"})
@@ -5429,7 +5585,7 @@ func TestPullAllPrintsRowsSkipsIneligibleAndRestoresWorkspace(t *testing.T) {
 			})
 		case "/v1/orgs":
 			auth := r.Header.Get("authorization")
-			if auth != "Bearer at_oclan_refreshed" && auth != "Bearer at_oclan_refreshed2" {
+			if auth != "Bearer at_oclan" && auth != "Bearer at_oclan2" && auth != "Bearer at_recall" {
 				t.Fatalf("unexpected org list auth header: %s", auth)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -5448,7 +5604,7 @@ func TestPullAllPrintsRowsSkipsIneligibleAndRestoresWorkspace(t *testing.T) {
 			switch body["workspace"] {
 			case "org_recall":
 				switchRecallSeen = true
-				if r.Header.Get("authorization") != "Bearer at_oclan_refreshed" {
+				if r.Header.Get("authorization") != "Bearer at_oclan" {
 					t.Fatalf("unexpected recall switch auth header: %s", r.Header.Get("authorization"))
 				}
 				_ = json.NewEncoder(w).Encode(map[string]any{
@@ -5489,7 +5645,7 @@ func TestPullAllPrintsRowsSkipsIneligibleAndRestoresWorkspace(t *testing.T) {
 			orgID := r.URL.Query().Get("orgId")
 			deviceID := r.URL.Query().Get("deviceId")
 			if orgID == "org_oclan" {
-				if auth != "Bearer at_oclan_refreshed" || deviceID != "dev_oclan" {
+				if auth != "Bearer at_oclan" || deviceID != "dev_oclan" {
 					t.Fatalf("unexpected active sync request auth=%s query=%s", auth, r.URL.RawQuery)
 				}
 			} else if orgID == "org_recall" {

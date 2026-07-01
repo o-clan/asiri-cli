@@ -5347,11 +5347,24 @@ func ensureControlPlaneAccess(origin string, st *store.FileStore) (string, error
 		}
 		return "", errors.New("OIDC workload session expired; run workload login again")
 	}
+	if cacheFresh {
+		return cached, nil
+	}
+	return refreshControlPlaneAccess(origin, st)
+}
+
+func refreshControlPlaneAccess(origin string, st *store.FileStore) (string, error) {
+	if st.State.ControlPlane == nil {
+		return "", errors.New("asiri is not linked to a control plane")
+	}
+	if err := validateControlPlaneOrigin(origin); err != nil {
+		return "", err
+	}
+	if st.State.ControlPlane.Source == "oidc" {
+		return "", errors.New("OIDC workload session expired; run workload login again")
+	}
 	result, status, err := refreshDeviceSession(origin, st)
 	if err != nil {
-		if cacheFresh {
-			return cached, nil
-		}
 		return "", err
 	}
 	if remoteDeviceNotTrusted(status, result.Error) {
@@ -5361,9 +5374,6 @@ func ensureControlPlaneAccess(origin string, st *store.FileStore) (string, error
 		return "", errors.New("remote device is no longer trusted; local key material was cleared")
 	}
 	if status != http.StatusOK {
-		if cacheFresh && status >= 500 {
-			return cached, nil
-		}
 		return "", fmt.Errorf("control plane returned HTTP %d", status)
 	}
 	if err := st.RefreshControlPlane(result.AccessToken, result.ExpiresIn, result.RefreshExpiresAt); err != nil {
@@ -5386,8 +5396,40 @@ func rejectWorkloadLocalMutation(st *store.FileStore) error {
 	return nil
 }
 
-func remoteDeviceNotTrusted(status int, errorCode string) bool {
-	return status == http.StatusForbidden && errorCode == "device_not_trusted"
+func remoteDeviceNotTrusted(status int, values ...string) bool {
+	if status != http.StatusForbidden {
+		return false
+	}
+	for _, value := range values {
+		normalized := strings.ToLower(strings.TrimSpace(value))
+		if normalized == "device_not_trusted" || normalized == "device not trusted" || normalized == "device is not trusted" {
+			return true
+		}
+	}
+	return false
+}
+
+type controlPlaneFailureResponse struct {
+	Error   string `json:"error"`
+	Message string `json:"message"`
+}
+
+func parseControlPlaneFailure(responseBody []byte) controlPlaneFailureResponse {
+	var failure controlPlaneFailureResponse
+	if len(bytes.TrimSpace(responseBody)) > 0 {
+		_ = json.Unmarshal(responseBody, &failure)
+	}
+	return failure
+}
+
+func cleanupRemoteDeviceNotTrusted(st *store.FileStore, status int, errorCode, message string) error {
+	if !remoteDeviceNotTrusted(status, errorCode, message) {
+		return nil
+	}
+	if err := st.QuarantineLocalKeys("remote device is no longer trusted"); err != nil {
+		return fmt.Errorf("remote device is no longer trusted, but local key cleanup failed: %w", err)
+	}
+	return errors.New("remote device is no longer trusted; local key material was cleared")
 }
 
 func revokeRemoteDevice(st *store.FileStore, origin, deviceID, accessToken string) (remoteDeviceResponse, error) {
@@ -5810,46 +5852,44 @@ func postJSONBearerStatusWithClient(st *store.FileStore, client *http.Client, ur
 	if err != nil {
 		return 0, err
 	}
+	status, responseBody, err := sendPostJSONBearer(st, client, url, bearer, encoded)
+	if err != nil {
+		return status, err
+	}
+	if status == http.StatusUnauthorized {
+		if refreshed, ok, err := refreshBearerAfterUnauthorized(st, bearer); err != nil {
+			return status, err
+		} else if ok {
+			status, responseBody, err = sendPostJSONBearer(st, client, url, refreshed, encoded)
+			if err != nil {
+				return status, err
+			}
+		}
+	}
+	return decodeBearerResponse(status, responseBody, out, st)
+}
+
+func sendPostJSONBearer(st *store.FileStore, client *http.Client, url, bearer string, encoded []byte) (int, []byte, error) {
 	request, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(encoded))
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	request.Header.Set("content-type", "application/json")
 	request.Header.Set("accept", "application/json")
 	request.Header.Set("authorization", "Bearer "+bearer)
 	if err := signBearerRequest(st, request, encoded, bearer); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	defer response.Body.Close()
 	responseBody, err := io.ReadAll(response.Body)
 	if err != nil {
-		return response.StatusCode, err
+		return response.StatusCode, nil, err
 	}
-	if out != nil && len(bytes.TrimSpace(responseBody)) > 0 {
-		if err := json.Unmarshal(responseBody, out); err != nil {
-			return response.StatusCode, nonJSONControlPlaneResponseError(response, responseBody, err)
-		}
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		var failure struct {
-			Error   string `json:"error"`
-			Message string `json:"message"`
-		}
-		if len(bytes.TrimSpace(responseBody)) > 0 {
-			_ = json.Unmarshal(responseBody, &failure)
-		}
-		if failure.Message != "" {
-			return response.StatusCode, fmt.Errorf("control plane returned HTTP %d: %s", response.StatusCode, failure.Message)
-		}
-		if failure.Error != "" {
-			return response.StatusCode, fmt.Errorf("control plane returned HTTP %d: %s", response.StatusCode, failure.Error)
-		}
-	}
-	return response.StatusCode, nil
+	return response.StatusCode, responseBody, nil
 }
 
 func getJSONBearer(st *store.FileStore, url, bearer string, out any) error {
@@ -5864,25 +5904,82 @@ func getJSONBearer(st *store.FileStore, url, bearer string, out any) error {
 }
 
 func getJSONBearerStatus(st *store.FileStore, url, bearer string, out any) (int, error) {
+	status, responseBody, err := sendGetJSONBearer(st, http.DefaultClient, url, bearer)
+	if err != nil {
+		return status, err
+	}
+	if status == http.StatusUnauthorized {
+		if refreshed, ok, err := refreshBearerAfterUnauthorized(st, bearer); err != nil {
+			return status, err
+		} else if ok {
+			status, responseBody, err = sendGetJSONBearer(st, http.DefaultClient, url, refreshed)
+			if err != nil {
+				return status, err
+			}
+		}
+	}
+	return decodeBearerResponse(status, responseBody, out, st)
+}
+
+func sendGetJSONBearer(st *store.FileStore, client *http.Client, url, bearer string) (int, []byte, error) {
 	request, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	request.Header.Set("authorization", "Bearer "+bearer)
 	if err := signBearerRequest(st, request, nil, bearer); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
-	response, err := http.DefaultClient.Do(request)
+	response, err := client.Do(request)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	defer response.Body.Close()
-	if out != nil && response.StatusCode >= 200 && response.StatusCode < 300 {
-		if err := json.NewDecoder(response.Body).Decode(out); err != nil && !errors.Is(err, io.EOF) {
-			return response.StatusCode, err
+	responseBody, err := io.ReadAll(response.Body)
+	if err != nil {
+		return response.StatusCode, nil, err
+	}
+	return response.StatusCode, responseBody, nil
+}
+
+func decodeBearerResponse(status int, responseBody []byte, out any, st *store.FileStore) (int, error) {
+	if status < 200 || status >= 300 {
+		failure := parseControlPlaneFailure(responseBody)
+		if err := cleanupRemoteDeviceNotTrusted(st, status, failure.Error, failure.Message); err != nil {
+			return status, err
+		}
+		if status == http.StatusNotFound {
+			return status, nil
+		}
+		if failure.Message != "" {
+			return status, fmt.Errorf("control plane returned HTTP %d: %s", status, failure.Message)
+		}
+		if failure.Error != "" {
+			return status, fmt.Errorf("control plane returned HTTP %d: %s", status, failure.Error)
+		}
+		return status, nil
+	}
+	if out != nil && len(bytes.TrimSpace(responseBody)) > 0 {
+		if err := json.Unmarshal(responseBody, out); err != nil {
+			return status, fmt.Errorf("control plane returned invalid JSON response: %w", err)
 		}
 	}
-	return response.StatusCode, nil
+	return status, nil
+}
+
+func refreshBearerAfterUnauthorized(st *store.FileStore, bearer string) (string, bool, error) {
+	if st == nil || st.State.ControlPlane == nil || st.State.ControlPlane.Origin == "" || st.State.ControlPlane.Source == "oidc" {
+		return "", false, nil
+	}
+	current, err := st.ControlPlaneAccessToken()
+	if err != nil || current != bearer {
+		return "", false, nil
+	}
+	refreshed, err := refreshControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	if err != nil {
+		return "", false, err
+	}
+	return refreshed, true, nil
 }
 
 func signBearerRequest(st *store.FileStore, request *http.Request, body []byte, bearer string) error {
