@@ -876,24 +876,15 @@ func (a App) workspace(st *store.FileStore, args []string) int {
 	}
 	switch args[0] {
 	case "list":
-		workspaceResult, err := listRemoteWorkspaceOverview(st, st.State.ControlPlane.Origin, accessToken, true)
+		workspaceResult, err := listRemoteWorkspaceOverview(st, st.State.ControlPlane.Origin, accessToken, true, false)
 		if err != nil {
 			return a.fail(err)
 		}
 		workspaces := workspaceResult.Organizations
-		var remoteSecrets []visibleRemoteSecretRecord
-		var secretsErr error
-		secretsKnown := workspaceResult.Secrets != nil
-		if workspaceResult.Secrets != nil {
-			remoteSecrets = workspaceResult.Secrets
+		if st.State.ControlPlane.Source != "oidc" && workspaceResult.Secrets == nil {
+			return a.fail(errors.New("control plane did not return workspace secret metadata"))
 		}
-		if st.State.ControlPlane.Source != "oidc" {
-			if workspaceResult.Secrets == nil {
-				remoteSecrets, secretsErr = listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken, false)
-				secretsKnown = secretsErr == nil
-			}
-		}
-		keySummaries := workspaceKeySummaries(st, workspaces, remoteSecrets, st.State.ControlPlane.WorkspaceID, secretsKnown)
+		keySummaries := workspaceKeySummaries(st, workspaces, workspaceResult.Secrets, st.State.ControlPlane.WorkspaceID, st.State.ControlPlane.Source != "oidc")
 		tw := tabwriter.NewWriter(a.Out, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(tw, "WORKSPACE\tROLE\tTHIS DEVICE\tACCOUNT WRITE\tKEYS\tNEXT\tID")
 		hasUntrusted := false
@@ -913,9 +904,6 @@ func (a App) workspace(st *store.FileStore, args []string) int {
 		}
 		if hasUntrusted {
 			fmt.Fprintln(a.Out, "\nThis device controls pull and workspace-scoped push. Use the NEXT command to trust it where needed.")
-		}
-		if secretsErr != nil {
-			fmt.Fprintf(a.Err, "asiri: remote key coverage unavailable: %s\n", secretsErr)
 		}
 		return 0
 	case "use":
@@ -1039,13 +1027,14 @@ func (a App) setupDoctor(st *store.FileStore, args []string) int {
 	checks = append(checks, setupDoctorCheck{Name: "session", Status: "ok", Detail: st.State.ControlPlane.WorkspaceSlug, Next: "-"})
 	printChecks(checks)
 
-	workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken)
+	workspaceResult, err := listRemoteWorkspaceOverview(st, st.State.ControlPlane.Origin, accessToken, true, false)
 	if err != nil {
 		fmt.Fprintf(a.Out, "\nWorkspace checks unavailable: %s\n", err)
 		addStep("asiri login --force")
 		printNextSteps()
 		return 0
 	}
+	workspaces := workspaceResult.Organizations
 	filterSet := map[string]bool{}
 	for _, slug := range workspaceFilters {
 		filterSet[slug] = true
@@ -1074,13 +1063,10 @@ func (a App) setupDoctor(st *store.FileStore, args []string) int {
 		}
 	}
 
-	var remoteSecrets []visibleRemoteSecretRecord
-	secretsKnown := false
-	if secrets, err := listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken, false); err == nil {
-		remoteSecrets = secrets
-		secretsKnown = true
-	} else {
-		fmt.Fprintf(a.Err, "asiri: remote key coverage unavailable: %s\n", err)
+	remoteSecrets := workspaceResult.Secrets
+	secretsKnown := remoteSecrets != nil
+	if !secretsKnown {
+		fmt.Fprintln(a.Err, "asiri: remote key coverage unavailable: control plane did not return workspace secret metadata")
 	}
 	keySummaries := workspaceKeySummaries(st, targets, remoteSecrets, st.State.ControlPlane.WorkspaceID, secretsKnown)
 	rows := make([]setupDoctorWorkspace, 0, len(targets))
@@ -2619,10 +2605,12 @@ func (a App) deviceStatus(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken)
+	includeSecrets := st.State.ControlPlane.Source != "oidc"
+	workspaceResult, err := listRemoteWorkspaceOverview(st, st.State.ControlPlane.Origin, accessToken, includeSecrets, false)
 	if err != nil {
 		return a.fail(err)
 	}
+	workspaces := workspaceResult.Organizations
 	targets := make([]remoteWorkspaceResponse, 0, len(workspaces))
 	if len(workspaceFilters) == 0 {
 		targets = append(targets, workspaces...)
@@ -2635,12 +2623,14 @@ func (a App) deviceStatus(st *store.FileStore, args []string) int {
 			targets = append(targets, target)
 		}
 	}
-	var remoteSecrets []visibleRemoteSecretRecord
+	remoteSecrets := workspaceResult.Secrets
 	var secretsErr error
 	secretsKnown := false
-	if st.State.ControlPlane.Source != "oidc" {
-		remoteSecrets, secretsErr = listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken, false)
-		secretsKnown = secretsErr == nil
+	if includeSecrets {
+		secretsKnown = remoteSecrets != nil
+		if !secretsKnown {
+			secretsErr = errors.New("control plane did not return workspace secret metadata")
+		}
 	}
 	keySummaries := workspaceKeySummaries(st, targets, remoteSecrets, st.State.ControlPlane.WorkspaceID, secretsKnown)
 	fmt.Fprintf(a.Out, "This device: %s\n", currentDeviceDescription(st))
@@ -4782,10 +4772,6 @@ type remoteSecretsResponse struct {
 	Secrets []remoteSecretRecord `json:"secrets"`
 }
 
-type visibleRemoteSecretsResponse struct {
-	Secrets []visibleRemoteSecretRecord `json:"secrets"`
-}
-
 type remoteSecretRecord struct {
 	ID                string                   `json:"id"`
 	OrgID             string                   `json:"orgId"`
@@ -4959,18 +4945,25 @@ func logoutDeviceSession(st *store.FileStore, origin, refreshToken string) error
 }
 
 func listRemoteWorkspaces(st *store.FileStore, origin, accessToken string) ([]remoteWorkspaceResponse, error) {
-	result, err := listRemoteWorkspaceOverview(st, origin, accessToken, false)
+	result, err := listRemoteWorkspaceOverview(st, origin, accessToken, false, false)
 	if err != nil {
 		return nil, err
 	}
 	return result.Organizations, nil
 }
 
-func listRemoteWorkspaceOverview(st *store.FileStore, origin, accessToken string, includeSecrets bool) (remoteWorkspacesResponse, error) {
+func listRemoteWorkspaceOverview(st *store.FileStore, origin, accessToken string, includeSecrets, includeInactive bool) (remoteWorkspacesResponse, error) {
 	var result remoteWorkspacesResponse
 	endpoint := strings.TrimRight(origin, "/") + "/v1/orgs"
+	params := url.Values{}
 	if includeSecrets {
-		endpoint += "?includeSecrets=1"
+		params.Set("includeSecrets", "1")
+	}
+	if includeInactive {
+		params.Set("includeInactive", "1")
+	}
+	if encoded := params.Encode(); encoded != "" {
+		endpoint += "?" + encoded
 	}
 	if err := getJSONBearer(st, endpoint, accessToken, &result); err != nil {
 		return result, err
@@ -5569,13 +5562,12 @@ func getActiveRemoteRecoveryRecipient(st *store.FileStore, origin, orgID, access
 }
 
 func listVisibleRemoteSecrets(st *store.FileStore, origin, accessToken string, includeInactive bool) ([]visibleRemoteSecretRecord, error) {
-	var result visibleRemoteSecretsResponse
-	endpoint := strings.TrimRight(origin, "/") + "/v1/secrets/visible"
-	if includeInactive {
-		endpoint += "?includeInactive=1"
-	}
-	if err := getJSONBearer(st, endpoint, accessToken, &result); err != nil {
+	result, err := listRemoteWorkspaceOverview(st, origin, accessToken, true, includeInactive)
+	if err != nil {
 		return nil, err
+	}
+	if result.Secrets == nil {
+		return nil, errors.New("control plane did not return workspace secret metadata")
 	}
 	return result.Secrets, nil
 }

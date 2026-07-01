@@ -332,6 +332,9 @@ func TestSetupDoctorReportsTrustedDeviceNextSteps(t *testing.T) {
 			if r.Header.Get("authorization") != "Bearer at_cached" || r.Header.Get("x-asiri-device") != "dev_remote" || r.Header.Get("x-asiri-signature") == "" {
 				t.Fatalf("workspace list missing signed trusted session: auth=%s device=%s", r.Header.Get("authorization"), r.Header.Get("x-asiri-device"))
 			}
+			if r.URL.Query().Get("includeSecrets") != "1" {
+				t.Fatalf("setup doctor should request workspace secret metadata, got %s", r.URL.RawQuery)
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"activeOrgId": "org_prod",
 				"organizations": []map[string]any{
@@ -339,20 +342,19 @@ func TestSetupDoctorReportsTrustedDeviceNextSteps(t *testing.T) {
 					{"id": "org_staging", "name": "Staging", "slug": "staging", "role": "owner", "canPull": false, "canWrite": true, "currentDeviceTrusted": false, "canApproveDevice": true},
 					{"id": "org_shared", "name": "Shared", "slug": "shared", "role": "member", "canPull": false, "canWrite": false, "currentDeviceTrusted": false, "canApproveDevice": false},
 				},
+				"secrets": []map[string]any{{
+					"id":                     "sec_prod",
+					"orgId":                  "org_prod",
+					"workspaceSlug":          "prod",
+					"scope":                  "prod/api",
+					"name":                   "TOKEN",
+					"version":                1,
+					"status":                 "active",
+					"canWrite":               true,
+					"wrappedToCurrentDevice": true,
+					"currentDeviceId":        "dev_remote",
+				}},
 			})
-		case "/v1/secrets/visible":
-			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{{
-				"id":                     "sec_prod",
-				"orgId":                  "org_prod",
-				"workspaceSlug":          "prod",
-				"scope":                  "prod/api",
-				"name":                   "TOKEN",
-				"version":                1,
-				"status":                 "active",
-				"canWrite":               true,
-				"wrappedToCurrentDevice": true,
-				"currentDeviceId":        "dev_remote",
-			}}})
 		case "/v1/recovery-recipient":
 			recoveryChecked = true
 			if r.URL.Query().Get("orgId") != "org_prod" {
@@ -494,8 +496,6 @@ func TestSetupDoctorDoesNotMarkUnknownChecksReady(t *testing.T) {
 					{"id": "org_stage", "name": "Staging", "slug": "stage", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_stage", "canApproveDevice": true},
 				},
 			})
-		case "/v1/secrets/visible":
-			http.Error(w, "temporary outage", http.StatusServiceUnavailable)
 		case "/v1/recovery-recipient":
 			http.Error(w, "not configured", http.StatusNotFound)
 		default:
@@ -4259,7 +4259,7 @@ func TestListMergesActiveWorkspaceRemoteSecrets(t *testing.T) {
 	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
 		t.Fatal(err)
 	}
-	visibleListSeen := false
+	workspaceOverviewSeen := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "application/json")
 		switch r.URL.Path {
@@ -4283,10 +4283,13 @@ func TestListMergesActiveWorkspaceRemoteSecrets(t *testing.T) {
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
-		case "/v1/secrets/visible":
-			visibleListSeen = true
+		case "/v1/orgs":
+			workspaceOverviewSeen = true
 			if r.Header.Get("authorization") != "Bearer at_list" {
-				t.Fatalf("unexpected visible list auth header: %s", r.Header.Get("authorization"))
+				t.Fatalf("unexpected workspace overview auth header: %s", r.Header.Get("authorization"))
+			}
+			if r.URL.Query().Get("includeSecrets") != "1" {
+				t.Fatalf("list should request remote secret metadata, got %s", r.URL.RawQuery)
 			}
 			secrets := []map[string]any{
 				{"id": "sec_synced", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "PUSHED", "version": 1, "status": "active", "canWrite": true},
@@ -4298,7 +4301,9 @@ func TestListMergesActiveWorkspaceRemoteSecrets(t *testing.T) {
 				)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"secrets": secrets,
+				"activeOrgId":   "org_oclan",
+				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				"secrets":       secrets,
 			})
 		default:
 			http.NotFound(w, r)
@@ -4326,8 +4331,8 @@ func TestListMergesActiveWorkspaceRemoteSecrets(t *testing.T) {
 	if code := app.Run([]string{"list"}); code != 0 {
 		t.Fatalf("list failed: %s", errb.String())
 	}
-	if !visibleListSeen {
-		t.Fatal("expected visible remote secrets endpoint")
+	if !workspaceOverviewSeen {
+		t.Fatal("expected workspace overview endpoint")
 	}
 	all := out.String()
 	for _, expected := range []string{"oclan-co", "local/asiri/PUSHED", "synced,writable", "local/asiri/UNPUSHED", "local-only"} {
@@ -4485,8 +4490,13 @@ func TestListExplainsRewrapLocationForUnusableRemoteKeys(t *testing.T) {
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
-		case "/v1/secrets/visible":
+		case "/v1/orgs":
+			if r.URL.Query().Get("includeSecrets") != "1" {
+				t.Fatalf("list actions should request remote secret metadata, got %s", r.URL.RawQuery)
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
+				"activeOrgId":   "org_oclan",
+				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
 				"secrets": []map[string]any{
 					{"id": "sec_needs_rewrap", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "LOCAL_NEEDS_REWRAP", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": false, "currentDeviceId": "dev_oclan"},
 					{"id": "sec_unwrapped", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "REMOTE_ONLY_UNWRAPPED", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": false, "currentDeviceId": "dev_oclan"},
@@ -4613,7 +4623,7 @@ func TestRemoteSecretDeleteMarksActiveRemoteVersionDeleted(t *testing.T) {
 	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
 		t.Fatal(err)
 	}
-	visibleSeen := false
+	workspaceOverviewSeen := false
 	deleteSeen := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "application/json")
@@ -4638,12 +4648,21 @@ func TestRemoteSecretDeleteMarksActiveRemoteVersionDeleted(t *testing.T) {
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
-		case "/v1/secrets/visible":
-			visibleSeen = true
+		case "/v1/orgs":
 			if r.Header.Get("authorization") != "Bearer at_delete" {
-				t.Fatalf("unexpected visible list auth header: %s", r.Header.Get("authorization"))
+				t.Fatalf("unexpected workspace overview auth header: %s", r.Header.Get("authorization"))
 			}
+			if r.URL.Query().Get("includeSecrets") != "1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"activeOrgId":   "org_oclan",
+					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				})
+				return
+			}
+			workspaceOverviewSeen = true
 			_ = json.NewEncoder(w).Encode(map[string]any{
+				"activeOrgId":   "org_oclan",
+				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
 				"secrets": []map[string]any{
 					{"id": "sec_delete", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "PUSHED", "version": 2, "status": "active", "canWrite": true},
 					{"id": "sec_other", "orgId": "org_other", "workspaceSlug": "other-co", "scope": "other-co/local/asiri", "name": "PUSHED", "version": 1, "status": "active", "canWrite": true},
@@ -4692,8 +4711,8 @@ func TestRemoteSecretDeleteMarksActiveRemoteVersionDeleted(t *testing.T) {
 	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "local/asiri/PUSHED", "--yes"}); code != 0 {
 		t.Fatalf("remote secret delete failed: %s", errb.String())
 	}
-	if !visibleSeen || !deleteSeen {
-		t.Fatalf("expected visible lookup and delete request, visible=%v delete=%v", visibleSeen, deleteSeen)
+	if !workspaceOverviewSeen || !deleteSeen {
+		t.Fatalf("expected workspace overview lookup and delete request, overview=%v delete=%v", workspaceOverviewSeen, deleteSeen)
 	}
 	for _, expected := range []string{"Marked remote secret", "local/asiri/PUSHED", "oclan-co", "v2"} {
 		if !strings.Contains(out.String(), expected) {
@@ -4716,7 +4735,7 @@ func TestRemoteSecretDeleteConfirmationAndPathGuards(t *testing.T) {
 	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
 		t.Fatal(err)
 	}
-	visibleCount := 0
+	overviewCount := 0
 	deleteCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "application/json")
@@ -4741,9 +4760,18 @@ func TestRemoteSecretDeleteConfirmationAndPathGuards(t *testing.T) {
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
-		case "/v1/secrets/visible":
-			visibleCount++
+		case "/v1/orgs":
+			if r.URL.Query().Get("includeSecrets") != "1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"activeOrgId":   "org_oclan",
+					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				})
+				return
+			}
+			overviewCount++
 			_ = json.NewEncoder(w).Encode(map[string]any{
+				"activeOrgId":   "org_oclan",
+				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
 				"secrets": []map[string]any{
 					{"id": "sec_confirm", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "PUSHED", "version": 1, "status": "active", "canWrite": true},
 				},
@@ -4780,8 +4808,8 @@ func TestRemoteSecretDeleteConfirmationAndPathGuards(t *testing.T) {
 	if !strings.Contains(errb.String(), "accepts short paths") {
 		t.Fatalf("prefixed path error was not clear: %s", errb.String())
 	}
-	if visibleCount != 0 || deleteCount != 0 {
-		t.Fatalf("prefixed path should fail before remote lookup, visible=%d delete=%d", visibleCount, deleteCount)
+	if overviewCount != 0 || deleteCount != 0 {
+		t.Fatalf("prefixed path should fail before remote lookup, overview=%d delete=%d", overviewCount, deleteCount)
 	}
 	app.In = strings.NewReader("wrong\n")
 	out.Reset()
@@ -4874,8 +4902,19 @@ func TestRemoteSecretDeleteFailureModes(t *testing.T) {
 						"expiresIn":        3600,
 						"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 					})
-				case "/v1/secrets/visible":
-					_ = json.NewEncoder(w).Encode(map[string]any{"secrets": tc.secrets})
+				case "/v1/orgs":
+					if r.URL.Query().Get("includeSecrets") != "1" {
+						_ = json.NewEncoder(w).Encode(map[string]any{
+							"activeOrgId":   "org_oclan",
+							"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+						})
+						return
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"activeOrgId":   "org_oclan",
+						"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+						"secrets":       tc.secrets,
+					})
 				case "/v1/secrets/sec_forbidden/delete":
 					deleteSeen = true
 					w.WriteHeader(tc.deleteCode)
@@ -4948,10 +4987,19 @@ func TestRemoteSecretBulkDeleteOnlyRemoteOnlyUnwrapped(t *testing.T) {
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
-		case "/v1/secrets/visible":
+		case "/v1/orgs":
+			if r.URL.Query().Get("includeSecrets") != "1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"activeOrgId":   "org_oclan",
+					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				})
+				return
+			}
 			wrapped := true
 			unwrapped := false
 			_ = json.NewEncoder(w).Encode(map[string]any{
+				"activeOrgId":   "org_oclan",
+				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
 				"secrets": []map[string]any{
 					{"id": "sec_candidate_a", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "GHOST_A", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": unwrapped},
 					{"id": "sec_candidate_b", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/prod", "name": "GHOST_B", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": unwrapped},
@@ -5046,9 +5094,18 @@ func TestRemoteSecretBulkDeleteConfirmation(t *testing.T) {
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
-		case "/v1/secrets/visible":
+		case "/v1/orgs":
+			if r.URL.Query().Get("includeSecrets") != "1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"activeOrgId":   "org_oclan",
+					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				})
+				return
+			}
 			unwrapped := false
 			_ = json.NewEncoder(w).Encode(map[string]any{
+				"activeOrgId":   "org_oclan",
+				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
 				"secrets": []map[string]any{
 					{"id": "sec_confirm_bulk", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/prod", "name": "GHOST", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": unwrapped},
 				},
@@ -5145,13 +5202,17 @@ func TestWorkspaceListAndUseDoesNotBindLocalPrefixBeforePushOrSync(t *testing.T)
 			if auth == "Bearer at_personal" {
 				active = "org_personal"
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
+			response := map[string]any{
 				"activeOrgId": active,
 				"organizations": []map[string]any{
 					{"id": "org_oclan", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true},
 					{"id": "org_personal", "name": "Peter Dev", "slug": "peter-dev", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true},
 				},
-			})
+			}
+			if r.URL.Query().Get("includeSecrets") == "1" {
+				response["secrets"] = []map[string]any{}
+			}
+			_ = json.NewEncoder(w).Encode(response)
 		case "/v1/auth/session/switch":
 			var body map[string]string
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -5302,7 +5363,6 @@ func TestWorkspaceListUsesCombinedWorkspaceOverview(t *testing.T) {
 	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
 		t.Fatal(err)
 	}
-	visibleSecretsCalled := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "application/json")
 		switch r.URL.Path {
@@ -5319,9 +5379,6 @@ func TestWorkspaceListUsesCombinedWorkspaceOverview(t *testing.T) {
 					"id": "sec_remote", "orgId": "org_remote", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "API_KEY", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": true, "currentDeviceId": "dev_remote",
 				}},
 			})
-		case "/v1/secrets/visible":
-			visibleSecretsCalled = true
-			t.Fatal("workspace list should not call visible secrets when overview includes secrets")
 		default:
 			http.NotFound(w, r)
 		}
@@ -5348,78 +5405,9 @@ func TestWorkspaceListUsesCombinedWorkspaceOverview(t *testing.T) {
 	errb.Reset()
 	if code := app.Run([]string{"workspace", "list"}); code != 0 {
 		t.Fatalf("workspace list failed: %s", errb.String())
-	}
-	if visibleSecretsCalled {
-		t.Fatal("visible secrets endpoint should not be called")
 	}
 	if !strings.Contains(out.String(), "oclan-co") || !strings.Contains(out.String(), "ready") {
 		t.Fatalf("workspace list did not use included secret metadata: %s", out.String())
-	}
-}
-
-func TestWorkspaceListFallsBackToVisibleSecretsForOlderServers(t *testing.T) {
-	tmp := t.TempDir()
-	old := os.Getenv("ASIRI_HOME")
-	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
-	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
-		t.Fatal(err)
-	}
-	visibleSecretsCalled := false
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("content-type", "application/json")
-		switch r.URL.Path {
-		case "/v1/orgs":
-			if r.URL.Query().Get("includeSecrets") != "1" {
-				t.Fatalf("workspace list should request combined overview, got %s", r.URL.RawQuery)
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"activeOrgId": "org_remote",
-				"organizations": []map[string]any{{
-					"id": "org_remote", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true,
-				}},
-			})
-		case "/v1/secrets/visible":
-			visibleSecretsCalled = true
-			if r.URL.RawQuery != "" {
-				t.Fatalf("unexpected visible secret query: %s", r.URL.RawQuery)
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"secrets": []map[string]any{{
-					"id": "sec_remote", "orgId": "org_remote", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "API_KEY", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": true, "currentDeviceId": "dev_remote",
-				}},
-			})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-
-	var out, errb bytes.Buffer
-	app := New(&out, &errb)
-	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
-		t.Fatalf("init failed: %s", errb.String())
-	}
-	st, err := store.LoadDefault()
-	if err != nil {
-		t.Fatal(err)
-	}
-	device, err := st.ActiveDevice()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := st.LinkControlPlaneForDevice(server.URL, "org_remote", "oclan-co", "usr_owner", "dev_remote", device.ID, "at_cached", "rt_cached", 3600, time.Now().UTC().Add(7*24*time.Hour).Format(time.RFC3339)); err != nil {
-		t.Fatal(err)
-	}
-	out.Reset()
-	errb.Reset()
-	if code := app.Run([]string{"workspace", "list"}); code != 0 {
-		t.Fatalf("workspace list failed: %s", errb.String())
-	}
-	if !visibleSecretsCalled {
-		t.Fatal("visible secrets endpoint should be called when overview omits secrets")
-	}
-	if !strings.Contains(out.String(), "oclan-co") || !strings.Contains(out.String(), "ready") {
-		t.Fatalf("workspace list did not use fallback secret metadata: %s", out.String())
 	}
 }
 
@@ -5556,6 +5544,9 @@ func TestDeviceStatusShowsTrustAndKeyCoverage(t *testing.T) {
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
 		case "/v1/orgs":
+			if r.URL.Query().Get("includeSecrets") != "1" {
+				t.Fatalf("device status should request workspace secret metadata, got %s", r.URL.RawQuery)
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"activeOrgId": "org_oclan",
 				"organizations": []map[string]any{
@@ -5563,9 +5554,6 @@ func TestDeviceStatusShowsTrustAndKeyCoverage(t *testing.T) {
 					{"id": "org_asiri", "slug": "asiri-dev", "ownerUserId": "usr_owner", "role": "owner", "canPull": false, "currentDeviceTrusted": false, "canWrite": true, "canApproveDevice": true},
 					{"id": "org_recall", "slug": "recallstack-com", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_recall", "canWrite": true, "canApproveDevice": true},
 				},
-			})
-		case "/v1/secrets/visible":
-			_ = json.NewEncoder(w).Encode(map[string]any{
 				"secrets": []map[string]any{
 					{"id": "sec_ready", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local", "name": "READY", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": true},
 					{"id": "sec_needs", "orgId": "org_recall", "workspaceSlug": "recallstack-com", "scope": "recallstack-com/prod", "name": "OLD", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": false},
@@ -6606,7 +6594,7 @@ func TestEnvRemoteHintFallsBackToSlashyScopeSelection(t *testing.T) {
 	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", oldHome) })
 	_ = os.Setenv("ASIRI_HOME", tmp)
 
-	visibleSeen := false
+	overviewSeen := false
 	remoteVisibleSecrets := []map[string]any{{
 		"id":                     "sec_remote_child",
 		"orgId":                  "org_runtime",
@@ -6631,13 +6619,22 @@ func TestEnvRemoteHintFallsBackToSlashyScopeSelection(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "application/json")
 		switch r.URL.Path {
-		case "/v1/secrets/visible":
-			visibleSeen = true
+		case "/v1/orgs":
 			if r.Header.Get("authorization") != "Bearer at_runtime" {
-				t.Fatalf("unexpected visible auth header: %s", r.Header.Get("authorization"))
+				t.Fatalf("unexpected workspace overview auth header: %s", r.Header.Get("authorization"))
 			}
+			if r.URL.Query().Get("includeSecrets") != "1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"activeOrgId":   "org_runtime",
+					"organizations": []map[string]any{{"id": "org_runtime", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				})
+				return
+			}
+			overviewSeen = true
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"secrets": remoteVisibleSecrets,
+				"activeOrgId":   "org_runtime",
+				"organizations": []map[string]any{{"id": "org_runtime", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				"secrets":       remoteVisibleSecrets,
 			})
 		default:
 			http.NotFound(w, r)
@@ -6676,7 +6673,7 @@ func TestEnvRemoteHintFallsBackToSlashyScopeSelection(t *testing.T) {
 	if code := app.Run([]string{"env", "--workspace", "oclan-co", "prod/github", "--", "sh", "-c", "true"}); code == 0 {
 		t.Fatal("expected remote-only scope selection to fail before execution")
 	}
-	if visibleSeen {
+	if overviewSeen {
 		t.Fatal("remote lookup should not run without an inject grant")
 	}
 	if !strings.Contains(errb.String(), "no exact secret or direct child secrets found") {
@@ -6708,14 +6705,14 @@ func TestEnvRemoteHintFallsBackToSlashyScopeSelection(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	visibleSeen = false
+	overviewSeen = false
 	out.Reset()
 	errb.Reset()
 	if code := app.Run([]string{"env", "--workspace", "oclan-co", "prod/github", "--", "sh", "-c", "true"}); code == 0 {
 		t.Fatal("expected remote-only scope selection to fail before execution")
 	}
-	if !visibleSeen {
-		t.Fatal("expected visible remote lookup")
+	if !overviewSeen {
+		t.Fatal("expected remote metadata lookup")
 	}
 	for _, expected := range []string{
 		"1 direct child secret(s) exist remotely under oclan-co/prod/github",
@@ -6742,14 +6739,14 @@ func TestEnvRemoteHintFallsBackToSlashyScopeSelection(t *testing.T) {
 		"canWrite":               true,
 		"wrappedToCurrentDevice": false,
 	}}
-	visibleSeen = false
+	overviewSeen = false
 	out.Reset()
 	errb.Reset()
 	if code := app.Run([]string{"env", "--workspace", "oclan-co", "prod/github", "--", "sh", "-c", "true"}); code == 0 {
 		t.Fatal("expected denied-only remote scope selection to fail before execution")
 	}
-	if !visibleSeen {
-		t.Fatal("expected visible remote lookup for denied-only scope")
+	if !overviewSeen {
+		t.Fatal("expected remote metadata lookup for denied-only scope")
 	}
 	if !strings.Contains(errb.String(), "no exact secret or direct child secrets found") || strings.Contains(errb.String(), "direct child secret(s) exist remotely") {
 		t.Fatalf("denied-only remote children should not produce inventory hint: %s", errb.String())
