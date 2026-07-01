@@ -40,7 +40,7 @@ type App struct {
 	In  io.Reader
 }
 
-var Version = "0.1.24"
+var Version = "0.1.25"
 
 var defaultControlPlaneOrigin = "http://127.0.0.1:4173"
 var githubActionsOidcTokenTimeout = 10 * time.Second
