@@ -40,7 +40,7 @@ type App struct {
 	In  io.Reader
 }
 
-var Version = "0.1.22"
+var Version = "0.1.23"
 
 var defaultControlPlaneOrigin = "http://127.0.0.1:4173"
 
@@ -876,16 +876,22 @@ func (a App) workspace(st *store.FileStore, args []string) int {
 	}
 	switch args[0] {
 	case "list":
-		workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken)
+		workspaceResult, err := listRemoteWorkspaceOverview(st, st.State.ControlPlane.Origin, accessToken, true)
 		if err != nil {
 			return a.fail(err)
 		}
+		workspaces := workspaceResult.Organizations
 		var remoteSecrets []visibleRemoteSecretRecord
 		var secretsErr error
-		secretsKnown := false
+		secretsKnown := workspaceResult.Secrets != nil
+		if workspaceResult.Secrets != nil {
+			remoteSecrets = workspaceResult.Secrets
+		}
 		if st.State.ControlPlane.Source != "oidc" {
-			remoteSecrets, secretsErr = listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken, false)
-			secretsKnown = secretsErr == nil
+			if workspaceResult.Secrets == nil {
+				remoteSecrets, secretsErr = listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken, false)
+				secretsKnown = secretsErr == nil
+			}
 		}
 		keySummaries := workspaceKeySummaries(st, workspaces, remoteSecrets, st.State.ControlPlane.WorkspaceID, secretsKnown)
 		tw := tabwriter.NewWriter(a.Out, 0, 0, 2, ' ', 0)
@@ -1279,7 +1285,7 @@ func (a App) push(st *store.FileStore, args []string) int {
 	rewrappedKeys := 0
 	rewrappedSecrets := 0
 	for _, candidate := range reconciled.Rewrap {
-		if err := addRemoteWrappedKeys(st, st.State.ControlPlane.Origin, candidate.SecretID, accessToken, candidate.Missing); err != nil {
+		if err := addRemoteWrappedKeys(st, st.State.ControlPlane.Origin, candidate.SecretID, accessToken, candidate.Missing, false); err != nil {
 			return a.fail(err)
 		}
 		rewrappedSecrets++
@@ -1824,11 +1830,11 @@ type workspaceKeySummary struct {
 
 func workspaceKeySummaries(st *store.FileStore, workspaces []remoteWorkspaceResponse, secrets []visibleRemoteSecretRecord, activeWorkspaceID string, secretsKnown bool) map[string]workspaceKeySummary {
 	type counts struct {
-		Total            int
-		Missing          int
-		Repairable       int
-		RemoteOnlyGhosts int
-		Unknown          int
+		Total              int
+		Missing            int
+		Repairable         int
+		RemoteOnlyUnusable int
+		Unknown            int
 	}
 	byWorkspace := map[string]counts{}
 	for _, secret := range secrets {
@@ -1841,7 +1847,7 @@ func workspaceKeySummaries(st *store.FileStore, workspaces []remoteWorkspaceResp
 			if localSecretVersionExists(st, secret.Scope, secret.Name, secret.Version) {
 				item.Repairable++
 			} else if !localActiveSecretExists(st, secret.Scope, secret.Name) {
-				item.RemoteOnlyGhosts++
+				item.RemoteOnlyUnusable++
 			}
 		}
 		byWorkspace[secret.WorkspaceSlug] = item
@@ -1858,8 +1864,6 @@ func workspaceKeySummaries(st *store.FileStore, workspaces []remoteWorkspaceResp
 				keys = "unknown"
 			case item.Repairable > 0:
 				keys = "needs rewrap"
-			case item.RemoteOnlyGhosts > 0:
-				keys = "needs cleanup"
 			case item.Missing > 0:
 				keys = "unwrapped"
 			default:
@@ -1884,8 +1888,8 @@ func workspaceNextAction(st *store.FileStore, workspace remoteWorkspaceResponse,
 	if keys == "needs rewrap" {
 		return fmt.Sprintf("asiri rewrap --workspace %s", workspace.Slug)
 	}
-	if keys == "needs cleanup" {
-		return fmt.Sprintf("asiri secret delete --workspace %s --remote-only-unwrapped", workspace.Slug)
+	if keys == "unwrapped" {
+		return "rewrap on a device with local keys"
 	}
 	return "-"
 }
@@ -1924,13 +1928,13 @@ func remoteSecretKeyLabel(st *store.FileStore, secret visibleRemoteSecretRecord)
 	if *secret.WrappedToCurrentDevice {
 		return "wrapped"
 	}
+	if secret.CurrentDeviceID == "" {
+		return "not trusted"
+	}
 	if localSecretVersionExists(st, secret.Scope, secret.Name, secret.Version) {
 		return "needs rewrap"
 	}
-	if !localActiveSecretExists(st, secret.Scope, secret.Name) {
-		return "unusable"
-	}
-	return "needs rewrap"
+	return "unwrapped"
 }
 
 func writePullResults(out io.Writer, results []pullResult) {
@@ -2103,9 +2107,17 @@ func (a App) rewrapWorkspace(st *store.FileStore, accessToken string, target rem
 	if err != nil {
 		return rewrapStats{}, err
 	}
-	secrets, err := listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, "", false)
+	encryptedSecrets, err := listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, "", false)
 	if err != nil {
 		return rewrapStats{}, err
+	}
+	metadataSecrets, status, err := listRemoteSecretMetadata(st, st.State.ControlPlane.Origin, target.ID, accessToken, false)
+	if err != nil {
+		return rewrapStats{}, err
+	}
+	secrets := encryptedSecrets
+	if status != http.StatusNotFound {
+		secrets = mergeRemoteSecretRecords(metadataSecrets, encryptedSecrets)
 	}
 	targets := map[string]remoteDeviceResponse{}
 	for _, device := range devices {
@@ -2139,7 +2151,7 @@ func (a App) rewrapWorkspace(st *store.FileStore, accessToken string, target rem
 		if len(missing) == 0 {
 			continue
 		}
-		if err := addRemoteWrappedKeys(st, st.State.ControlPlane.Origin, secret.ID, accessToken, missing); err != nil {
+		if err := addRemoteWrappedKeys(st, st.State.ControlPlane.Origin, secret.ID, accessToken, missing, true); err != nil {
 			return rewrapStats{}, err
 		}
 		stats.Updated++
@@ -3224,6 +3236,7 @@ func (a App) list(st *store.FileStore, args []string) int {
 	}
 	w := tabwriter.NewWriter(a.Out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "WORKSPACE\tPATH\tVER\tHASH\tSTATE\tVERSION_STATUS\tKEYS")
+	actionSummary := newListActionSummary()
 	for _, key := range keys {
 		row := rows[key]
 		status := row.Status
@@ -3235,10 +3248,12 @@ func (a App) list(st *store.FileStore, args []string) int {
 			versionStatus = "active"
 		}
 		fmt.Fprintf(w, "%s\t%s\tv%d\t%s\t%s\t%s\t%s\n", row.Workspace, row.Path, row.Version, row.NameHash, status, versionStatus, row.Keys)
+		actionSummary.Add(row)
 	}
 	if err := w.Flush(); err != nil {
 		return a.fail(err)
 	}
+	actionSummary.Write(a.Out)
 	return 0
 }
 
@@ -4677,8 +4692,9 @@ type remoteWorkspaceResponse struct {
 }
 
 type remoteWorkspacesResponse struct {
-	Organizations []remoteWorkspaceResponse `json:"organizations"`
-	ActiveOrgID   string                    `json:"activeOrgId"`
+	Organizations []remoteWorkspaceResponse   `json:"organizations"`
+	ActiveOrgID   string                      `json:"activeOrgId"`
+	Secrets       []visibleRemoteSecretRecord `json:"secrets,omitempty"`
 }
 
 type remoteWorkloadResponse struct {
@@ -4782,8 +4798,15 @@ type remoteSecretRecord struct {
 	AAD               string                   `json:"aad"`
 	Status            string                   `json:"status"`
 	WrappedKeys       []store.RemoteWrappedKey `json:"wrappedKeys"`
+	WrappedRecipients []remoteWrappedRecipient `json:"wrappedRecipients"`
 	CreatedByDeviceID string                   `json:"createdByDeviceId"`
 	CreatedAt         time.Time                `json:"createdAt"`
+}
+
+type remoteWrappedRecipient struct {
+	RecipientType string `json:"recipientType"`
+	RecipientID   string `json:"recipientId"`
+	WrapAlgorithm string `json:"wrapAlgorithm"`
 }
 
 type recoveryRecipientReplacement struct {
@@ -4936,12 +4959,23 @@ func logoutDeviceSession(st *store.FileStore, origin, refreshToken string) error
 }
 
 func listRemoteWorkspaces(st *store.FileStore, origin, accessToken string) ([]remoteWorkspaceResponse, error) {
-	var result remoteWorkspacesResponse
-	endpoint := strings.TrimRight(origin, "/") + "/v1/orgs"
-	if err := getJSONBearer(st, endpoint, accessToken, &result); err != nil {
+	result, err := listRemoteWorkspaceOverview(st, origin, accessToken, false)
+	if err != nil {
 		return nil, err
 	}
 	return result.Organizations, nil
+}
+
+func listRemoteWorkspaceOverview(st *store.FileStore, origin, accessToken string, includeSecrets bool) (remoteWorkspacesResponse, error) {
+	var result remoteWorkspacesResponse
+	endpoint := strings.TrimRight(origin, "/") + "/v1/orgs"
+	if includeSecrets {
+		endpoint += "?includeSecrets=1"
+	}
+	if err := getJSONBearer(st, endpoint, accessToken, &result); err != nil {
+		return result, err
+	}
+	return result, nil
 }
 
 func createRemoteWorkload(st *store.FileStore, origin, accessToken, orgID, slug, name string) (remoteWorkloadResponse, error) {
@@ -5618,9 +5652,13 @@ func deleteRemoteSecret(st *store.FileStore, origin, secretID, deviceID, accessT
 	return result, nil
 }
 
-func addRemoteWrappedKeys(st *store.FileStore, origin, secretID, accessToken string, wrappedKeys []store.RemoteWrappedKey) error {
+func addRemoteWrappedKeys(st *store.FileStore, origin, secretID, accessToken string, wrappedKeys []store.RemoteWrappedKey, localRepair bool) error {
 	endpoint := strings.TrimRight(origin, "/") + "/v1/secrets/" + url.PathEscape(secretID) + "/wrapped-keys"
-	return postJSONBearer(st, endpoint, accessToken, map[string]any{"wrappedKeys": wrappedKeys}, nil)
+	body := map[string]any{"wrappedKeys": wrappedKeys}
+	if localRepair {
+		body["localRepair"] = true
+	}
+	return postJSONBearer(st, endpoint, accessToken, body, nil)
 }
 
 func registerRemoteRecoveryRecipient(st *store.FileStore, origin, accessToken string, setup store.RecoverySetup, replacements []recoveryRecipientReplacement) error {
@@ -5687,11 +5725,21 @@ func remoteSecretHasRecipient(secret remoteSecretRecord, deviceID string) bool {
 			return true
 		}
 	}
+	for _, key := range secret.WrappedRecipients {
+		if key.RecipientType == "device" && key.RecipientID == deviceID {
+			return true
+		}
+	}
 	return false
 }
 
 func remoteSecretHasRecoveryRecipient(secret remoteSecretRecord, recipientID string) bool {
 	for _, key := range secret.WrappedKeys {
+		if key.RecipientType == "recovery" && key.RecipientID == recipientID {
+			return true
+		}
+	}
+	for _, key := range secret.WrappedRecipients {
 		if key.RecipientType == "recovery" && key.RecipientID == recipientID {
 			return true
 		}
@@ -5748,6 +5796,64 @@ type listRow struct {
 	HasLocal      bool
 	HasRemote     bool
 	RemoteStatus  string
+}
+
+type listActionSummary struct {
+	rewrapHere     map[string]int
+	rewrapAtSource map[string]int
+	trustDevice    map[string]int
+}
+
+func newListActionSummary() *listActionSummary {
+	return &listActionSummary{
+		rewrapHere:     map[string]int{},
+		rewrapAtSource: map[string]int{},
+		trustDevice:    map[string]int{},
+	}
+}
+
+func (summary *listActionSummary) Add(row listRow) {
+	switch row.Keys {
+	case "needs rewrap":
+		summary.rewrapHere[row.Workspace]++
+	case "unwrapped":
+		summary.rewrapAtSource[row.Workspace]++
+	case "not trusted":
+		summary.trustDevice[row.Workspace]++
+	}
+}
+
+func (summary *listActionSummary) Write(out io.Writer) {
+	workspaceSet := map[string]bool{}
+	for workspace := range summary.rewrapHere {
+		workspaceSet[workspace] = true
+	}
+	for workspace := range summary.rewrapAtSource {
+		workspaceSet[workspace] = true
+	}
+	for workspace := range summary.trustDevice {
+		workspaceSet[workspace] = true
+	}
+	if len(workspaceSet) == 0 {
+		return
+	}
+	workspaces := make([]string, 0, len(workspaceSet))
+	for workspace := range workspaceSet {
+		workspaces = append(workspaces, workspace)
+	}
+	sort.Strings(workspaces)
+	fmt.Fprintln(out, "\nNext:")
+	for _, workspace := range workspaces {
+		if count := summary.rewrapHere[workspace]; count > 0 {
+			fmt.Fprintf(out, "  %s: run asiri rewrap --workspace %s here for %d repairable key(s).\n", workspace, workspace, count)
+		}
+		if count := summary.rewrapAtSource[workspace]; count > 0 {
+			fmt.Fprintf(out, "  %s: run asiri rewrap --workspace %s on a device where these secrets are wrapped, then run asiri pull --workspace %s here for %d unwrapped key(s).\n", workspace, workspace, workspace, count)
+		}
+		if count := summary.trustDevice[workspace]; count > 0 {
+			fmt.Fprintf(out, "  %s: run asiri device trust --workspace %s before pulling %d remote key(s).\n", workspace, workspace, count)
+		}
+	}
 }
 
 func activeVersion(secret asiri.Secret) *asiri.SecretVersion {
