@@ -32,8 +32,10 @@ type ControlPlaneLink struct {
 	WorkspaceID          string    `json:"workspaceId"`
 	WorkspaceSlug        string    `json:"workspaceSlug"`
 	UserID               string    `json:"userId"`
-	WorkloadID           string    `json:"workloadId,omitempty"`
-	WorkloadSlug         string    `json:"workloadSlug,omitempty"`
+	ServiceAccountID     string    `json:"serviceAccountId,omitempty"`
+	ServiceAccountSlug   string    `json:"serviceAccountSlug,omitempty"`
+	ServiceAccountName   string    `json:"serviceAccountName,omitempty"`
+	ApprovedByUserID     string    `json:"approvedByUserId,omitempty"`
 	DeviceID             string    `json:"deviceId"`
 	LocalDeviceID        string    `json:"localDeviceId"`
 	Source               string    `json:"source,omitempty"`

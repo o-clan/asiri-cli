@@ -190,7 +190,16 @@ func Load(path string) (*FileStore, error) {
 		store.State.RemoteBindings = map[string]asiri.RemoteWorkspaceBinding{}
 	}
 	store.configureKeyStore()
+	store.removeLegacyOidcControlPlaneSession()
 	return store, nil
+}
+
+func (s *FileStore) removeLegacyOidcControlPlaneSession() {
+	if s.State.ControlPlane == nil || s.State.ControlPlane.Source != "oidc" {
+		return
+	}
+	s.deleteControlPlaneTokens(s.State.ControlPlane)
+	s.State.ControlPlane = nil
 }
 
 func (s *FileStore) migratePreviousState(bytes []byte) {
@@ -737,7 +746,7 @@ func (s *FileStore) LinkControlPlaneForDevice(origin, workspaceID, workspaceSlug
 	return s.Save()
 }
 
-func (s *FileStore) LinkWorkloadControlPlane(origin, workspaceID, workspaceSlug, userID, workloadID, workloadSlug, deviceID, localDeviceID, accessToken string, expiresIn int) error {
+func (s *FileStore) LinkServiceAccountControlPlane(origin, workspaceID, workspaceSlug, approvedByUserID, serviceAccountID, serviceAccountSlug, serviceAccountName, deviceID, localDeviceID, accessToken, refreshToken string, expiresIn int, refreshExpiresAt string) error {
 	if err := s.RequireInitialized(); err != nil {
 		return err
 	}
@@ -747,38 +756,54 @@ func (s *FileStore) LinkWorkloadControlPlane(origin, workspaceID, workspaceSlug,
 	if accessToken == "" {
 		return errors.New("control plane did not return an access token")
 	}
-	if workspaceID == "" || workspaceSlug == "" || workloadID == "" || workloadSlug == "" {
-		return errors.New("control plane did not return workload session metadata")
+	if refreshToken == "" {
+		return errors.New("control plane did not return a refresh token")
+	}
+	if workspaceID == "" || workspaceSlug == "" || serviceAccountID == "" || serviceAccountSlug == "" {
+		return errors.New("control plane did not return service account session metadata")
 	}
 	accessAccount := keystore.SessionAccessAccount(workspaceID, deviceID)
+	refreshAccount := keystore.SessionRefreshAccount(workspaceID, deviceID)
+	refreshExpiry, err := parseControlPlaneExpiry(refreshExpiresAt, 7*24*time.Hour)
+	if err != nil {
+		return err
+	}
 	if s.State.ControlPlane != nil {
 		s.deleteControlPlaneTokens(s.State.ControlPlane)
 	}
 	if err := keystore.Store(accessAccount, accessToken); err != nil {
 		return err
 	}
+	if err := keystore.Store(refreshAccount, refreshToken); err != nil {
+		_ = keystore.Delete(accessAccount)
+		return err
+	}
 	s.addKeyRef("control-plane-access-token", accessAccount)
+	s.addKeyRef("control-plane-refresh-token", refreshAccount)
 	expiresAt := time.Now().UTC().Add(time.Duration(expiresIn) * time.Second)
 	if expiresIn <= 0 {
-		expiresAt = time.Now().UTC().Add(15 * time.Minute)
+		expiresAt = time.Now().UTC().Add(time.Hour)
 	}
 	s.State.ControlPlane = &asiri.ControlPlaneLink{
 		Origin:               origin,
 		WorkspaceID:          workspaceID,
 		WorkspaceSlug:        workspaceSlug,
-		UserID:               userID,
-		WorkloadID:           workloadID,
-		WorkloadSlug:         workloadSlug,
+		UserID:               approvedByUserID,
+		ServiceAccountID:     serviceAccountID,
+		ServiceAccountSlug:   serviceAccountSlug,
+		ServiceAccountName:   serviceAccountName,
+		ApprovedByUserID:     approvedByUserID,
 		DeviceID:             deviceID,
 		LocalDeviceID:        localDeviceID,
-		Source:               "oidc",
+		Source:               "service-account",
 		AccessTokenAccount:   accessAccount,
+		RefreshTokenAccount:  refreshAccount,
 		AccessTokenExpiresAt: expiresAt,
-		RefreshExpiresAt:     expiresAt,
+		RefreshExpiresAt:     refreshExpiry,
 		LinkedAt:             time.Now().UTC(),
 	}
 	s.State.LocalDeviceID = localDeviceID
-	s.Audit(workloadSlug, "control_plane_linked", "allowed", "", "", "OIDC workload session approved", map[string]string{"origin": origin, "workspace": workspaceSlug, "remoteDevice": deviceID})
+	s.Audit(serviceAccountSlug, "control_plane_linked", "allowed", "", "", "service account session approved", map[string]string{"origin": origin, "workspace": workspaceSlug, "remoteDevice": deviceID, "approvedByUserId": approvedByUserID})
 	return s.Save()
 }
 

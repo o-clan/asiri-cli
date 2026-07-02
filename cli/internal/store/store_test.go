@@ -145,6 +145,60 @@ func TestPreviousBoundWorkspaceIDMigratesToFreshVaultID(t *testing.T) {
 	}
 }
 
+func TestLegacyOidcControlPlaneSessionIsRemovedOnLoad(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	accessAccount := "legacy-oidc-access"
+	refreshAccount := "legacy-oidc-refresh"
+	if err := keystore.Store(accessAccount, "at_legacy"); err != nil {
+		t.Fatal(err)
+	}
+	if err := keystore.Store(refreshAccount, "rt_legacy"); err != nil {
+		t.Fatal(err)
+	}
+	previous := `{
+  "version": 1,
+  "vaultId": "vault_local",
+  "userId": "usr_local",
+  "keyStore": "platform",
+  "keyRefs": [
+    {"purpose": "control-plane-access-token", "account": "legacy-oidc-access"},
+    {"purpose": "control-plane-refresh-token", "account": "legacy-oidc-refresh"}
+  ],
+  "controlPlane": {
+    "origin": "https://asiri.dev",
+    "workspaceId": "org_prod",
+    "workspaceSlug": "prod",
+    "userId": "usr_local",
+    "source": "oidc",
+    "accessTokenAccount": "legacy-oidc-access",
+    "refreshTokenAccount": "legacy-oidc-refresh"
+  },
+  "devices": [],
+  "secrets": {},
+  "policies": [],
+  "audit": []
+}`
+	if err := os.WriteFile(path, []byte(previous), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State.ControlPlane != nil {
+		t.Fatalf("legacy OIDC session was not removed: %#v", st.State.ControlPlane)
+	}
+	if _, err := keystore.Load(accessAccount); err == nil {
+		t.Fatal("legacy OIDC access token was not deleted")
+	}
+	if _, err := keystore.Load(refreshAccount); err == nil {
+		t.Fatal("legacy OIDC refresh token was not deleted")
+	}
+	if len(st.State.KeyRefs) != 0 {
+		t.Fatalf("legacy OIDC key refs were not removed: %#v", st.State.KeyRefs)
+	}
+}
+
 func TestAgentRawReadRequiresExplicitPolicy(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	st, err := Load(path)

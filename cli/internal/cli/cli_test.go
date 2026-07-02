@@ -120,95 +120,51 @@ func TestLoginOriginSelection(t *testing.T) {
 	}
 }
 
-func TestWorkloadControlPlaneSessionsRejectMutations(t *testing.T) {
-	workloadStore := &store.FileStore{State: asiri.State{ControlPlane: &asiri.ControlPlaneLink{Source: "oidc"}}}
-	if err := rejectWorkloadControlPlaneMutation(workloadStore); err == nil {
-		t.Fatal("workload sessions should reject control-plane mutations")
+func TestServiceAccountControlPlaneSessionsRejectMutations(t *testing.T) {
+	serviceStore := &store.FileStore{State: asiri.State{ControlPlane: &asiri.ControlPlaneLink{Source: "service-account"}}}
+	if err := rejectServiceAccountControlPlaneMutation(serviceStore); err == nil {
+		t.Fatal("service account sessions should reject control-plane mutations")
 	}
-	if err := rejectWorkloadLocalMutation(workloadStore); err == nil {
-		t.Fatal("workload sessions should reject local mutations")
+	if err := rejectServiceAccountLocalMutation(serviceStore); err == nil {
+		t.Fatal("service account sessions should reject local mutations")
 	}
 
 	humanStore := &store.FileStore{State: asiri.State{ControlPlane: &asiri.ControlPlaneLink{Source: "device-code"}}}
-	if err := rejectWorkloadControlPlaneMutation(humanStore); err != nil {
+	if err := rejectServiceAccountControlPlaneMutation(humanStore); err != nil {
 		t.Fatalf("human sessions should allow control-plane mutations: %v", err)
 	}
-	if err := rejectWorkloadLocalMutation(humanStore); err != nil {
+	if err := rejectServiceAccountLocalMutation(humanStore); err != nil {
 		t.Fatalf("human sessions should allow local mutations: %v", err)
 	}
 }
 
-func TestWorkloadSetupRejectsInvalidExpiryFlags(t *testing.T) {
+func TestServiceAccountGrantRejectsInvalidExpiryFlags(t *testing.T) {
 	future := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
-	options, err := parseWorkloadSetupArgs([]string{"--workspace", "prod", "--slug", "prod-api", "--name", "Production API", "--provider", "generic", "--issuer", "https://issuer.example.test", "--audience", "asiri-runtime", "--jwks-url", "https://issuer.example.test/jwks", "--scope", "api", "--secret", "*", "--inject-only", "--trust-expires-at", future, "--policy-expires-at", future})
+	options, err := parseServiceAccountGrantArgs([]string{"--workspace", "prod", "--service-account", "prod-api", "--scope", "api", "--secret", "*", "--inject-only", "--expires-at", future})
 	if err != nil {
 		t.Fatalf("valid future expiry flags should parse: %v", err)
 	}
-	if options.TrustExpiresAt == "" || options.PolicyExpiresAt == "" || !strings.HasSuffix(options.TrustExpiresAt, "Z") || !strings.HasSuffix(options.PolicyExpiresAt, "Z") {
-		t.Fatalf("expiry flags should be normalized to UTC RFC3339, got trust=%q policy=%q", options.TrustExpiresAt, options.PolicyExpiresAt)
+	if options.ExpiresAt == "" || !strings.HasSuffix(options.ExpiresAt, "Z") {
+		t.Fatalf("expiry flag should be normalized to UTC RFC3339, got %q", options.ExpiresAt)
 	}
-	if _, err := parseWorkloadTrustArgs([]string{"--workspace", "prod", "--workload", "prod-api", "--provider", "generic", "--issuer", "https://issuer.example.test", "--audience", "asiri-runtime", "--jwks-url", "https://issuer.example.test/jwks", "--expires-at", "not-a-date"}); err == nil {
-		t.Fatal("invalid trust expiry should fail")
-	}
-	if _, err := parseWorkloadGrantArgs([]string{"--workspace", "prod", "--workload", "prod-api", "--scope", "api", "--secret", "*", "--inject-only", "--expires-at", time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)}); err == nil {
+	if _, err := parseServiceAccountGrantArgs([]string{"--workspace", "prod", "--service-account", "prod-api", "--scope", "api", "--secret", "*", "--inject-only", "--expires-at", time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)}); err == nil {
 		t.Fatal("expired policy expiry should fail")
 	}
 }
 
-func TestWorkloadVerifyRejectsInvalidArgs(t *testing.T) {
-	if _, err := parseWorkloadVerifyArgs([]string{"--workspace", "prod", "--provider", "generic", "--token", "jwt", "--token-file", "jwt.txt", "--expect-secret", "api/TOKEN"}); err == nil {
-		t.Fatal("verify should reject token and token-file together")
+func TestServiceAccountLoginRejectsInvalidArgs(t *testing.T) {
+	if _, err := parseServiceAccountSelectArgs([]string{"--service-account", "prod-api"}, "login"); err == nil {
+		t.Fatal("service-account login should require workspace")
 	}
-	if _, err := parseWorkloadVerifyArgs([]string{"--workspace", "prod", "--provider", "generic", "--token", "jwt", "--expect-secret", "api/TOKEN", "--action", "delete"}); err == nil {
-		t.Fatal("verify should reject unknown actions")
+	if _, err := parseServiceAccountSelectArgs([]string{"--workspace", "prod"}, "login"); err == nil {
+		t.Fatal("service-account login should require service account")
 	}
-	if _, err := parseWorkloadVerifyArgs([]string{"--workspace", "prod", "--provider", "generic", "--token", "jwt", "--smoke-env", "BAD-NAME=api/TOKEN"}); err == nil {
-		t.Fatal("verify should reject invalid smoke env names")
-	}
-	if _, err := parseWorkloadVerifyArgs([]string{"--workspace", "prod", "--provider", "generic", "--token", "jwt"}); err == nil {
-		t.Fatal("verify should require an expected secret or smoke env")
+	if _, err := parseServiceAccountSelectArgs([]string{"--workspace", "prod", "--service-account", "prod-api"}, "login"); err != nil {
+		t.Fatalf("valid service-account login args should parse: %v", err)
 	}
 }
 
-func TestWorkloadPolicyReuseRequiresExactActions(t *testing.T) {
-	policies := []remotePolicyResponse{{
-		ID:            "pol_broad",
-		SubjectType:   "service",
-		SubjectID:     "prod-api",
-		ScopePattern:  "prod/api",
-		SecretPattern: "TOKEN",
-		Actions:       []string{"inject", "read"},
-		ApprovalMode:  "none",
-	}}
-	if _, ok := findMatchingRemoteWorkloadPolicy(policies, "prod-api", workloadGrantOptions{
-		ScopePattern:  "prod/api",
-		SecretPattern: "TOKEN",
-		Actions:       []string{"inject"},
-		ApprovalMode:  "none",
-	}); ok {
-		t.Fatal("inject-only setup should not reuse a broader read policy")
-	}
-	policies = append(policies, remotePolicyResponse{
-		ID:            "pol_exact",
-		SubjectType:   "service",
-		SubjectID:     "prod-api",
-		ScopePattern:  "prod/api",
-		SecretPattern: "TOKEN",
-		Actions:       []string{"inject"},
-		ApprovalMode:  "none",
-	})
-	policy, ok := findMatchingRemoteWorkloadPolicy(policies, "prod-api", workloadGrantOptions{
-		ScopePattern:  "prod/api",
-		SecretPattern: "TOKEN",
-		Actions:       []string{"inject"},
-		ApprovalMode:  "none",
-	})
-	if !ok || policy.ID != "pol_exact" {
-		t.Fatalf("expected exact inject policy reuse, got ok=%v policy=%#v", ok, policy)
-	}
-}
-
-func TestTrustedCLIConfiguresWorkloadOIDC(t *testing.T) {
+func TestTrustedCLIConfiguresServiceAccounts(t *testing.T) {
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")
 	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
@@ -218,10 +174,9 @@ func TestTrustedCLIConfiguresWorkloadOIDC(t *testing.T) {
 
 	refreshes := 0
 	createSeen := false
-	trustCreateCount := 0
 	policyCreateCount := 0
-	trusts := []map[string]any{}
 	policies := []map[string]any{}
+	accounts := []map[string]any{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/auth/session/refresh":
@@ -236,22 +191,15 @@ func TestTrustedCLIConfiguresWorkloadOIDC(t *testing.T) {
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
-		case "/v1/workloads":
+		case "/v1/service-accounts":
 			if r.Method == http.MethodGet {
 				if r.URL.Query().Get("orgId") != "org_setup" {
-					t.Fatalf("unexpected workload list org: %s", r.URL.RawQuery)
+					t.Fatalf("unexpected service account list org: %s", r.URL.RawQuery)
 				}
 				if r.Header.Get("authorization") != "Bearer at_cached" || r.Header.Get("x-asiri-device") != "dev_remote" || r.Header.Get("x-asiri-signature") == "" {
-					t.Fatalf("workload list missing signed trusted session: auth=%s device=%s", r.Header.Get("authorization"), r.Header.Get("x-asiri-device"))
+					t.Fatalf("service account list missing signed trusted session: auth=%s device=%s", r.Header.Get("authorization"), r.Header.Get("x-asiri-device"))
 				}
-				_ = json.NewEncoder(w).Encode(map[string]any{"workloads": []map[string]any{{
-					"id":              "wli_prod",
-					"orgId":           "org_setup",
-					"slug":            "prod-api",
-					"name":            "Production API",
-					"status":          "active",
-					"createdByUserId": "usr_owner",
-				}}})
+				_ = json.NewEncoder(w).Encode(map[string]any{"serviceAccounts": accounts})
 				return
 			}
 			if r.Method != http.MethodPost {
@@ -260,69 +208,36 @@ func TestTrustedCLIConfiguresWorkloadOIDC(t *testing.T) {
 			}
 			createSeen = true
 			if r.Header.Get("authorization") != "Bearer at_cached" || r.Header.Get("x-asiri-device") != "dev_remote" || r.Header.Get("x-asiri-signature") == "" {
-				t.Fatalf("workload create missing signed trusted session: auth=%s device=%s", r.Header.Get("authorization"), r.Header.Get("x-asiri-device"))
+				t.Fatalf("service account create missing signed trusted session: auth=%s device=%s", r.Header.Get("authorization"), r.Header.Get("x-asiri-device"))
 			}
 			var body map[string]string
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
 			}
 			if body["orgId"] != "org_setup" || body["slug"] != "prod-api" || body["name"] != "Production API" {
-				t.Fatalf("unexpected workload create body: %#v", body)
+				t.Fatalf("unexpected service account create body: %#v", body)
 			}
-			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"id":              "wli_prod",
+			account := map[string]any{
+				"id":              "svc_prod",
 				"orgId":           "org_setup",
 				"slug":            "prod-api",
 				"name":            "Production API",
 				"status":          "active",
 				"createdByUserId": "usr_owner",
-			})
-		case "/v1/workloads/wli_prod/oidc-trusts":
-			if r.Method == http.MethodGet {
-				if r.Header.Get("authorization") != "Bearer at_cached" || r.Header.Get("x-asiri-device") != "dev_remote" || r.Header.Get("x-asiri-signature") == "" {
-					t.Fatalf("workload trust list missing signed trusted session: auth=%s device=%s", r.Header.Get("authorization"), r.Header.Get("x-asiri-device"))
-				}
-				_ = json.NewEncoder(w).Encode(map[string]any{"trusts": trusts})
-				return
 			}
+			accounts = append(accounts, account)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(account)
+		case "/v1/service-accounts/svc_prod/disable":
 			if r.Method != http.MethodPost {
 				http.NotFound(w, r)
 				return
 			}
-			trustCreateCount++
 			if r.Header.Get("authorization") != "Bearer at_cached" || r.Header.Get("x-asiri-device") != "dev_remote" || r.Header.Get("x-asiri-signature") == "" {
-				t.Fatalf("workload trust missing signed trusted session: auth=%s device=%s", r.Header.Get("authorization"), r.Header.Get("x-asiri-device"))
+				t.Fatalf("service account disable missing signed trusted session: auth=%s device=%s", r.Header.Get("authorization"), r.Header.Get("x-asiri-device"))
 			}
-			var body struct {
-				Provider string            `json:"provider"`
-				Issuer   string            `json:"issuer"`
-				Audience string            `json:"audience"`
-				JwksURL  string            `json:"jwksUrl"`
-				Subject  string            `json:"subject"`
-				Claims   map[string]string `json:"claims"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				t.Fatal(err)
-			}
-			if body.Provider != "generic" || body.Issuer != "https://issuer.example.test" || body.Audience != "asiri-runtime" || body.JwksURL != "https://issuer.example.test/jwks" || body.Subject != "repo:o-clan/asiri:ref:refs/heads/main" || body.Claims["repository"] != "o-clan/asiri" {
-				t.Fatalf("unexpected workload trust body: %#v", body)
-			}
-			trust := map[string]any{
-				"id":         "otr_prod",
-				"orgId":      "org_setup",
-				"workloadId": "wli_prod",
-				"provider":   body.Provider,
-				"issuer":     body.Issuer,
-				"audience":   body.Audience,
-				"jwksUrl":    body.JwksURL,
-				"subject":    body.Subject,
-				"claims":     body.Claims,
-				"status":     "active",
-			}
-			trusts = append(trusts, trust)
-			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(trust)
+			accounts[0]["status"] = "disabled"
+			_ = json.NewEncoder(w).Encode(accounts[0])
 		case "/v1/policies":
 			if r.Method == http.MethodGet {
 				if r.URL.Query().Get("orgId") != "org_setup" {
@@ -396,290 +311,47 @@ func TestTrustedCLIConfiguresWorkloadOIDC(t *testing.T) {
 
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"workload", "create", "--workspace", "prod", "--slug", "prod-api", "--name", "Production API"}); code != 0 {
-		t.Fatalf("workload create failed: %s", errb.String())
+	if code := app.Run([]string{"service-account", "create", "--workspace", "prod", "--slug", "prod-api", "--name", "Production API"}); code != 0 {
+		t.Fatalf("service account create failed: %s", errb.String())
 	}
-	if !createSeen || !strings.Contains(out.String(), "Created workload prod-api") {
-		t.Fatalf("workload create did not complete as expected, seen=%v output=%s", createSeen, out.String())
-	}
-
-	out.Reset()
-	errb.Reset()
-	if code := app.Run([]string{"workload", "trust", "--workspace", "prod", "--workload", "prod-api", "--provider", "generic", "--issuer", "https://issuer.example.test", "--audience", "asiri-runtime", "--jwks-url", "https://issuer.example.test/jwks", "--subject", "repo:o-clan/asiri:ref:refs/heads/main", "--claim", "repository=o-clan/asiri"}); code != 0 {
-		t.Fatalf("workload trust failed: %s", errb.String())
-	}
-	if refreshes != 0 || trustCreateCount != 1 || !strings.Contains(out.String(), "Added generic OIDC trust") {
-		t.Fatalf("workload trust did not complete as expected, refreshes=%d creates=%d output=%s", refreshes, trustCreateCount, out.String())
+	if !createSeen || !strings.Contains(out.String(), "Created service account prod-api") {
+		t.Fatalf("service account create did not complete as expected, seen=%v output=%s", createSeen, out.String())
 	}
 
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"workload", "grant", "--workspace", "prod", "--workload", "prod-api", "--scope", "api", "--secret", "*", "--inject-only"}); code != 0 {
-		t.Fatalf("workload grant failed: %s", errb.String())
+	if code := app.Run([]string{"service-account", "list", "--workspace", "prod"}); code != 0 {
+		t.Fatalf("service account list failed: %s", errb.String())
+	}
+	if refreshes != 0 || !strings.Contains(out.String(), "prod-api") || !strings.Contains(out.String(), "Production API") {
+		t.Fatalf("service account list did not complete as expected, refreshes=%d output=%s", refreshes, out.String())
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"service-account", "grant", "--workspace", "prod", "--service-account", "prod-api", "--scope", "api", "--secret", "*", "--inject-only"}); code != 0 {
+		t.Fatalf("service account grant failed: %s", errb.String())
 	}
 	if policyCreateCount != 1 || !strings.Contains(out.String(), "Added service policy") {
-		t.Fatalf("workload grant did not complete as expected, creates=%d output=%s", policyCreateCount, out.String())
+		t.Fatalf("service account grant did not complete as expected, creates=%d output=%s", policyCreateCount, out.String())
 	}
 
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"workload", "setup", "--workspace", "prod", "--slug", "prod-api", "--name", "Production API", "--provider", "generic", "--issuer", "https://issuer.example.test", "--audience", "asiri-runtime", "--jwks-url", "https://issuer.example.test/jwks", "--subject", "repo:o-clan/asiri:ref:refs/heads/main", "--claim", "repository=o-clan/asiri", "--scope", "api", "--secret", "*", "--inject-only"}); code != 0 {
-		t.Fatalf("workload setup failed: %s", errb.String())
+	if code := app.Run([]string{"service-account", "grant", "--workspace", "prod", "--service-account", "prod-api", "--scope", "api", "--secret", "*", "--inject-only"}); code != 0 {
+		t.Fatalf("service account grant reuse failed: %s", errb.String())
 	}
-	if trustCreateCount != 1 || policyCreateCount != 1 || !strings.Contains(out.String(), "Workload setup verified") {
-		t.Fatalf("workload setup should reuse existing trust and policy, trustCreates=%d policyCreates=%d output=%s", trustCreateCount, policyCreateCount, out.String())
+	if policyCreateCount != 1 || !strings.Contains(out.String(), "already grants") {
+		t.Fatalf("service account grant should reuse existing policy, policyCreates=%d output=%s", policyCreateCount, out.String())
 	}
-}
-
-func TestWorkloadVerifyExchangesSyncsAndSmokes(t *testing.T) {
-	tmp := t.TempDir()
-	old := os.Getenv("ASIRI_HOME")
-	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
-	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
-		t.Fatal(err)
-	}
-
-	var out bytes.Buffer
-	var errb bytes.Buffer
-	app := New(&out, &errb)
-	if code := app.Run([]string{"init", "--device", "gha-runner"}); code != 0 {
-		t.Fatalf("init failed: %s", errb.String())
-	}
-	st, err := store.LoadDefault()
-	if err != nil {
-		t.Fatal(err)
-	}
-	device, err := st.ActiveDevice()
-	if err != nil {
-		t.Fatal(err)
-	}
-	expires := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
-	if err := st.LinkControlPlaneForDevice("http://control.test", "org_prod", "prod", "usr_owner", "wdev_prod", device.ID, "at_source", "rt_source", 3600, expires); err != nil {
-		t.Fatal(err)
-	}
-	st.State.RemoteBindings = map[string]asiri.RemoteWorkspaceBinding{
-		"prod": {WorkspaceID: "org_prod", WorkspaceSlug: "prod", BoundAt: time.Now().UTC()},
-	}
-	if err := st.Save(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.AddSecret("prod/api/TOKEN", "ci_secret_value"); err != nil {
-		t.Fatal(err)
-	}
-	versions, err := st.RemoteSecretVersionsForPrefix("prod")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(versions) != 1 {
-		t.Fatalf("expected one remote version, got %d", len(versions))
-	}
-
-	exchangeSeen := false
-	syncSeen := false
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("content-type", "application/json")
-		switch r.URL.Path {
-		case "/v1/workload/oidc/token":
-			exchangeSeen = true
-			var body map[string]string
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				t.Fatal(err)
-			}
-			if body["provider"] != "generic" || body["token"] != "ci.jwt" || body["expectedWorkspaceSlug"] != "prod" || body["deviceName"] != "gha-runner" || body["encryptionPublicKey"] == "" || body["signingPublicKey"] == "" {
-				t.Fatalf("unexpected OIDC exchange body: %#v", body)
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"status":        "approved",
-				"orgId":         "org_prod",
-				"workspaceSlug": "prod",
-				"userId":        "usr_workload",
-				"workloadId":    "wli_prod",
-				"workloadSlug":  "prod-api",
-				"deviceId":      "wdev_prod",
-				"accessToken":   "at_workload",
-				"expiresIn":     3600,
-			})
-		case "/v1/sync":
-			syncSeen = true
-			if r.Header.Get("authorization") != "Bearer at_workload" || r.Header.Get("x-asiri-device") != "wdev_prod" || r.Header.Get("x-asiri-signature") == "" {
-				t.Fatalf("sync missing signed workload session: auth=%s device=%s", r.Header.Get("authorization"), r.Header.Get("x-asiri-device"))
-			}
-			if r.URL.Query().Get("orgId") != "org_prod" || r.URL.Query().Get("deviceId") != "wdev_prod" {
-				t.Fatalf("unexpected sync query: %s", r.URL.RawQuery)
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"orgId":            "org_prod",
-				"deviceId":         "wdev_prod",
-				"issuedAt":         time.Now().UTC().Format(time.RFC3339),
-				"encryptedSecrets": versions,
-				"policies": []map[string]any{{
-					"id":            "pol_prod",
-					"subjectType":   "service",
-					"subjectId":     "prod-api",
-					"scopePattern":  "prod/api",
-					"secretPattern": "TOKEN",
-					"actions":       []string{"inject"},
-					"approvalMode":  "none",
-					"createdAt":     time.Now().UTC(),
-				}},
-			})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
 
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"workload", "verify", "--origin", server.URL, "--workspace", "prod", "--provider", "generic", "--token", "ci.jwt", "--expect-secret", "api/TOKEN", "--action", "inject", "--smoke-env", "ASIRI_VERIFY_TOKEN=api/TOKEN", "--force"}); code != 0 {
-		t.Fatalf("workload verify failed: %s", errb.String())
+	if code := app.Run([]string{"service-account", "disable", "--workspace", "prod", "--service-account", "prod-api"}); code != 0 {
+		t.Fatalf("service account disable failed: %s", errb.String())
 	}
-	if !exchangeSeen || !syncSeen {
-		t.Fatalf("verify should exchange OIDC and sync, exchange=%v sync=%v", exchangeSeen, syncSeen)
-	}
-	for _, expected := range []string{"Linked workload prod-api", "Synced 1 remote secret version", "Verified 1 expected secret", "No-output injection smoke passed"} {
-		if !strings.Contains(out.String(), expected) {
-			t.Fatalf("verify output missing %q: %s", expected, out.String())
-		}
-	}
-	if strings.Contains(out.String(), "ci_secret_value") || strings.Contains(errb.String(), "ci_secret_value") {
-		t.Fatalf("verify leaked secret stdout=%q stderr=%q", out.String(), errb.String())
-	}
-	st, err = store.LoadDefault()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st.State.ControlPlane == nil || st.State.ControlPlane.Source != "oidc" || st.State.ControlPlane.WorkloadSlug != "prod-api" {
-		t.Fatalf("verify should leave workload session linked: %#v", st.State.ControlPlane)
-	}
-	if allowed, reason := st.CheckPolicy("prod-api", "prod/api/TOKEN", "inject"); !allowed {
-		t.Fatalf("verify should import workload policy: %s", reason)
-	}
-}
-
-func TestWorkloadVerifyRequiresSecretInCurrentSyncBundle(t *testing.T) {
-	tmp := t.TempDir()
-	old := os.Getenv("ASIRI_HOME")
-	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
-	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
-		t.Fatal(err)
-	}
-
-	var out bytes.Buffer
-	var errb bytes.Buffer
-	app := New(&out, &errb)
-	if code := app.Run([]string{"init", "--device", "gha-runner"}); code != 0 {
-		t.Fatalf("init failed: %s", errb.String())
-	}
-	st, err := store.LoadDefault()
-	if err != nil {
-		t.Fatal(err)
-	}
-	device, err := st.ActiveDevice()
-	if err != nil {
-		t.Fatal(err)
-	}
-	expires := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
-	if err := st.LinkControlPlaneForDevice("http://control.test", "org_prod", "prod", "usr_owner", "wdev_prod", device.ID, "at_source", "rt_source", 3600, expires); err != nil {
-		t.Fatal(err)
-	}
-	st.State.RemoteBindings = map[string]asiri.RemoteWorkspaceBinding{
-		"prod": {WorkspaceID: "org_prod", WorkspaceSlug: "prod", BoundAt: time.Now().UTC()},
-	}
-	if err := st.Save(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.AddSecret("prod/api/TOKEN", "stale_local_value"); err != nil {
-		t.Fatal(err)
-	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("content-type", "application/json")
-		switch r.URL.Path {
-		case "/v1/workload/oidc/token":
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"status":        "approved",
-				"orgId":         "org_prod",
-				"workspaceSlug": "prod",
-				"userId":        "usr_workload",
-				"workloadId":    "wli_prod",
-				"workloadSlug":  "prod-api",
-				"deviceId":      "wdev_prod",
-				"accessToken":   "at_workload",
-				"expiresIn":     3600,
-			})
-		case "/v1/sync":
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"orgId":            "org_prod",
-				"deviceId":         "wdev_prod",
-				"issuedAt":         time.Now().UTC().Format(time.RFC3339),
-				"encryptedSecrets": []store.RemoteSecretVersion{},
-				"policies": []map[string]any{{
-					"id":            "pol_prod",
-					"subjectType":   "service",
-					"subjectId":     "prod-api",
-					"scopePattern":  "prod/api",
-					"secretPattern": "TOKEN",
-					"actions":       []string{"inject"},
-					"approvalMode":  "none",
-					"createdAt":     time.Now().UTC(),
-				}},
-			})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-
-	out.Reset()
-	errb.Reset()
-	code := app.Run([]string{"workload", "verify", "--origin", server.URL, "--workspace", "prod", "--provider", "generic", "--token", "ci.jwt", "--expect-secret", "api/TOKEN", "--action", "inject", "--force"})
-	if code == 0 {
-		t.Fatal("verify should fail when expected secret was not in the current sync bundle")
-	}
-	if !strings.Contains(errb.String(), "not present in the current workload sync bundle") {
-		t.Fatalf("unexpected stale-cache error: %s", errb.String())
-	}
-	if strings.Contains(out.String(), "stale_local_value") || strings.Contains(errb.String(), "stale_local_value") {
-		t.Fatalf("verify leaked stale secret stdout=%q stderr=%q", out.String(), errb.String())
-	}
-}
-
-func TestWorkloadVerifyEnvSmokeIsShellFree(t *testing.T) {
-	if err := runNoOutputEnvSmoke([]string{"ASIRI_VERIFY_TOKEN=value"}, []string{"ASIRI_VERIFY_TOKEN"}); err != nil {
-		t.Fatalf("smoke env helper failed: %v", err)
-	}
-	if err := runNoOutputEnvSmoke([]string{}, []string{"ASIRI_VERIFY_TOKEN"}); err == nil {
-		t.Fatal("smoke env helper should fail when the variable is missing")
-	}
-}
-
-func TestGitHubActionsOidcTokenFetchesAudienceWithTimeoutClient(t *testing.T) {
-	oldURL := os.Getenv("ACTIONS_ID_TOKEN_REQUEST_URL")
-	oldToken := os.Getenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
-	t.Cleanup(func() {
-		_ = os.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", oldURL)
-		_ = os.Setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", oldToken)
-	})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("authorization") != "Bearer request-token" {
-			t.Fatalf("unexpected authorization header: %s", r.Header.Get("authorization"))
-		}
-		if r.URL.Query().Get("audience") != "asiri-ci" {
-			t.Fatalf("unexpected audience query: %s", r.URL.RawQuery)
-		}
-		_ = json.NewEncoder(w).Encode(map[string]string{"value": "oidc.jwt"})
-	}))
-	defer server.Close()
-	_ = os.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", server.URL)
-	_ = os.Setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "request-token")
-
-	token, err := githubActionsOidcTokenWithClient("asiri-ci", server.Client())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if token != "oidc.jwt" {
-		t.Fatalf("unexpected token: %s", token)
+	if !strings.Contains(out.String(), "Disabled service account prod-api") {
+		t.Fatalf("service account disable did not complete as expected: %s", out.String())
 	}
 }
 
@@ -940,7 +612,7 @@ func TestSetupDoctorDoesNotMarkUnknownChecksReady(t *testing.T) {
 	}
 }
 
-func TestHumanLoginRefusesActiveWorkloadSession(t *testing.T) {
+func TestHumanLoginRefusesActiveServiceAccountSession(t *testing.T) {
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")
 	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
@@ -951,7 +623,7 @@ func TestHumanLoginRefusesActiveWorkloadSession(t *testing.T) {
 	var out bytes.Buffer
 	var errb bytes.Buffer
 	app := New(&out, &errb)
-	if code := app.Run([]string{"init", "--device", "workload-host"}); code != 0 {
+	if code := app.Run([]string{"init", "--device", "service-host"}); code != 0 {
 		t.Fatalf("init failed: %s", errb.String())
 	}
 	st, err := store.LoadDefault()
@@ -962,7 +634,7 @@ func TestHumanLoginRefusesActiveWorkloadSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.LinkWorkloadControlPlane("http://control.test", "org_prod", "prod", "usr_owner", "wli_prod", "prod-api", "wdev_prod", device.ID, "at_workload", 3600); err != nil {
+	if err := st.LinkServiceAccountControlPlane("http://control.test", "org_prod", "prod", "usr_owner", "svc_prod", "prod-api", "Production API", "wdev_prod", device.ID, "at_service", "rt_service", 3600, time.Now().UTC().Add(7*24*time.Hour).Format(time.RFC3339)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -976,17 +648,17 @@ func TestHumanLoginRefusesActiveWorkloadSession(t *testing.T) {
 	out.Reset()
 	errb.Reset()
 	if code := app.Run([]string{"login", "--origin", server.URL}); code == 0 {
-		t.Fatal("human login should fail while a workload session is active")
+		t.Fatal("human login should fail while a service account session is active")
 	}
 	if remoteHit {
-		t.Fatal("human login should not start remote refresh or device-code flow for workload sessions")
+		t.Fatal("human login should not start remote refresh or device-code flow for service account sessions")
 	}
-	if !strings.Contains(errb.String(), "workload session active; run asiri logout first") {
+	if !strings.Contains(errb.String(), "service account session active; run asiri logout first") {
 		t.Fatalf("unexpected error: %s", errb.String())
 	}
 }
 
-func TestWorkloadWipeCommandsAreRejected(t *testing.T) {
+func TestServiceAccountWipeCommandsAreRejected(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		args []string
@@ -1005,7 +677,7 @@ func TestWorkloadWipeCommandsAreRejected(t *testing.T) {
 			var out bytes.Buffer
 			var errb bytes.Buffer
 			app := New(&out, &errb)
-			if code := app.Run([]string{"init", "--device", "workload-host"}); code != 0 {
+			if code := app.Run([]string{"init", "--device", "service-host"}); code != 0 {
 				t.Fatalf("init failed: %s", errb.String())
 			}
 			st, err := store.LoadDefault()
@@ -1016,16 +688,16 @@ func TestWorkloadWipeCommandsAreRejected(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := st.LinkWorkloadControlPlane("http://control.test", "org_prod", "prod", "usr_owner", "wli_prod", "prod-api", "wdev_prod", device.ID, "at_workload", 3600); err != nil {
+			if err := st.LinkServiceAccountControlPlane("http://control.test", "org_prod", "prod", "usr_owner", "svc_prod", "prod-api", "Production API", "wdev_prod", device.ID, "at_service", "rt_service", 3600, time.Now().UTC().Add(7*24*time.Hour).Format(time.RFC3339)); err != nil {
 				t.Fatal(err)
 			}
 
 			out.Reset()
 			errb.Reset()
 			if code := app.Run(tc.args); code == 0 {
-				t.Fatalf("%v should fail for workload sessions", tc.args)
+				t.Fatalf("%v should fail for service account sessions", tc.args)
 			}
-			if !strings.Contains(errb.String(), "OIDC workload sessions cannot mutate local vault or policy state") {
+			if !strings.Contains(errb.String(), "service account sessions cannot mutate local vault or policy state") {
 				t.Fatalf("unexpected error: %s", errb.String())
 			}
 			if _, err := os.Stat(filepath.Join(tmp, "local-state.json")); err != nil {
@@ -1035,8 +707,8 @@ func TestWorkloadWipeCommandsAreRejected(t *testing.T) {
 	}
 }
 
-func TestWorkloadPullTargetsStayOnBoundWorkspace(t *testing.T) {
-	active := &asiri.ControlPlaneLink{Source: "oidc", WorkspaceID: "org_prod", WorkspaceSlug: "prod"}
+func TestServiceAccountPullTargetsStayOnBoundWorkspace(t *testing.T) {
+	active := &asiri.ControlPlaneLink{Source: "service-account", WorkspaceID: "org_prod", WorkspaceSlug: "prod"}
 	workspaces := []remoteWorkspaceResponse{
 		{ID: "org_prod", Slug: "prod", CurrentDeviceTrusted: boolPtr(true), CanPull: boolPtr(true)},
 		{ID: "org_staging", Slug: "staging", CurrentDeviceTrusted: boolPtr(true), CanPull: boolPtr(true)},
@@ -1044,20 +716,20 @@ func TestWorkloadPullTargetsStayOnBoundWorkspace(t *testing.T) {
 
 	targets, results := pullTargets(active, workspaces, pullOptions{})
 	if len(results) != 0 || len(targets) != 1 || targets[0].Workspace.Slug != "prod" {
-		t.Fatalf("default workload pull should target only active workspace, targets=%#v results=%#v", targets, results)
+		t.Fatalf("default service account pull should target only active workspace, targets=%#v results=%#v", targets, results)
 	}
 
 	targets, results = pullTargets(active, workspaces, pullOptions{Workspaces: []string{"staging", "prod"}})
 	if len(targets) != 1 || targets[0].Workspace.Slug != "prod" || len(results) != 1 || results[0].Result != "failed" {
-		t.Fatalf("explicit workload pull should fail non-active workspace and keep active target, targets=%#v results=%#v", targets, results)
+		t.Fatalf("explicit service account pull should fail non-active workspace and keep active target, targets=%#v results=%#v", targets, results)
 	}
 }
 
-func TestWorkloadRuntimeUsesSyncedServicePolicies(t *testing.T) {
+func TestServiceAccountRuntimeUsesSyncedServicePolicies(t *testing.T) {
 	expiredAt := time.Now().UTC().Add(-time.Minute)
 	validUntil := time.Now().UTC().Add(time.Hour)
 	st := &store.FileStore{State: asiri.State{
-		ControlPlane: &asiri.ControlPlaneLink{Source: "oidc", WorkloadSlug: "prod-api"},
+		ControlPlane: &asiri.ControlPlaneLink{Source: "service-account", ServiceAccountSlug: "prod-api"},
 		Policies: []asiri.Policy{{
 			ID:            "pol_stale",
 			Subject:       "prod-api",
@@ -1068,7 +740,7 @@ func TestWorkloadRuntimeUsesSyncedServicePolicies(t *testing.T) {
 			CreatedAt:     time.Now().UTC(),
 		}},
 	}}
-	importWorkloadSyncPolicies(st, []syncPolicyResponse{{
+	importServiceAccountSyncPolicies(st, []syncPolicyResponse{{
 		ID:            "pol_expired_read",
 		SubjectType:   "service",
 		SubjectID:     "prod-api",
@@ -1090,21 +762,21 @@ func TestWorkloadRuntimeUsesSyncedServicePolicies(t *testing.T) {
 		ExpiresAt:     &validUntil,
 	}})
 
-	subject, labelType, err := workloadRuntimeSubject(st, "other-agent", "process-name", true)
+	subject, labelType, err := runtimeSubject(st, "other-agent", "process-name", true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if subject != "prod-api" || labelType != "service" {
-		t.Fatalf("workload runtime subject mismatch: subject=%s type=%s", subject, labelType)
+		t.Fatalf("service account runtime subject mismatch: subject=%s type=%s", subject, labelType)
 	}
 	if allowed, _ := st.CheckPolicy(subject, "prod/api/DATABASE_URL", "read"); allowed {
-		t.Fatal("synced inject-only workload policy should not allow raw read")
+		t.Fatal("synced inject-only service account policy should not allow raw read")
 	}
 	if allowed, reason := st.CheckPolicy(subject, "prod/api/DATABASE_URL", "inject"); !allowed {
-		t.Fatalf("synced workload policy should allow inject: %s", reason)
+		t.Fatalf("synced service account policy should allow inject: %s", reason)
 	}
 	if st.State.Policies[1].ExpiresAt == nil || !st.State.Policies[1].ExpiresAt.Equal(validUntil) {
-		t.Fatalf("synced workload policy should preserve expiry: %#v", st.State.Policies[1].ExpiresAt)
+		t.Fatalf("synced service account policy should preserve expiry: %#v", st.State.Policies[1].ExpiresAt)
 	}
 }
 
