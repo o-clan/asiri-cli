@@ -1,6 +1,6 @@
 ---
 name: asiri
-description: "Use when an agent needs to operate Asiri CLI or Asiri-managed secrets: inspect secret metadata, run commands with scoped secrets, add or rotate operational secrets, grant local runtime access, push or pull encrypted records, verify workload/OIDC CI access, or diagnose Asiri workspace/device state without exposing secret values. Focus on safe operational use first; use trust, recovery, rekey, revocation, workload setup, and remote policy changes only when explicitly requested."
+description: "Use when an agent needs to operate Asiri CLI or Asiri-managed secrets: inspect secret metadata, run commands with scoped secrets, add or rotate operational secrets, grant local runtime access, push or pull encrypted records, configure service-account runtime access for CI or servers, or diagnose Asiri workspace/device state without exposing secret values. Focus on safe operational use first; use trust, recovery, rekey, revocation, service-account setup, and remote policy changes only when explicitly requested."
 ---
 
 # Asiri
@@ -136,29 +136,44 @@ Use rewrap only when the user explicitly wants trusted devices or recovery recip
 asiri rewrap --workspace <workspace>
 ```
 
-## Workloads And CI
+## Service Accounts, CI, And Servers
 
-Use workload/OIDC for CI and servers instead of long-lived shared tokens. Keep the setup and verification phases separate.
+Use service accounts for CI and servers instead of long-lived shared tokens. Service accounts are permission identities; trusted devices remain the decryption boundary.
 
-Only create or configure workloads from a real authenticated user-device session:
+Only create, disable, or grant service accounts from a real authenticated user-device session:
 
 ```sh
-asiri workload setup --workspace <workspace> --slug <workload> --name <name> --provider github --issuer https://token.actions.githubusercontent.com --audience asiri --subject <sub> --scope <scope> --secret <pattern> --inject-only
+asiri service-account create --workspace <workspace> --slug <service-account> --name <name>
+asiri service-account grant --workspace <workspace> --service-account <service-account> --scope <scope> --secret <pattern> --inject-only
 ```
 
-This is a remote control-plane mutation. Run it only when the user explicitly asked to create or update the workload, OIDC trust, or remote service policy. Do not run it from workload/OIDC sessions.
+These are remote control-plane mutations. Run them only when the user explicitly asked to create, disable, or update service-account access. Service-account sessions are read-only for control-plane and local vault mutations.
 
-In GitHub Actions, use isolated local state, let the CLI fetch the live Actions OIDC token from the runner environment, and verify without printing values:
+For service-account login, start a browser approval flow from the runtime device. A workspace owner or delegated service-account admin must approve it:
 
 ```sh
-export ASIRI_HOME="$RUNNER_TEMP/asiri-home"
+export ASIRI_HOME="<isolated-state-dir>"
 asiri init --device gha-runner
-asiri workload verify --origin <origin> --workspace <workspace> --audience asiri --expect-secret <scope/SECRET_NAME> --action inject --smoke-env ASIRI_VERIFY_SECRET=<scope/SECRET_NAME>
+asiri service-account login --origin <origin> --workspace <workspace> --service-account <service-account>
+asiri whoami
 ```
 
-`workload verify` should exchange OIDC, sync as the workload, confirm the expected secret and policy are present in the current sync bundle, and optionally run a no-output injection smoke check. Prefer this over `workload login` plus ad hoc `pull`/`env` checks.
+After approval, `whoami` should show identity type `service account`, the service-account slug/name, workspace, device, and approving human. Runtime commands audit as the service account.
 
-Avoid passing raw OIDC tokens with `--token`; use the GitHub Actions OIDC environment or `--token-file` only for controlled tests.
+Pull and injection still require the allowed secrets to be wrapped to the current trusted device:
+
+```sh
+asiri pull --workspace <workspace>
+asiri env --workspace <workspace> <scope/SECRET_NAME> -- <command> <args>
+```
+
+If pull reports that an allowed secret is not wrapped to this trusted device, ask the user to rewrap from a trusted device that can already decrypt it:
+
+```sh
+asiri rewrap --workspace <workspace>
+```
+
+Do not try to recover by storing decryption material in CI secrets unless the user explicitly chooses that operational tradeoff.
 
 ## Stop And Ask
 
@@ -167,7 +182,8 @@ Stop before running any of these unless the user directly requested that exact o
 - `asiri init` on an existing install.
 - `asiri login --force`.
 - `asiri device trust`, `asiri device revoke`, or dashboard trust changes.
-- `asiri workload create`, `asiri workload trust`, `asiri workload grant`, or `asiri workload setup`.
+- `asiri service-account create`, `asiri service-account disable`, or `asiri service-account grant`.
+- `asiri service-account login` when it would bind a new runtime device to a service account.
 - `asiri recovery setup`, `asiri recovery restore`, or recovery key handling.
 - `asiri rekey`.
 - Deleting or editing local Asiri state, keychain entries, or keyring material.
@@ -179,6 +195,6 @@ When blocked by local key material or trust state, preserve the current state an
 
 Trusted device state is the runtime security boundary. Agent, app, process, and command names are policy and audit labels, not strong identities.
 
-For CI or servers, prefer workload/OIDC setup over long-lived shared tokens. A workload should receive a short-lived scoped session, then use the same local-runtime patterns: inject, mount, broker, push, pull, and audit.
+For CI or servers, prefer service accounts over long-lived shared tokens. A service account should receive a browser-approved scoped session, then use the same local-runtime patterns: inject, mount, broker, pull, and audit. Service-account sessions cannot mutate secrets, policies, devices, members, billing, recovery, or service accounts.
 
 For suspected host compromise, revocation blocks future access but does not erase what the host may already have seen. Rotate the upstream secret after revocation.
