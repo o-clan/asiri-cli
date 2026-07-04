@@ -40,7 +40,7 @@ type App struct {
 	In  io.Reader
 }
 
-var Version = "0.1.29"
+var Version = "0.1.30"
 
 var defaultControlPlaneOrigin = "http://127.0.0.1:4173"
 
@@ -692,6 +692,9 @@ func (a App) serviceAccountCreate(st *store.FileStore, args []string) int {
 	if err := st.RequireInitialized(); err != nil {
 		return a.fail(err)
 	}
+	if err := rejectServiceAccountControlPlaneMutation(st); err != nil {
+		return a.fail(err)
+	}
 	options, err := parseServiceAccountCreateArgs(args)
 	if err != nil {
 		return a.fail(err)
@@ -747,6 +750,9 @@ func (a App) serviceAccountDisable(st *store.FileStore, args []string) int {
 	if err := st.RequireInitialized(); err != nil {
 		return a.fail(err)
 	}
+	if err := rejectServiceAccountControlPlaneMutation(st); err != nil {
+		return a.fail(err)
+	}
 	options, err := parseServiceAccountSelectArgs(args, "disable")
 	if err != nil {
 		return a.fail(err)
@@ -774,6 +780,9 @@ func (a App) serviceAccountDisable(st *store.FileStore, args []string) int {
 
 func (a App) serviceAccountGrant(st *store.FileStore, args []string) int {
 	if err := st.RequireInitialized(); err != nil {
+		return a.fail(err)
+	}
+	if err := rejectServiceAccountControlPlaneMutation(st); err != nil {
 		return a.fail(err)
 	}
 	options, err := parseServiceAccountGrantArgs(args)
@@ -2593,6 +2602,9 @@ func (a App) whoami(st *store.FileStore, args []string) int {
 	if result.Session.ServiceAccountSlug != "" || st.State.ControlPlane.ServiceAccountSlug != "" {
 		fmt.Fprintf(tw, "IDENTITY\tservice account\n")
 		fmt.Fprintf(tw, "SERVICE ACCOUNT\t%s\n", printable(firstNonEmpty(result.Session.ServiceAccountSlug, st.State.ControlPlane.ServiceAccountSlug)))
+		if firstNonEmpty(result.Session.ServiceAccountName, st.State.ControlPlane.ServiceAccountName) != "" {
+			fmt.Fprintf(tw, "SERVICE ACCOUNT NAME\t%s\n", printable(firstNonEmpty(result.Session.ServiceAccountName, st.State.ControlPlane.ServiceAccountName)))
+		}
 		if firstNonEmpty(result.Session.ApprovedByUserID, st.State.ControlPlane.ApprovedByUserID) != "" {
 			fmt.Fprintf(tw, "APPROVED BY\t%s\n", printable(firstNonEmpty(result.Session.ApprovedByUserID, st.State.ControlPlane.ApprovedByUserID)))
 		}

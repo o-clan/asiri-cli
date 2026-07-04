@@ -191,6 +191,61 @@ func TestServiceAccountRemoteDeleteCommandsAreRejectedBeforeNetwork(t *testing.T
 	}
 }
 
+func TestServiceAccountManagementCommandsAreRejectedBeforeNetwork(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{name: "create", args: []string{"service-account", "create", "--workspace", "prod", "--slug", "prod-api-next", "--name", "Production API Next"}},
+		{name: "disable", args: []string{"service-account", "disable", "--workspace", "prod", "--service-account", "prod-api"}},
+		{name: "grant", args: []string{"service-account", "grant", "--workspace", "prod", "--service-account", "prod-api", "--scope", "api", "--secret", "*", "--inject-only"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			old := os.Getenv("ASIRI_HOME")
+			t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+			if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+				t.Fatal(err)
+			}
+			var out bytes.Buffer
+			var errb bytes.Buffer
+			app := New(&out, &errb)
+			if code := app.Run([]string{"init", "--device", "service-host"}); code != 0 {
+				t.Fatalf("init failed: %s", errb.String())
+			}
+			st, err := store.LoadDefault()
+			if err != nil {
+				t.Fatal(err)
+			}
+			device, err := st.ActiveDevice()
+			if err != nil {
+				t.Fatal(err)
+			}
+			remoteHit := false
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				remoteHit = true
+				http.Error(w, "unexpected", http.StatusInternalServerError)
+			}))
+			defer server.Close()
+			if err := st.LinkServiceAccountControlPlane(server.URL, "org_prod", "prod", "usr_owner", "svc_prod", "prod-api", "Production API", "wdev_prod", device.ID, "at_service", "rt_service", 3600, time.Now().UTC().Add(7*24*time.Hour).Format(time.RFC3339)); err != nil {
+				t.Fatal(err)
+			}
+
+			out.Reset()
+			errb.Reset()
+			if code := app.Run(tc.args); code == 0 {
+				t.Fatalf("%v should fail for service account sessions", tc.args)
+			}
+			if remoteHit {
+				t.Fatal("service-account management command should not call remote endpoints for service account sessions")
+			}
+			if !strings.Contains(errb.String(), "service account sessions are read-only for control-plane mutations") {
+				t.Fatalf("unexpected error: %s", errb.String())
+			}
+		})
+	}
+}
+
 func TestServiceAccountGrantRejectsInvalidExpiryFlags(t *testing.T) {
 	future := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
 	options, err := parseServiceAccountGrantArgs([]string{"--workspace", "prod", "--service-account", "prod-api", "--scope", "api", "--secret", "*", "--inject-only", "--expires-at", future})
@@ -938,6 +993,73 @@ func TestWhoamiUsesFreshCachedControlPlaneToken(t *testing.T) {
 	}
 	got := out.String()
 	for _, expected := range []string{"peter@example.com", "Peter Owner", "oclan-co", "LOCAL DEVICE", "qa-laptop", "REMOTE DEVICE", "dev_remote"} {
+		if !strings.Contains(got, expected) {
+			t.Fatalf("whoami output missing %q: %s", expected, got)
+		}
+	}
+}
+
+func TestWhoamiShowsServiceAccountName(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		if r.URL.Path != "/v1/whoami" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"user": map[string]any{
+				"id":     "usr_owner",
+				"status": "active",
+			},
+			"workspace": map[string]any{
+				"id":   "org_prod",
+				"slug": "prod",
+			},
+			"session": map[string]any{
+				"identityType":       "service_account",
+				"workspaceId":        "org_prod",
+				"deviceId":           "wdev_prod",
+				"serviceAccountSlug": "prod-api",
+				"serviceAccountName": "Production API",
+				"approvedByUserId":   "usr_owner",
+				"status":             "active",
+			},
+		})
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "service-host"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkServiceAccountControlPlane(server.URL, "org_prod", "prod", "usr_owner", "svc_prod", "prod-api", "Production API", "wdev_prod", device.ID, "at_service", "rt_service", 3600, time.Now().UTC().Add(7*24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"whoami"}); code != 0 {
+		t.Fatalf("whoami failed: %s", errb.String())
+	}
+	got := out.String()
+	for _, expected := range []string{"IDENTITY", "service account", "SERVICE ACCOUNT", "prod-api", "SERVICE ACCOUNT NAME", "Production API", "APPROVED BY", "usr_owner"} {
 		if !strings.Contains(got, expected) {
 			t.Fatalf("whoami output missing %q: %s", expected, got)
 		}

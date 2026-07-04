@@ -88,13 +88,13 @@ asiri add --workspace <workspace> <scope/SECRET_NAME> --value-file <path>
 After adding or rotating a secret that must be preserved remotely, push the narrowest target:
 
 ```sh
-asiri push --workspace <workspace> --scope <scope> --secret <SECRET_NAME>
+asiri push --workspace <workspace> --secret <scope/SECRET_NAME>
 ```
 
 Before a risky or broad push, use dry-run:
 
 ```sh
-asiri push --workspace <workspace> --scope <scope> --secret <SECRET_NAME> --dry-run
+asiri push --workspace <workspace> --secret <scope/SECRET_NAME> --dry-run
 ```
 
 If a same-version remote record already exists and matches, push should skip it. If Asiri reports a conflict, do not overwrite blindly; inspect the local and remote metadata and ask.
@@ -143,11 +143,11 @@ Use service accounts for CI and servers instead of long-lived shared tokens. Ser
 Only create, disable, or grant service accounts from a real authenticated user-device session:
 
 ```sh
-asiri service-account create --workspace <workspace> --slug <service-account> --name <name>
+asiri service-account create --workspace <workspace> --slug <service-account> --name "<name>"
 asiri service-account grant --workspace <workspace> --service-account <service-account> --scope <scope> --secret <pattern> --inject-only
 ```
 
-These are remote control-plane mutations. Run them only when the user explicitly asked to create, disable, or update service-account access. Service-account sessions are read-only for control-plane and local vault mutations.
+These are remote control-plane mutations. Run them only when the user explicitly asked to create, disable, or update service-account access. Service-account sessions cannot change control-plane state, add or rotate local secrets, remove local state, or edit local policy directly. They can pull encrypted records and allowed service policies for their active workspace, then use those secrets through the local runtime.
 
 For service-account login, start a browser approval flow from the runtime device. A workspace owner or delegated service-account admin must approve it:
 
