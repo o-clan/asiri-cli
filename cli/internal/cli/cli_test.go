@@ -138,6 +138,59 @@ func TestServiceAccountControlPlaneSessionsRejectMutations(t *testing.T) {
 	}
 }
 
+func TestServiceAccountRemoteDeleteCommandsAreRejectedBeforeNetwork(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{name: "secret delete", args: []string{"secret", "delete", "--workspace", "prod", "prod/api/KEY", "--dry-run"}},
+		{name: "remote rm", args: []string{"rm", "--remote", "--workspace", "prod", "prod/api/KEY", "--dry-run"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			old := os.Getenv("ASIRI_HOME")
+			t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+			if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+				t.Fatal(err)
+			}
+			var out bytes.Buffer
+			var errb bytes.Buffer
+			app := New(&out, &errb)
+			if code := app.Run([]string{"init", "--device", "service-host"}); code != 0 {
+				t.Fatalf("init failed: %s", errb.String())
+			}
+			st, err := store.LoadDefault()
+			if err != nil {
+				t.Fatal(err)
+			}
+			device, err := st.ActiveDevice()
+			if err != nil {
+				t.Fatal(err)
+			}
+			remoteHit := false
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				remoteHit = true
+				http.Error(w, "unexpected", http.StatusInternalServerError)
+			}))
+			defer server.Close()
+			if err := st.LinkServiceAccountControlPlane(server.URL, "org_prod", "prod", "usr_owner", "svc_prod", "prod-api", "Production API", "wdev_prod", device.ID, "at_service", "rt_service", 3600, time.Now().UTC().Add(7*24*time.Hour).Format(time.RFC3339)); err != nil {
+				t.Fatal(err)
+			}
+			out.Reset()
+			errb.Reset()
+			if code := app.Run(tc.args); code == 0 {
+				t.Fatalf("%v should fail for service account sessions", tc.args)
+			}
+			if remoteHit {
+				t.Fatal("remote delete command should not call remote endpoints for service account sessions")
+			}
+			if !strings.Contains(errb.String(), "service account sessions are read-only for control-plane mutations") {
+				t.Fatalf("unexpected error: %s", errb.String())
+			}
+		})
+	}
+}
+
 func TestServiceAccountGrantRejectsInvalidExpiryFlags(t *testing.T) {
 	future := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
 	options, err := parseServiceAccountGrantArgs([]string{"--workspace", "prod", "--service-account", "prod-api", "--scope", "api", "--secret", "*", "--inject-only", "--expires-at", future})
@@ -1781,6 +1834,18 @@ func TestRemoteRevocationClearsLocalKeyMaterial(t *testing.T) {
 
 func serverURL(r *http.Request) string {
 	return "http://" + r.Host
+}
+
+func remoteDeleteTokenFromOutput(t *testing.T, output string) string {
+	t.Helper()
+	for _, line := range strings.Split(output, "\n") {
+		token, ok := strings.CutPrefix(line, "Confirmation token: ")
+		if ok && strings.HasPrefix(token, "del_") {
+			return token
+		}
+	}
+	t.Fatalf("missing confirmation token in output: %s", output)
+	return ""
 }
 
 func TestPushAndPullUseBearerAccessToken(t *testing.T) {
@@ -4695,6 +4760,7 @@ func TestRemoteSecretDeleteMarksActiveRemoteVersionDeleted(t *testing.T) {
 		t.Fatal(err)
 	}
 	workspaceOverviewSeen := false
+	preflightSeen := false
 	deleteSeen := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "application/json")
@@ -4739,6 +4805,24 @@ func TestRemoteSecretDeleteMarksActiveRemoteVersionDeleted(t *testing.T) {
 					{"id": "sec_other", "orgId": "org_other", "workspaceSlug": "other-co", "scope": "other-co/local/asiri", "name": "PUSHED", "version": 1, "status": "active", "canWrite": true},
 				},
 			})
+		case "/v1/secrets/sec_delete/delete-preflight":
+			preflightSeen = true
+			if r.Method != http.MethodPost {
+				t.Fatalf("expected POST preflight, got %s", r.Method)
+			}
+			if r.Header.Get("authorization") != "Bearer at_delete" {
+				t.Fatalf("unexpected preflight auth header: %s", r.Header.Get("authorization"))
+			}
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["createdByDeviceId"] != "dev_oclan" || body["version"] != float64(2) {
+				t.Fatalf("preflight request used wrong body: %#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "sec_delete", "orgId": "org_oclan", "scope": "oclan-co/local/asiri", "name": "PUSHED", "version": 2, "status": "active",
+			})
 		case "/v1/secrets/sec_delete/delete":
 			deleteSeen = true
 			if r.Method != http.MethodPost {
@@ -4747,12 +4831,15 @@ func TestRemoteSecretDeleteMarksActiveRemoteVersionDeleted(t *testing.T) {
 			if r.Header.Get("authorization") != "Bearer at_delete" {
 				t.Fatalf("unexpected delete auth header: %s", r.Header.Get("authorization"))
 			}
-			var body map[string]string
+			var body map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
 			}
 			if body["createdByDeviceId"] != "dev_oclan" {
 				t.Fatalf("delete request used wrong device id: %#v", body)
+			}
+			if body["version"] != float64(2) {
+				t.Fatalf("delete request used wrong version: %#v", body)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"id": "sec_delete", "orgId": "org_oclan", "scope": "oclan-co/local/asiri", "name": "PUSHED", "version": 2, "status": "deleted",
@@ -4779,7 +4866,19 @@ func TestRemoteSecretDeleteMarksActiveRemoteVersionDeleted(t *testing.T) {
 	}
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "local/asiri/PUSHED", "--yes"}); code != 0 {
+	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "local/asiri/PUSHED", "--dry-run"}); code != 0 {
+		t.Fatalf("remote secret delete dry-run failed: %s", errb.String())
+	}
+	if deleteSeen {
+		t.Fatal("remote secret delete dry-run should not call delete endpoint")
+	}
+	if !preflightSeen {
+		t.Fatal("remote secret delete dry-run should call delete preflight")
+	}
+	token := remoteDeleteTokenFromOutput(t, out.String())
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "local/asiri/PUSHED", "--confirm-token", token}); code != 0 {
 		t.Fatalf("remote secret delete failed: %s", errb.String())
 	}
 	if !workspaceOverviewSeen || !deleteSeen {
@@ -4873,7 +4972,7 @@ func TestRemoteSecretDeleteConfirmationAndPathGuards(t *testing.T) {
 	}
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "oclan-co/local/asiri/PUSHED", "--yes"}); code == 0 {
+	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "oclan-co/local/asiri/PUSHED"}); code == 0 {
 		t.Fatal("workspace-prefixed remote delete path should fail")
 	}
 	if !strings.Contains(errb.String(), "accepts short paths") {
@@ -4894,7 +4993,7 @@ func TestRemoteSecretDeleteConfirmationAndPathGuards(t *testing.T) {
 	if deleteCount != 0 {
 		t.Fatalf("confirmation mismatch should not delete, deleteCount=%d", deleteCount)
 	}
-	app.In = strings.NewReader("local/asiri/PUSHED \n")
+	app.In = strings.NewReader("delete oclan-co local/asiri/PUSHED v1 \n")
 	out.Reset()
 	errb.Reset()
 	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "local/asiri/PUSHED"}); code == 0 {
@@ -4906,7 +5005,7 @@ func TestRemoteSecretDeleteConfirmationAndPathGuards(t *testing.T) {
 	if deleteCount != 0 {
 		t.Fatalf("whitespace confirmation mismatch should not delete, deleteCount=%d", deleteCount)
 	}
-	app.In = strings.NewReader("local/asiri/PUSHED\n")
+	app.In = strings.NewReader("delete oclan-co local/asiri/PUSHED v1\n")
 	out.Reset()
 	errb.Reset()
 	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "local/asiri/PUSHED"}); code != 0 {
@@ -4914,6 +5013,101 @@ func TestRemoteSecretDeleteConfirmationAndPathGuards(t *testing.T) {
 	}
 	if deleteCount != 1 {
 		t.Fatalf("expected one confirmed delete, got %d", deleteCount)
+	}
+}
+
+func TestRemoteSecretRestoreRestoresDeletedRemoteVersion(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	restoreSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_restore_delete",
+				"userCode":                "RDEL-123",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=RDEL-123",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      "at_restore_delete",
+				"refreshToken":     "rt_restore_delete",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/orgs":
+			if r.URL.Query().Get("includeSecrets") != "1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"activeOrgId":   "org_oclan",
+					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				})
+				return
+			}
+			if r.URL.Query().Get("includeInactive") != "1" {
+				t.Fatalf("restore lookup should include inactive secrets: %s", r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"activeOrgId":   "org_oclan",
+				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				"secrets": []map[string]any{
+					{"id": "sec_restore", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "PUSHED", "version": 2, "status": "deleted", "canWrite": true},
+				},
+			})
+		case "/v1/secrets/sec_restore/restore":
+			restoreSeen = true
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["createdByDeviceId"] != "dev_oclan" || body["version"] != float64(2) {
+				t.Fatalf("restore request used wrong body: %#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "sec_restore", "orgId": "org_oclan", "scope": "oclan-co/local/asiri", "name": "PUSHED", "version": 2, "status": "active",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"secret", "restore", "--workspace", "oclan-co", "local/asiri/PUSHED", "--yes"}); code != 0 {
+		t.Fatalf("remote secret restore failed: %s", errb.String())
+	}
+	if !restoreSeen {
+		t.Fatal("expected restore request")
+	}
+	for _, expected := range []string{"Restored remote secret", "local/asiri/PUSHED", "oclan-co", "v2"} {
+		if !strings.Contains(out.String(), expected) {
+			t.Fatalf("restore output missing %q: %s", expected, out.String())
+		}
 	}
 }
 
@@ -5011,7 +5205,8 @@ func TestRemoteSecretDeleteFailureModes(t *testing.T) {
 			}
 			out.Reset()
 			errb.Reset()
-			if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "local/asiri/PUSHED", "--yes"}); code == 0 {
+			app.In = strings.NewReader("delete oclan-co local/asiri/PUSHED v1\n")
+			if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "local/asiri/PUSHED"}); code == 0 {
 				t.Fatal("remote delete failure mode should fail")
 			}
 			if !strings.Contains(errb.String(), tc.want) {
@@ -5080,13 +5275,31 @@ func TestRemoteSecretBulkDeleteOnlyRemoteOnlyUnwrapped(t *testing.T) {
 					{"id": "sec_local", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "LOCAL_COPY", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": unwrapped},
 				},
 			})
+		case "/v1/secrets/sec_candidate_a/delete-preflight", "/v1/secrets/sec_candidate_b/delete-preflight":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["createdByDeviceId"] != "dev_oclan" {
+				t.Fatalf("bulk preflight used wrong device id: %#v", body)
+			}
+			if body["version"] != float64(1) {
+				t.Fatalf("bulk preflight used wrong version: %#v", body)
+			}
+			id := strings.TrimPrefix(strings.TrimSuffix(r.URL.Path, "/delete-preflight"), "/v1/secrets/")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": id, "orgId": "org_oclan", "scope": "oclan-co/prod", "name": "GHOST", "version": 1, "status": "active",
+			})
 		case "/v1/secrets/sec_candidate_a/delete", "/v1/secrets/sec_candidate_b/delete":
-			var body map[string]string
+			var body map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
 			}
 			if body["createdByDeviceId"] != "dev_oclan" {
 				t.Fatalf("bulk delete used wrong device id: %#v", body)
+			}
+			if body["version"] != float64(1) {
+				t.Fatalf("bulk delete used wrong version: %#v", body)
 			}
 			id := strings.TrimPrefix(strings.TrimSuffix(r.URL.Path, "/delete"), "/v1/secrets/")
 			deletedIDs = append(deletedIDs, id)
@@ -5115,7 +5328,13 @@ func TestRemoteSecretBulkDeleteOnlyRemoteOnlyUnwrapped(t *testing.T) {
 	}
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "--remote-only-unwrapped", "--yes"}); code != 0 {
+	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "--remote-only-unwrapped", "--dry-run"}); code != 0 {
+		t.Fatalf("bulk remote delete dry-run failed: %s", errb.String())
+	}
+	token := remoteDeleteTokenFromOutput(t, out.String())
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "--remote-only-unwrapped", "--confirm-token", token}); code != 0 {
 		t.Fatalf("bulk remote delete failed: %s", errb.String())
 	}
 	sort.Strings(deletedIDs)
@@ -5131,6 +5350,342 @@ func TestRemoteSecretBulkDeleteOnlyRemoteOnlyUnwrapped(t *testing.T) {
 	}
 	if _, ok := st.State.Secrets[store.SecretKey("oclan-co/local/asiri", "LOCAL_COPY")]; !ok {
 		t.Fatal("bulk remote delete should not remove local secrets")
+	}
+}
+
+func TestRemoteRemoveDeletesRemoteOnlyRecordsWithToken(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	deleteCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_rm_remote",
+				"userCode":                "RMR-123",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=RMR-123",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      "at_rm_remote",
+				"refreshToken":     "rt_rm_remote",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/orgs":
+			if r.URL.Query().Get("includeSecrets") != "1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"activeOrgId":   "org_oclan",
+					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				})
+				return
+			}
+			wrapped := true
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"activeOrgId":   "org_oclan",
+				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				"secrets": []map[string]any{
+					{"id": "sec_wrapped_remote_only", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/prod", "name": "WRAPPED_ONLY", "version": 3, "status": "active", "canWrite": true, "wrappedToCurrentDevice": wrapped},
+				},
+			})
+		case "/v1/secrets/sec_wrapped_remote_only/delete-preflight":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["createdByDeviceId"] != "dev_oclan" || body["version"] != float64(3) {
+				t.Fatalf("remote rm used wrong preflight body: %#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "sec_wrapped_remote_only", "orgId": "org_oclan", "scope": "oclan-co/prod", "name": "WRAPPED_ONLY", "version": 3, "status": "active",
+			})
+		case "/v1/secrets/sec_wrapped_remote_only/delete":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["createdByDeviceId"] != "dev_oclan" || body["version"] != float64(3) {
+				t.Fatalf("remote rm used wrong delete body: %#v", body)
+			}
+			deleteCount++
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "sec_wrapped_remote_only", "orgId": "org_oclan", "scope": "oclan-co/prod", "name": "WRAPPED_ONLY", "version": 3, "status": "deleted",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"rm", "--remote", "--workspace", "oclan-co", "--where", "remote-only", "--dry-run"}); code != 0 {
+		t.Fatalf("remote rm dry-run failed: %s", errb.String())
+	}
+	if !strings.Contains(out.String(), "WRAPPED_ONLY v3") {
+		t.Fatalf("dry-run did not show remote-only secret: %s", out.String())
+	}
+	token := remoteDeleteTokenFromOutput(t, out.String())
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"rm", "--remote", "--workspace", "oclan-co", "--where", "remote-only", "--confirm-token", token}); code != 0 {
+		t.Fatalf("remote rm failed: %s", errb.String())
+	}
+	if deleteCount != 1 {
+		t.Fatalf("expected one remote delete, got %d", deleteCount)
+	}
+	if !strings.Contains(out.String(), "Marked 1 remote-only active secret") {
+		t.Fatalf("remote rm output missing count: %s", out.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "--where", "remote-only", "--dry-run"}); code != 0 {
+		t.Fatalf("secret delete remote-only dry-run failed: %s", errb.String())
+	}
+	token = remoteDeleteTokenFromOutput(t, out.String())
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "--where", "remote-only", "--confirm-token", token}); code != 0 {
+		t.Fatalf("secret delete remote-only failed: %s", errb.String())
+	}
+	if deleteCount != 2 {
+		t.Fatalf("expected two remote deletes after second command, got %d", deleteCount)
+	}
+}
+
+func TestRemoteSecretBulkDeletePreflightsBeforeMutation(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	actualDeletes := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_bulk_preflight",
+				"userCode":                "BPRE-123",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=BPRE-123",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      "at_bulk_preflight",
+				"refreshToken":     "rt_bulk_preflight",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/orgs":
+			if r.URL.Query().Get("includeSecrets") != "1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"activeOrgId":   "org_oclan",
+					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				})
+				return
+			}
+			unwrapped := false
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"activeOrgId":   "org_oclan",
+				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				"secrets": []map[string]any{
+					{"id": "sec_preflight_a", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/prod", "name": "A", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": unwrapped},
+					{"id": "sec_preflight_b", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/prod", "name": "B", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": unwrapped},
+				},
+			})
+		case "/v1/secrets/sec_preflight_a/delete-preflight", "/v1/secrets/sec_preflight_b/delete-preflight":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			id := strings.TrimPrefix(strings.TrimSuffix(r.URL.Path, "/delete-preflight"), "/v1/secrets/")
+			if id == "sec_preflight_b" {
+				w.WriteHeader(http.StatusForbidden)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": "forbidden", "message": "secret delete denied"})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "orgId": "org_oclan", "scope": "oclan-co/prod", "name": "A", "version": 1, "status": "active"})
+		case "/v1/secrets/sec_preflight_a/delete", "/v1/secrets/sec_preflight_b/delete":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			id := strings.TrimPrefix(strings.TrimSuffix(r.URL.Path, "/delete"), "/v1/secrets/")
+			actualDeletes++
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "orgId": "org_oclan", "scope": "oclan-co/prod", "name": "A", "version": 1, "status": "deleted"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "--where", "remote-only", "--dry-run"}); code == 0 {
+		t.Fatal("bulk dry-run should fail when preflight fails")
+	}
+	if actualDeletes != 0 {
+		t.Fatalf("bulk dry-run should not mutate when preflight fails, got %d delete(s)", actualDeletes)
+	}
+	if !strings.Contains(errb.String(), "secret delete denied") {
+		t.Fatalf("bulk dry-run preflight error was not clear: %s", errb.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "--where", "remote-only", "--yes"}); code == 0 {
+		t.Fatal("bulk delete should fail when preflight fails")
+	}
+	if actualDeletes != 0 {
+		t.Fatalf("bulk delete should not mutate before all preflights pass, got %d delete(s)", actualDeletes)
+	}
+	if !strings.Contains(errb.String(), "secret delete denied") {
+		t.Fatalf("bulk preflight error was not clear: %s", errb.String())
+	}
+}
+
+func TestRemoteSecretBulkDeleteRestoresEarlierDeletesWhenLaterDeleteFails(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	deletedIDs := []string{}
+	restoredIDs := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_bulk_rollback",
+				"userCode":                "BROLL-123",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=BROLL-123",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      "at_bulk_rollback",
+				"refreshToken":     "rt_bulk_rollback",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/orgs":
+			if r.URL.Query().Get("includeSecrets") != "1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"activeOrgId":   "org_oclan",
+					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				})
+				return
+			}
+			unwrapped := false
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"activeOrgId":   "org_oclan",
+				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				"secrets": []map[string]any{
+					{"id": "sec_rollback_a", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/prod", "name": "A", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": unwrapped},
+					{"id": "sec_rollback_b", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/prod", "name": "B", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": unwrapped},
+				},
+			})
+		case "/v1/secrets/sec_rollback_a/delete-preflight", "/v1/secrets/sec_rollback_b/delete-preflight":
+			id := strings.TrimPrefix(strings.TrimSuffix(r.URL.Path, "/delete-preflight"), "/v1/secrets/")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "orgId": "org_oclan", "scope": "oclan-co/prod", "name": strings.TrimPrefix(id, "sec_rollback_"), "version": 1, "status": "active"})
+		case "/v1/secrets/sec_rollback_a/delete":
+			deletedIDs = append(deletedIDs, "sec_rollback_a")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "sec_rollback_a", "orgId": "org_oclan", "scope": "oclan-co/prod", "name": "A", "version": 1, "status": "deleted"})
+		case "/v1/secrets/sec_rollback_b/delete":
+			deletedIDs = append(deletedIDs, "sec_rollback_b")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "delete_failed", "message": "delete failed after preflight"})
+		case "/v1/secrets/sec_rollback_a/restore":
+			restoredIDs = append(restoredIDs, "sec_rollback_a")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "sec_rollback_a", "orgId": "org_oclan", "scope": "oclan-co/prod", "name": "A", "version": 1, "status": "active"})
+		case "/v1/secrets/sec_rollback_b/restore":
+			restoredIDs = append(restoredIDs, "sec_rollback_b")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "sec_rollback_b", "orgId": "org_oclan", "scope": "oclan-co/prod", "name": "B", "version": 1, "status": "active"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"secret", "delete", "--workspace", "oclan-co", "--where", "remote-only", "--yes"}); code == 0 {
+		t.Fatal("bulk delete should fail when a post-preflight delete fails")
+	}
+	if got := strings.Join(deletedIDs, ","); got != "sec_rollback_a,sec_rollback_b" {
+		t.Fatalf("unexpected delete attempts: %s", got)
+	}
+	if got := strings.Join(restoredIDs, ","); got != "sec_rollback_b,sec_rollback_a" {
+		t.Fatalf("expected rollback restore for failed and first delete, got %s", got)
+	}
+	if !strings.Contains(errb.String(), "restored 1 earlier delete") || !strings.Contains(errb.String(), "checked failed target") {
+		t.Fatalf("rollback message was not clear: %s", errb.String())
 	}
 }
 
@@ -5181,7 +5736,22 @@ func TestRemoteSecretBulkDeleteConfirmation(t *testing.T) {
 					{"id": "sec_confirm_bulk", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/prod", "name": "GHOST", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": unwrapped},
 				},
 			})
+		case "/v1/secrets/sec_confirm_bulk/delete-preflight":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["createdByDeviceId"] != "dev_oclan" || body["version"] != float64(1) {
+				t.Fatalf("bulk preflight used wrong body: %#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "sec_confirm_bulk", "orgId": "org_oclan", "scope": "oclan-co/prod", "name": "GHOST", "version": 1, "status": "active",
+			})
 		case "/v1/secrets/sec_confirm_bulk/delete":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
 			deleteCount++
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"id": "sec_confirm_bulk", "orgId": "org_oclan", "scope": "oclan-co/prod", "name": "GHOST", "version": 1, "status": "deleted",
