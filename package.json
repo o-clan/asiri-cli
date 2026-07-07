@@ -1,6 +1,6 @@
 {
   "name": "asiri",
-  "version": "0.1.30",
+  "version": "0.1.31",
   "private": true,
   "description": "Asiri CLI public source and releases.",
   "type": "module",

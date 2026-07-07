@@ -44,7 +44,7 @@ type App struct {
 	In  io.Reader
 }
 
-var Version = "0.1.30"
+var Version = "0.1.31"
 
 var defaultControlPlaneOrigin = "http://127.0.0.1:4173"
 
