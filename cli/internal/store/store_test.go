@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -57,6 +58,186 @@ func TestEncryptedLocalSecretStoreDoesNotPersistPlaintext(t *testing.T) {
 	}
 	if secret.NameHash == "" || !strings.HasPrefix(secret.NameHash, "sn_") {
 		t.Fatalf("expected secret name hash, got %q", secret.NameHash)
+	}
+}
+
+func TestAuditLedgerEncryptsLocalEventsAndDetectsTampering(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	st, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.UseDefaultFileKeyStore()
+	t.Cleanup(keystore.ClearConfiguredFileKeyStoreDir)
+	if err := st.InitializeLocal(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("offline local vault initialized")) {
+		t.Fatalf("audit reason should not be stored as plaintext: %s", string(raw))
+	}
+	var state asiri.State
+	if err := json.Unmarshal(raw, &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.AuditLedger) == 0 || state.AuditLedgerHead == nil {
+		t.Fatal("expected encrypted audit ledger and signed head")
+	}
+	if state.AuditLedgerHead.SignatureAlg != "hmac-sha256" || state.AuditLedgerHead.SignerDeviceID != "" {
+		t.Fatalf("audit ledger head should be anchored to the audit key, got %#v", state.AuditLedgerHead)
+	}
+	for _, record := range state.AuditLedger {
+		if record.SignatureAlg != "hmac-sha256" || record.SignerDeviceID != "" {
+			t.Fatalf("audit ledger record should be anchored to the audit key, got %#v", record)
+		}
+	}
+	var missingHead map[string]any
+	if err := json.Unmarshal(raw, &missingHead); err != nil {
+		t.Fatal(err)
+	}
+	delete(missingHead, "auditLedgerHead")
+	missingHeadBytes, err := json.MarshalIndent(missingHead, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, missingHeadBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected missing audit ledger head to fail load")
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var plaintextFallback map[string]any
+	if err := json.Unmarshal(raw, &plaintextFallback); err != nil {
+		t.Fatal(err)
+	}
+	delete(plaintextFallback, "auditLedger")
+	delete(plaintextFallback, "auditLedgerHead")
+	plaintextFallback["audit"] = []map[string]any{{
+		"id":        "aud_fake",
+		"actor":     "attacker",
+		"action":    "secret_read",
+		"result":    "allowed",
+		"reason":    "fake plaintext audit downgrade",
+		"createdAt": time.Now().UTC().Format(time.RFC3339),
+	}}
+	plaintextFallbackBytes, err := json.MarshalIndent(plaintextFallback, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, plaintextFallbackBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected plaintext audit downgrade to fail load")
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	missingLedger := state
+	missingLedger.AuditLedger = nil
+	missingLedger.AuditLedgerHead = nil
+	missingLedgerBytes, err := json.MarshalIndent(missingLedger, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, missingLedgerBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected missing audit ledger to fail load")
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state.AuditLedger[0].Ciphertext = "tampered"
+	tampered, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, tampered, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected tampered audit ledger to fail load")
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := keystore.Delete(auditLedgerDataKeyAccount(state.VaultID)); err != nil {
+		t.Fatal(err)
+	}
+	keyless, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := keyless.Save(); !errors.Is(err, ErrAuditLedgerKeyUnavailable) {
+		t.Fatalf("expected save without audit ledger key to fail, got %v", err)
+	}
+}
+
+func TestAuditLedgerKeyRolledBackWhenLegacyStateSaveFails(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	now := time.Now().UTC()
+	legacy := map[string]any{
+		"version":   1,
+		"vaultId":   "vault_legacy",
+		"userId":    "usr_legacy",
+		"keyStore":  KeyStoreFile,
+		"keyRefs":   []any{},
+		"devices":   []any{},
+		"secrets":   map[string]any{},
+		"policies":  []any{},
+		"createdAt": now.Format(time.RFC3339),
+		"updatedAt": now.Format(time.RFC3339),
+		"audit": []map[string]any{{
+			"id":        "aud_legacy",
+			"actor":     "usr_legacy",
+			"action":    "secret_read",
+			"result":    "allowed",
+			"reason":    "legacy plaintext audit",
+			"createdAt": now.Format(time.RFC3339),
+		}},
+	}
+	raw, err := json.MarshalIndent(legacy, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(keystore.ClearConfiguredFileKeyStoreDir)
+	account := auditLedgerDataKeyAccount(st.State.VaultID)
+	if _, err := keystore.Load(account); err == nil {
+		t.Fatal("legacy load should not create an audit ledger key")
+	}
+	badPath := filepath.Join(t.TempDir(), "state-dir")
+	if err := os.Mkdir(badPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	st.Path = badPath
+	if err := st.Save(); err == nil {
+		t.Fatal("expected save failure")
+	}
+	if _, err := keystore.Load(account); err == nil {
+		t.Fatal("new audit ledger key remained after failed save")
+	}
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("legacy state should remain loadable after failed save: %v", err)
+	}
+	if len(reloaded.State.Audit) != 1 || reloaded.State.Audit[0].ID != "aud_legacy" {
+		t.Fatalf("legacy audit was not recovered after failed save: %#v", reloaded.State.Audit)
 	}
 }
 

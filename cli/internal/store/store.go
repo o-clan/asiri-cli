@@ -37,8 +37,16 @@ const (
 )
 
 type FileStore struct {
-	Path  string
-	State asiri.State
+	Path                   string
+	State                  asiri.State
+	auditLedgerUnavailable bool
+}
+
+var ErrAuditLedgerKeyUnavailable = errors.New("local audit ledger key unavailable")
+
+type persistedAuditFields struct {
+	Audit       []asiri.AuditEvent        `json:"audit"`
+	AuditLedger []asiri.AuditLedgerRecord `json:"auditLedger"`
 }
 
 type previousStateFields struct {
@@ -189,7 +197,13 @@ func Load(path string) (*FileStore, error) {
 	if store.State.RemoteBindings == nil {
 		store.State.RemoteBindings = map[string]asiri.RemoteWorkspaceBinding{}
 	}
+	if store.State.EnvelopeAuditModes == nil {
+		store.State.EnvelopeAuditModes = map[string]asiri.AuditMode{}
+	}
 	store.configureKeyStore()
+	if err := store.loadAuditFromLedger(bytes); err != nil {
+		return nil, err
+	}
 	store.removeLegacyOidcControlPlaneSession()
 	return store, nil
 }
@@ -241,6 +255,14 @@ func (s *FileStore) migratePreviousState(bytes []byte) {
 }
 
 func (s *FileStore) Save() error {
+	return s.save()
+}
+
+func (s *FileStore) SaveWithAuditLedger() error {
+	return s.save()
+}
+
+func (s *FileStore) save() error {
 	if s.State.CreatedAt.IsZero() {
 		s.State.CreatedAt = time.Now().UTC()
 	}
@@ -248,11 +270,341 @@ func (s *FileStore) Save() error {
 	if err := os.MkdirAll(filepath.Dir(s.Path), 0o700); err != nil {
 		return err
 	}
+	newAuditLedgerKeyAccount := ""
+	if err := s.rebuildAuditLedger(&newAuditLedgerKeyAccount); err != nil {
+		if newAuditLedgerKeyAccount != "" {
+			_ = keystore.Delete(newAuditLedgerKeyAccount)
+		}
+		return err
+	}
+	if err := s.writeStateFile(); err != nil {
+		if newAuditLedgerKeyAccount != "" {
+			_ = keystore.Delete(newAuditLedgerKeyAccount)
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *FileStore) writeStateFile() error {
 	bytes, err := json.MarshalIndent(s.State, "", "  ")
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(s.Path, bytes, 0o600)
+}
+
+func (s *FileStore) loadAuditFromLedger(bytes []byte) error {
+	var persisted persistedAuditFields
+	if err := json.Unmarshal(bytes, &persisted); err != nil {
+		return err
+	}
+	if len(persisted.AuditLedger) > 0 {
+		events, err := s.decryptAuditLedger(persisted.AuditLedger)
+		if err != nil {
+			if errors.Is(err, ErrAuditLedgerKeyUnavailable) {
+				s.auditLedgerUnavailable = true
+				s.State.Audit = []asiri.AuditEvent{}
+				return nil
+			}
+			return err
+		}
+		s.State.Audit = events
+		return nil
+	}
+	if s.State.AuditLedgerHead != nil {
+		return errors.New("local audit ledger is missing")
+	}
+	if s.State.VaultID != "" {
+		if _, err := loadDataKey(auditLedgerDataKeyAccount(s.State.VaultID)); err == nil {
+			return errors.New("local audit ledger is missing")
+		}
+	}
+	s.State.Audit = persisted.Audit
+	for index := range s.State.Audit {
+		s.ensureAuditDigest(&s.State.Audit[index])
+	}
+	if s.State.Audit == nil {
+		s.State.Audit = []asiri.AuditEvent{}
+	}
+	return nil
+}
+
+func (s *FileStore) rebuildAuditLedger(newAuditLedgerKeyAccount *string) error {
+	if s.auditLedgerUnavailable {
+		return ErrAuditLedgerKeyUnavailable
+	}
+	if len(s.State.Audit) == 0 {
+		s.State.AuditLedger = nil
+		s.State.AuditLedgerHead = nil
+		return nil
+	}
+	if s.State.VaultID == "" {
+		return errors.New("audit ledger requires an initialized vault")
+	}
+	key, createdAccount, err := s.auditLedgerKey()
+	if err != nil {
+		return err
+	}
+	if newAuditLedgerKeyAccount != nil && createdAccount != "" {
+		*newAuditLedgerKeyAccount = createdAccount
+	}
+	records := make([]asiri.AuditLedgerRecord, 0, len(s.State.Audit))
+	previousHash := ""
+	sequence := 1
+	for index := len(s.State.Audit) - 1; index >= 0; index-- {
+		event := s.State.Audit[index]
+		if event.ID == "" {
+			event.ID = NewID("aud")
+		}
+		if event.CreatedAt.IsZero() {
+			event.CreatedAt = time.Now().UTC()
+		}
+		s.ensureAuditDigest(&event)
+		plaintext, err := json.Marshal(event)
+		if err != nil {
+			return err
+		}
+		aad := fmt.Sprintf("asiri-audit-ledger:v1:%s:%d:%s", s.State.VaultID, sequence, previousHash)
+		nonce, ciphertext, err := encryptWithKey(key, plaintext, []byte(aad))
+		if err != nil {
+			return err
+		}
+		record := asiri.AuditLedgerRecord{
+			Sequence:     sequence,
+			EventID:      event.ID,
+			PreviousHash: previousHash,
+			Algorithm:    "aes-256-gcm",
+			Nonce:        nonce,
+			AAD:          aad,
+			Ciphertext:   ciphertext,
+			CreatedAt:    event.CreatedAt,
+		}
+		record.Hash = auditLedgerRecordHash(record)
+		signature, signatureAlg, signerDeviceID, err := s.signAuditLedgerRecord(key, record.Hash)
+		if err != nil {
+			return err
+		}
+		record.Signature = signature
+		record.SignatureAlg = signatureAlg
+		record.SignerDeviceID = signerDeviceID
+		records = append(records, record)
+		previousHash = record.Hash
+		s.State.Audit[index] = event
+		sequence++
+	}
+	s.State.AuditLedger = records
+	headHash := auditLedgerHeadHash(len(records), previousHash)
+	signature, signatureAlg, signerDeviceID, err := s.signAuditLedgerRecord(key, headHash)
+	if err != nil {
+		return err
+	}
+	s.State.AuditLedgerHead = &asiri.AuditLedgerHead{
+		Count:          len(records),
+		Hash:           headHash,
+		Signature:      signature,
+		SignatureAlg:   signatureAlg,
+		SignerDeviceID: signerDeviceID,
+		UpdatedAt:      time.Now().UTC(),
+	}
+	return nil
+}
+
+func (s *FileStore) decryptAuditLedger(records []asiri.AuditLedgerRecord) ([]asiri.AuditEvent, error) {
+	key, err := loadDataKey(auditLedgerDataKeyAccount(s.State.VaultID))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrAuditLedgerKeyUnavailable, err)
+	}
+	events := make([]asiri.AuditEvent, 0, len(records))
+	previousHash := ""
+	for index, record := range records {
+		if record.Sequence != index+1 {
+			return nil, errors.New("local audit ledger sequence is invalid")
+		}
+		if record.PreviousHash != previousHash {
+			return nil, errors.New("local audit ledger hash chain is invalid")
+		}
+		if record.Algorithm != "aes-256-gcm" {
+			return nil, fmt.Errorf("unsupported local audit ledger algorithm %s", record.Algorithm)
+		}
+		hash := auditLedgerRecordHash(record)
+		if hash != record.Hash {
+			return nil, errors.New("local audit ledger record hash mismatch")
+		}
+		if err := s.verifyAuditLedgerRecord(key, record); err != nil {
+			return nil, err
+		}
+		plaintext, err := decryptWithKey(key, record.Nonce, record.Ciphertext, []byte(record.AAD))
+		if err != nil {
+			return nil, fmt.Errorf("local audit ledger decrypt failed: %w", err)
+		}
+		var event asiri.AuditEvent
+		if err := json.Unmarshal(plaintext, &event); err != nil {
+			return nil, fmt.Errorf("local audit ledger record is invalid: %w", err)
+		}
+		if event.ID != record.EventID {
+			return nil, errors.New("local audit ledger event id mismatch")
+		}
+		if digest := AuditEventDigest(event); event.Digest != "" && event.Digest != digest {
+			return nil, errors.New("local audit ledger event digest mismatch")
+		}
+		event.Digest = AuditEventDigest(event)
+		events = append(events, event)
+		previousHash = record.Hash
+	}
+	if err := s.verifyAuditLedgerHead(key, len(records), previousHash); err != nil {
+		return nil, err
+	}
+	for left, right := 0, len(events)-1; left < right; left, right = left+1, right-1 {
+		events[left], events[right] = events[right], events[left]
+	}
+	return events, nil
+}
+
+func (s *FileStore) auditLedgerKey() ([]byte, string, error) {
+	account := auditLedgerDataKeyAccount(s.State.VaultID)
+	if key, err := loadDataKey(account); err == nil {
+		return key, "", nil
+	}
+	encoded, err := keystore.NewDataKey()
+	if err != nil {
+		return nil, "", err
+	}
+	key, err := decodeDataKey(encoded)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := keystore.Store(account, encoded); err != nil {
+		return nil, "", err
+	}
+	return key, account, nil
+}
+
+func auditLedgerDataKeyAccount(vaultID string) string {
+	return keystore.DataKeyAccount(vaultID, "audit-ledger-v1")
+}
+
+func (s *FileStore) ensureAuditDigest(event *asiri.AuditEvent) {
+	event.Digest = AuditEventDigest(*event)
+}
+
+func AuditEventDigest(event asiri.AuditEvent) string {
+	payload := struct {
+		ID             string            `json:"id"`
+		Actor          string            `json:"actor"`
+		Action         string            `json:"action"`
+		Scope          string            `json:"scope,omitempty"`
+		SecretNameHash string            `json:"secretNameHash,omitempty"`
+		Result         string            `json:"result"`
+		Reason         string            `json:"reason,omitempty"`
+		Metadata       map[string]string `json:"metadata,omitempty"`
+		CreatedAt      string            `json:"createdAt"`
+	}{
+		ID:             event.ID,
+		Actor:          event.Actor,
+		Action:         event.Action,
+		Scope:          event.Scope,
+		SecretNameHash: event.SecretNameHash,
+		Result:         event.Result,
+		Reason:         event.Reason,
+		Metadata:       event.Metadata,
+		CreatedAt:      event.CreatedAt.UTC().Format(time.RFC3339Nano),
+	}
+	encoded, _ := json.Marshal(payload)
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
+}
+
+func auditLedgerRecordHash(record asiri.AuditLedgerRecord) string {
+	payload := struct {
+		Sequence     int       `json:"sequence"`
+		EventID      string    `json:"eventId"`
+		PreviousHash string    `json:"previousHash"`
+		Algorithm    string    `json:"algorithm"`
+		Nonce        string    `json:"nonce"`
+		AAD          string    `json:"aad"`
+		Ciphertext   string    `json:"ciphertext"`
+		CreatedAt    time.Time `json:"createdAt"`
+	}{
+		Sequence:     record.Sequence,
+		EventID:      record.EventID,
+		PreviousHash: record.PreviousHash,
+		Algorithm:    record.Algorithm,
+		Nonce:        record.Nonce,
+		AAD:          record.AAD,
+		Ciphertext:   record.Ciphertext,
+		CreatedAt:    record.CreatedAt,
+	}
+	encoded, _ := json.Marshal(payload)
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
+}
+
+func auditLedgerHeadHash(count int, lastHash string) string {
+	payload := struct {
+		Count    int    `json:"count"`
+		LastHash string `json:"lastHash"`
+	}{
+		Count:    count,
+		LastHash: lastHash,
+	}
+	encoded, _ := json.Marshal(payload)
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
+}
+
+func (s *FileStore) signAuditLedgerRecord(key []byte, recordHash string) (string, string, string, error) {
+	// Keep ledger authenticity anchored in key storage. Device public keys live
+	// in the editable state file, so they cannot validate state-file integrity.
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte(recordHash))
+	return base64.StdEncoding.EncodeToString(mac.Sum(nil)), "hmac-sha256", "", nil
+}
+
+func (s *FileStore) verifyAuditLedgerHead(key []byte, count int, lastHash string) error {
+	head := s.State.AuditLedgerHead
+	if head == nil {
+		if count > 0 {
+			return errors.New("local audit ledger head is missing")
+		}
+		return nil
+	}
+	expected := auditLedgerHeadHash(count, lastHash)
+	if head.Count != count || head.Hash != expected {
+		return errors.New("local audit ledger head mismatch")
+	}
+	record := asiri.AuditLedgerRecord{
+		Hash:           head.Hash,
+		Signature:      head.Signature,
+		SignatureAlg:   head.SignatureAlg,
+		SignerDeviceID: head.SignerDeviceID,
+	}
+	return s.verifyAuditLedgerRecord(key, record)
+}
+
+func (s *FileStore) verifyAuditLedgerRecord(key []byte, record asiri.AuditLedgerRecord) error {
+	if record.SignatureAlg != "hmac-sha256" {
+		return fmt.Errorf("unsupported local audit ledger signature %s", record.SignatureAlg)
+	}
+	signature, err := base64.StdEncoding.DecodeString(record.Signature)
+	if err != nil {
+		return err
+	}
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte(record.Hash))
+	if !hmac.Equal(signature, mac.Sum(nil)) {
+		return errors.New("local audit ledger signature is invalid")
+	}
+	return nil
+}
+
+func (s *FileStore) deviceByID(id string) *asiri.Device {
+	for index := range s.State.Devices {
+		if s.State.Devices[index].ID == id {
+			return &s.State.Devices[index]
+		}
+	}
+	return nil
 }
 
 func (s *FileStore) InitializeLocal() error {
@@ -459,6 +811,25 @@ func (s *FileStore) GetSecret(fullPath string) (string, asiri.Secret, error) {
 		}
 	}
 	return "", asiri.Secret{}, fmt.Errorf("secret %s has no active version", fullPath)
+}
+
+func (s *FileStore) CheckSecretReadable(fullPath string) error {
+	if err := s.RequireInitialized(); err != nil {
+		return err
+	}
+	secret, err := s.SecretMetadata(fullPath)
+	if err != nil {
+		return err
+	}
+	for _, version := range secret.Versions {
+		if version.Version == secret.ActiveVersion && version.Status == "active" {
+			// Verify local usability without returning plaintext. Strict audit
+			// still gates external release before the value reaches a caller.
+			_, err := s.decryptSecretVersion(version)
+			return err
+		}
+	}
+	return fmt.Errorf("secret %s has no active version", fullPath)
 }
 
 func (s *FileStore) SecretMetadata(fullPath string) (asiri.Secret, error) {
@@ -1748,8 +2119,18 @@ func (s *FileStore) QuarantineLocalKeys(reason string) error {
 	if reason == "" {
 		reason = "local key material cleared"
 	}
+	auditLen := len(s.State.Audit)
 	s.Audit(s.State.UserID, "local_key_material_cleared", "allowed", "", "", reason, nil)
 	if err := s.Save(); err != nil {
+		if len(s.State.Audit) > auditLen {
+			s.State.Audit = s.State.Audit[:auditLen]
+		}
+		if writeErr := s.writeStateFile(); writeErr != nil {
+			return fmt.Errorf("%w; failed to persist local key quarantine: %v", err, writeErr)
+		}
+		if deleteErr != nil {
+			return deleteErr
+		}
 		return err
 	}
 	return deleteErr
@@ -1776,6 +2157,11 @@ func (s *FileStore) DeletePlatformKeys() error {
 			continue
 		}
 		if err := keystore.Delete(ref.Account); err != nil {
+			return err
+		}
+	}
+	if s.State.VaultID != "" {
+		if err := keystore.Delete(auditLedgerDataKeyAccount(s.State.VaultID)); err != nil {
 			return err
 		}
 	}
@@ -1865,7 +2251,73 @@ func parseControlPlaneExpiry(value string, fallback time.Duration) (time.Time, e
 }
 
 func (s *FileStore) Audit(actor, action, result, scope, secretNameHash, reason string, metadata map[string]string) {
-	s.State.Audit = append([]asiri.AuditEvent{{ID: NewID("aud"), Actor: actor, Action: action, Scope: scope, SecretNameHash: secretNameHash, Result: result, Reason: reason, Metadata: metadata, CreatedAt: time.Now().UTC()}}, s.State.Audit...)
+	event := asiri.AuditEvent{ID: NewID("aud"), Actor: actor, Action: action, Scope: scope, SecretNameHash: secretNameHash, Result: result, Reason: reason, Metadata: metadata, CreatedAt: time.Now().UTC()}
+	event.Digest = AuditEventDigest(event)
+	s.State.Audit = append([]asiri.AuditEvent{event}, s.State.Audit...)
+}
+
+type RemoteAuditAck struct {
+	LocalAuditID  string
+	EventDigest   string
+	RemoteEventID string
+	SyncedAt      time.Time
+}
+
+func (s *FileStore) LatestAuditEventID() string {
+	if len(s.State.Audit) == 0 {
+		return ""
+	}
+	return s.State.Audit[0].ID
+}
+
+func (s *FileStore) AuditEventByID(id string) (asiri.AuditEvent, bool) {
+	for _, event := range s.State.Audit {
+		if event.ID == id {
+			return event, true
+		}
+	}
+	return asiri.AuditEvent{}, false
+}
+
+func (s *FileStore) MarkAuditEventFailed(id, reason string) bool {
+	for index := range s.State.Audit {
+		if s.State.Audit[index].ID != id {
+			continue
+		}
+		s.State.Audit[index].Result = "failed"
+		s.State.Audit[index].Reason = reason
+		s.State.Audit[index].RemoteEventID = ""
+		s.State.Audit[index].RemoteSyncedAt = nil
+		s.State.Audit[index].Digest = AuditEventDigest(s.State.Audit[index])
+		return true
+	}
+	return false
+}
+
+func (s *FileStore) MarkAuditEventsRemoteAcked(acks []RemoteAuditAck) {
+	if len(acks) == 0 {
+		return
+	}
+	byID := map[string]RemoteAuditAck{}
+	for _, ack := range acks {
+		byID[ack.LocalAuditID] = ack
+	}
+	for index := range s.State.Audit {
+		ack, ok := byID[s.State.Audit[index].ID]
+		if !ok {
+			continue
+		}
+		s.ensureAuditDigest(&s.State.Audit[index])
+		if ack.EventDigest != "" && ack.EventDigest != s.State.Audit[index].Digest {
+			continue
+		}
+		s.State.Audit[index].RemoteEventID = ack.RemoteEventID
+		value := ack.SyncedAt
+		if value.IsZero() {
+			value = time.Now().UTC()
+		}
+		s.State.Audit[index].RemoteSyncedAt = &value
+	}
 }
 
 func (s *FileStore) MarkAuditEventsRemoteSynced(ids []string, syncedAt time.Time) {
@@ -1882,6 +2334,45 @@ func (s *FileStore) MarkAuditEventsRemoteSynced(ids []string, syncedAt time.Time
 			s.State.Audit[index].RemoteSyncedAt = &value
 		}
 	}
+}
+
+func (s *FileStore) SetEnvelopeAuditModes(scopes []asiri.ScopeAuditMode) {
+	if s.State.EnvelopeAuditModes == nil {
+		s.State.EnvelopeAuditModes = map[string]asiri.AuditMode{}
+	}
+	for _, scope := range scopes {
+		path := strings.Trim(scope.Path, "/")
+		if path == "" {
+			continue
+		}
+		mode := normalizeAuditMode(scope.ResolvedAuditMode)
+		s.State.EnvelopeAuditModes[path] = mode
+	}
+}
+
+func (s *FileStore) ResolveEnvelopeAuditMode(scope string) asiri.AuditMode {
+	if s == nil || len(s.State.EnvelopeAuditModes) == 0 {
+		return asiri.AuditModeBuffered
+	}
+	current := strings.Trim(scope, "/")
+	for current != "" {
+		if mode, ok := s.State.EnvelopeAuditModes[current]; ok {
+			return normalizeAuditMode(mode)
+		}
+		index := strings.LastIndex(current, "/")
+		if index < 0 {
+			break
+		}
+		current = current[:index]
+	}
+	return asiri.AuditModeBuffered
+}
+
+func normalizeAuditMode(mode asiri.AuditMode) asiri.AuditMode {
+	if mode == asiri.AuditModeStrict {
+		return asiri.AuditModeStrict
+	}
+	return asiri.AuditModeBuffered
 }
 
 func ParseSecretPath(fullPath string) (string, string, error) {

@@ -15,6 +15,7 @@ Asiri is a secrets access layer. Treat it as the source of operational secrets a
 - Use exact workspace slugs and secret paths from the user or from `asiri workspace list` / `asiri list`.
 - Prefer `asiri env` or `asiri mount` over raw reads.
 - Use raw reads only when the user explicitly asks and policy allows it; redirect verification reads to `/dev/null`.
+- Treat strict audit failures as hard stops. Do not retry, bypass, copy, or expose the secret through another path when Asiri says audit ack is required before release.
 - Stop before changing trust, device, recovery, rekey, or local key material unless the user explicitly asked for that repair.
 - If Asiri reports missing platform key material, keyring errors, duplicated devices, unknown trust, or recovery problems, report the state and ask before mutating anything.
 
@@ -69,6 +70,8 @@ Use argv substitution only as an escape hatch for tools that cannot read env var
 asiri run --workspace <workspace> --unsafe-argv --agent <label> <command> --token asiri://<scope/SECRET_NAME>
 ```
 
+Envelope audit mode applies to every secret materialization path: raw read, env injection, mount, unsafe argv, and broker value requests. Buffered envelopes can release after local encrypted audit append and sync later. Strict envelopes must receive a matching control-plane ack before Asiri releases the value. If the device is offline or the ack is missing or malformed, report the block and stop.
+
 ## Add Or Track A Secret
 
 Use stdin or a value file. Do not put values in command arguments.
@@ -116,6 +119,8 @@ Check recent activity without values:
 ```sh
 asiri audit tail --limit 20
 ```
+
+Audit mode is an envelope policy set by the workspace owner or a delegated admin. Do not change it unless the user explicitly asked for an audit-mode change.
 
 ## Pull, Push, And Rewrap
 
@@ -195,6 +200,8 @@ When blocked by local key material or trust state, preserve the current state an
 ## Advanced Context
 
 Trusted device state is the runtime security boundary. Agent, app, process, and command names are policy and audit labels, not strong identities.
+
+Strict audit gives administrators visibility over Asiri-controlled secret release. It does not make a compromised trusted host safe, and it only applies after the device has synced the envelope policy.
 
 For CI or servers, prefer service accounts over long-lived shared tokens. A service account should receive a browser-approved scoped session, then use the same local-runtime patterns: inject, mount, broker, pull, and audit. Service-account sessions cannot mutate secrets, policies, devices, members, billing, recovery, or service accounts.
 

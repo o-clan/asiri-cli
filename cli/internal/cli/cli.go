@@ -44,7 +44,7 @@ type App struct {
 	In  io.Reader
 }
 
-var Version = "0.1.31"
+var Version = "0.1.32"
 
 var defaultControlPlaneOrigin = "http://127.0.0.1:4173"
 
@@ -354,11 +354,20 @@ func (a App) initLocal(st *store.FileStore, args []string) int {
 			deviceName = hostname
 		}
 	}
+	usedFileKeyStore := false
 	if err := st.InitializeLocal(); err != nil {
-		return a.fail(err)
+		if errors.Is(err, keystore.ErrPlatformUnavailable) && keystore.FileKeyStoreDir() == "" {
+			st.State = asiri.State{}
+			st.UseDefaultFileKeyStore()
+			usedFileKeyStore = true
+			if err := st.InitializeLocal(); err != nil {
+				return a.fail(err)
+			}
+		} else {
+			return a.fail(err)
+		}
 	}
 	device, refs, err := createDevice(deviceName)
-	usedFileKeyStore := false
 	if errors.Is(err, keystore.ErrPlatformUnavailable) && keystore.FileKeyStoreDir() == "" {
 		st.UseDefaultFileKeyStore()
 		device, refs, err = createDevice(deviceName)
@@ -1722,6 +1731,7 @@ func (a App) pullOneWorkspaceWithBundle(st *store.FileStore, accessToken string,
 		fmt.Fprintf(a.Err, "Warning: %s\n", partial.Error())
 	}
 	importServiceAccountSyncPolicies(st, bundle.Policies)
+	st.SetEnvelopeAuditModes(bundle.Scopes)
 	st.Audit(st.State.UserID, "control_plane_sync", "allowed", "", "", "fetched encrypted pull bundle", map[string]string{"secrets": fmt.Sprintf("%d", len(bundle.EncryptedSecrets)), "workspace": st.State.ControlPlane.WorkspaceSlug})
 	if err := st.Save(); err != nil {
 		return 0, 0, nextToken, bundle, err
@@ -3126,7 +3136,7 @@ func (a App) get(st *store.FileStore, args []string) int {
 			return a.fail(errors.New(reason))
 		}
 	}
-	value, secret, err := st.GetSecret(fullPath)
+	secret, err := st.SecretMetadata(fullPath)
 	if err != nil {
 		return a.fail(err)
 	}
@@ -3134,11 +3144,29 @@ func (a App) get(st *store.FileStore, args []string) int {
 	if agent != "" {
 		actor = agent
 	}
-	st.Audit(actor, "secret_read", "allowed", secret.Scope, secret.NameHash, "raw read", runtimeAuditMetadata(st, secret.Scope, agent, runtimeType, nil))
-	if err := st.Save(); err != nil {
+	auditLabel := agent
+	auditLabelType := runtimeType
+	if auditLabel == "" {
+		auditLabel = actor
+		auditLabelType = "user"
+	}
+	metadata := runtimeAuditMetadata(st, secret.Scope, auditLabel, auditLabelType, nil)
+	if err := st.CheckSecretReadable(fullPath); err != nil {
+		st.Audit(actor, "secret_read", "failed", secret.Scope, secret.NameHash, "secret not locally usable: "+err.Error(), metadata)
+		_ = st.Save()
+		a.syncRuntimeAuditBestEffort(st)
 		return a.fail(err)
 	}
-	a.syncRuntimeAuditBestEffort(st)
+	if err := a.gateSecretRelease(st, actor, "secret_read", secret.Scope, secret.NameHash, "raw read", metadata); err != nil {
+		return a.fail(err)
+	}
+	value, _, err := st.GetSecret(fullPath)
+	if err != nil {
+		st.Audit(actor, "secret_read", "failed", secret.Scope, secret.NameHash, "secret release failed after audit gate: "+err.Error(), metadata)
+		_ = st.Save()
+		a.syncRuntimeAuditBestEffort(st)
+		return a.fail(err)
+	}
 	fmt.Fprintln(a.Out, value)
 	return 0
 }
@@ -3983,12 +4011,8 @@ func (a App) runWithEnvMappings(st *store.FileStore, target workspacePathTarget,
 	if err != nil {
 		return a.fail(err)
 	}
-	type envResolvedSecret struct {
-		resolvedSecret
-		EnvName string
-	}
 	env := os.Environ()
-	resolved := []envResolvedSecret{}
+	prepared := []envPreparedSecret{}
 	for _, mapping := range mappings {
 		name, path, ok := strings.Cut(mapping, "=")
 		if !ok || name == "" || path == "" {
@@ -3998,30 +4022,34 @@ func (a App) runWithEnvMappings(st *store.FileStore, target workspacePathTarget,
 		if err != nil {
 			return a.fail(err)
 		}
-		allowed, reason := st.CheckPolicy(agent, fullPath, "inject")
-		if !allowed {
-			a.auditDeniedSecretUse(st, agent, runtimeType, fullPath, reason)
+		release, err := a.prepareSecretRelease(st, agent, runtimeType, "inject", "secret_injected", fullPath, "explicit env mapping", map[string]string{"env": name})
+		if err != nil {
 			_ = st.Save()
 			a.syncRuntimeAuditBestEffort(st)
-			return a.fail(fmt.Errorf("%s: %s cannot inject %s", reason, agent, fullPath))
-		}
-		value, secret, err := st.GetSecret(fullPath)
-		if err != nil {
 			return a.fail(err)
 		}
-		env = append(env, name+"="+value)
-		resolved = append(resolved, envResolvedSecret{
-			resolvedSecret: resolvedSecret{Path: fullPath, Scope: secret.Scope, Name: secret.Name, Hash: secret.NameHash, Value: value},
-			EnvName:        name,
-		})
+		prepared = append(prepared, envPreparedSecret{preparedSecretRelease: release, EnvName: name})
 	}
-	for _, secret := range resolved {
-		st.Audit(agent, "secret_injected", "allowed", secret.Scope, secret.Hash, "explicit env mapping", runtimeAuditMetadata(st, secret.Scope, agent, runtimeType, map[string]string{"env": secret.EnvName}))
+	preparedReleases := make([]preparedSecretRelease, 0, len(prepared))
+	for _, item := range prepared {
+		preparedReleases = append(preparedReleases, item.preparedSecretRelease)
+	}
+	if err := a.gatePreparedSecretReleases(st, agent, preparedReleases); err != nil {
+		return a.fail(err)
+	}
+	for _, item := range prepared {
+		value, _, err := st.GetSecret(item.Path)
+		if err != nil {
+			a.auditFailedPreparedRelease(st, agent, item.preparedSecretRelease, "secret release failed after audit gate: "+err.Error())
+			_ = st.Save()
+			a.syncRuntimeAuditBestEffort(st)
+			return a.fail(err)
+		}
+		env = append(env, item.EnvName+"="+value)
 	}
 	if err := st.Save(); err != nil {
 		return a.fail(err)
 	}
-	a.syncRuntimeAuditBestEffort(st)
 	return a.execChild(remaining[cmdIndex], remaining[cmdIndex+1:], env)
 }
 
@@ -4039,23 +4067,42 @@ func (a App) runWithUnsafeArgv(st *store.FileStore, target workspacePathTarget, 
 	if strings.Contains(commandArgs[0], "asiri://") {
 		return a.fail(errors.New("unsafe argv substitution is not allowed in the command name"))
 	}
-	resolvedSecrets := []resolvedSecret{}
+	prepared := []preparedSecretRelease{}
 	for i, arg := range commandArgs[1:] {
-		resolved, err := a.resolveUnsafeArgvArg(st, target, agent, runtimeType, arg, &resolvedSecrets)
-		if err != nil {
+		if err := a.prepareUnsafeArgvArg(st, target, agent, runtimeType, arg, &prepared); err != nil {
 			_ = st.Save()
 			a.syncRuntimeAuditBestEffort(st)
 			return a.fail(err)
 		}
-		resolvedArgs[i+1] = resolved
+		resolvedArgs[i+1] = arg
 	}
-	for _, secret := range resolvedSecrets {
-		st.Audit(agent, "secret_unsafe_argv_injected", "allowed", secret.Scope, secret.Hash, "unsafe argv materialization", runtimeAuditMetadata(st, secret.Scope, agent, runtimeType, map[string]string{"mode": "unsafe-argv"}))
+	if err := a.gatePreparedSecretReleases(st, agent, prepared); err != nil {
+		return a.fail(err)
+	}
+	values := map[string]string{}
+	for _, release := range prepared {
+		if _, ok := values[release.Path]; ok {
+			continue
+		}
+		value, _, err := st.GetSecret(release.Path)
+		if err != nil {
+			a.auditFailedPreparedRelease(st, agent, release, "secret release failed after audit gate: "+err.Error())
+			_ = st.Save()
+			a.syncRuntimeAuditBestEffort(st)
+			return a.fail(err)
+		}
+		values[release.Path] = value
+	}
+	for i, arg := range resolvedArgs[1:] {
+		resolved, err := replaceUnsafeArgvValues(target, arg, values)
+		if err != nil {
+			return a.fail(err)
+		}
+		resolvedArgs[i+1] = resolved
 	}
 	if err := st.Save(); err != nil {
 		return a.fail(err)
 	}
-	a.syncRuntimeAuditBestEffort(st)
 	return a.execChild(resolvedArgs[0], resolvedArgs[1:], os.Environ())
 }
 
@@ -4139,6 +4186,81 @@ func (a App) resolveUnsafeArgvArg(st *store.FileStore, target workspacePathTarge
 	return resolved, nil
 }
 
+func (a App) prepareUnsafeArgvArg(st *store.FileStore, target workspacePathTarget, agent, runtimeType, arg string, releases *[]preparedSecretRelease) error {
+	refs, err := unsafeArgvRefs(arg)
+	if err != nil {
+		return err
+	}
+	for _, ref := range refs {
+		fullPath, err := workspacePrefixedPath(target, strings.TrimPrefix(ref, "asiri://"), "run")
+		if err != nil {
+			return err
+		}
+		release, err := a.prepareSecretRelease(st, agent, runtimeType, "inject", "secret_unsafe_argv_injected", fullPath, "unsafe argv materialization", map[string]string{"mode": "unsafe-argv"})
+		if err != nil {
+			return err
+		}
+		*releases = append(*releases, release)
+	}
+	return nil
+}
+
+func unsafeArgvRefs(arg string) ([]string, error) {
+	if !strings.Contains(arg, "asiri://") {
+		return nil, nil
+	}
+	matches := asiriRefPattern.FindAllStringIndex(arg, -1)
+	if len(matches) == 0 {
+		return nil, errors.New("invalid asiri:// reference; expected asiri://scope/name")
+	}
+	for offset := 0; ; {
+		index := strings.Index(arg[offset:], "asiri://")
+		if index < 0 {
+			break
+		}
+		start := offset + index
+		covered := false
+		for _, match := range matches {
+			if match[0] == start {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			return nil, errors.New("invalid asiri:// reference; expected asiri://scope/name")
+		}
+		offset = start + len("asiri://")
+	}
+	return asiriRefPattern.FindAllString(arg, -1), nil
+}
+
+func replaceUnsafeArgvValues(target workspacePathTarget, arg string, values map[string]string) (string, error) {
+	if _, err := unsafeArgvRefs(arg); err != nil {
+		return "", err
+	}
+	var resolveErr error
+	resolved := asiriRefPattern.ReplaceAllStringFunc(arg, func(ref string) string {
+		if resolveErr != nil {
+			return ref
+		}
+		fullPath, err := workspacePrefixedPath(target, strings.TrimPrefix(ref, "asiri://"), "run")
+		if err != nil {
+			resolveErr = err
+			return ref
+		}
+		value, ok := values[fullPath]
+		if !ok {
+			resolveErr = fmt.Errorf("secret %s was not prepared for unsafe argv materialization", fullPath)
+			return ref
+		}
+		return value
+	})
+	if resolveErr != nil {
+		return "", resolveErr
+	}
+	return resolved, nil
+}
+
 func (a App) resolveUnsafeArgvSecret(st *store.FileStore, target workspacePathTarget, agent, runtimeType, shortPath string, resolvedSecrets *[]resolvedSecret) (string, error) {
 	fullPath, err := workspacePrefixedPath(target, shortPath, "run")
 	if err != nil {
@@ -4159,8 +4281,20 @@ func (a App) resolveUnsafeArgvSecret(st *store.FileStore, target workspacePathTa
 		}
 		return "", fmt.Errorf("%s: %s cannot inject %s", reason, agent, fullPath)
 	}
-	value, secret, err := st.GetSecret(fullPath)
+	secret, err := st.SecretMetadata(fullPath)
 	if err != nil {
+		return "", err
+	}
+	if err := st.CheckSecretReadable(fullPath); err != nil {
+		st.Audit(agent, "secret_unsafe_argv_injected", "failed", secret.Scope, secret.NameHash, "secret not locally usable: "+err.Error(), metadata)
+		return "", err
+	}
+	if err := a.gateSecretRelease(st, agent, "secret_unsafe_argv_injected", secret.Scope, secret.NameHash, "unsafe argv materialization", metadata); err != nil {
+		return "", err
+	}
+	value, _, err := st.GetSecret(fullPath)
+	if err != nil {
+		st.Audit(agent, "secret_unsafe_argv_injected", "failed", secret.Scope, secret.NameHash, "secret release failed after audit gate: "+err.Error(), metadata)
 		return "", err
 	}
 	*resolvedSecrets = append(*resolvedSecrets, resolvedSecret{Path: fullPath, Scope: secret.Scope, Name: secret.Name, Hash: secret.NameHash, Value: value})
@@ -4198,6 +4332,119 @@ type resolvedSecret struct {
 	Value string
 }
 
+type preparedSecretRelease struct {
+	Path        string
+	Secret      asiri.Secret
+	Metadata    map[string]string
+	AuditAction string
+	AuditReason string
+}
+
+type envPreparedSecret struct {
+	preparedSecretRelease
+	EnvName string
+}
+
+func (a App) prepareSecretRelease(st *store.FileStore, agent, runtimeType, action, auditAction, fullPath, auditReason string, extra map[string]string) (preparedSecretRelease, error) {
+	allowed, reason := st.CheckPolicy(agent, fullPath, action)
+	scope, name, parseErr := store.ParseSecretPath(fullPath)
+	metadataScope := ""
+	if parseErr == nil {
+		metadataScope = scope
+	}
+	metadata := runtimeAuditMetadata(st, metadataScope, agent, runtimeType, extra)
+	if !allowed {
+		if parseErr == nil {
+			st.Audit(agent, auditAction, "denied", scope, store.HashSecretName(scope, name), reason, metadata)
+		} else {
+			st.Audit(agent, auditAction, "denied", "", "", reason, metadata)
+		}
+		return preparedSecretRelease{}, fmt.Errorf("%s: %s cannot %s %s", reason, agent, action, fullPath)
+	}
+	secret, err := st.SecretMetadata(fullPath)
+	if err != nil {
+		return preparedSecretRelease{}, err
+	}
+	if err := st.CheckSecretReadable(fullPath); err != nil {
+		st.Audit(agent, auditAction, "failed", secret.Scope, secret.NameHash, "secret not locally usable: "+err.Error(), metadata)
+		return preparedSecretRelease{}, err
+	}
+	if auditReason == "" {
+		auditReason = fmt.Sprintf("%s materialization", action)
+	}
+	return preparedSecretRelease{Path: fullPath, Secret: secret, Metadata: metadata, AuditAction: auditAction, AuditReason: auditReason}, nil
+}
+
+func (a App) gatePreparedSecretRelease(st *store.FileStore, actor string, release preparedSecretRelease) error {
+	return a.gateSecretRelease(st, actor, release.AuditAction, release.Secret.Scope, release.Secret.NameHash, release.AuditReason, release.Metadata)
+}
+
+func (a App) gatePreparedSecretReleases(st *store.FileStore, actor string, releases []preparedSecretRelease) error {
+	if len(releases) == 0 {
+		return nil
+	}
+	strictReleases := []preparedSecretRelease{}
+	bufferedReleases := []preparedSecretRelease{}
+	for _, release := range releases {
+		if st.ResolveEnvelopeAuditMode(release.Secret.Scope) == asiri.AuditModeStrict {
+			strictReleases = append(strictReleases, release)
+		} else {
+			bufferedReleases = append(bufferedReleases, release)
+		}
+	}
+	strictEventIDs := make([]string, 0, len(strictReleases))
+	strictReleasesByEventID := map[string]preparedSecretRelease{}
+	for _, release := range strictReleases {
+		st.Audit(actor, release.AuditAction, "allowed", release.Secret.Scope, release.Secret.NameHash, release.AuditReason, release.Metadata)
+		eventID := st.LatestAuditEventID()
+		strictEventIDs = append(strictEventIDs, eventID)
+		strictReleasesByEventID[eventID] = release
+	}
+	if len(strictEventIDs) > 0 {
+		if err := st.SaveWithAuditLedger(); err != nil {
+			return err
+		}
+		strictEvents := make([]asiri.AuditEvent, 0, len(strictEventIDs))
+		for _, eventID := range strictEventIDs {
+			event, ok := st.AuditEventByID(eventID)
+			if !ok {
+				return errors.New("strict audit event missing after local append")
+			}
+			strictEvents = append(strictEvents, event)
+		}
+		if err := a.syncRuntimeAuditStrictBatch(st, strictEvents); err != nil {
+			for _, event := range strictEvents {
+				release := strictReleasesByEventID[event.ID]
+				failedMetadata := copyStringMap(release.Metadata)
+				if failedMetadata == nil {
+					failedMetadata = map[string]string{}
+				}
+				failedMetadata["blockedLocalAuditId"] = event.ID
+				failedMetadata["blockedEventDigest"] = event.Digest
+				st.Audit(actor, release.AuditAction, "failed", release.Secret.Scope, release.Secret.NameHash, "secret release blocked because strict audit ack failed: "+err.Error(), failedMetadata)
+			}
+			if saveErr := st.SaveWithAuditLedger(); saveErr != nil {
+				return fmt.Errorf("strict audit ack required before secret release: %w; failed to persist failed audit record: %v", err, saveErr)
+			}
+			return fmt.Errorf("strict audit ack required before secret release: %w", err)
+		}
+	}
+	for _, release := range bufferedReleases {
+		st.Audit(actor, release.AuditAction, "allowed", release.Secret.Scope, release.Secret.NameHash, release.AuditReason, release.Metadata)
+	}
+	if len(bufferedReleases) > 0 {
+		if err := st.SaveWithAuditLedger(); err != nil {
+			return err
+		}
+		a.syncRuntimeAuditBestEffort(st)
+	}
+	return nil
+}
+
+func (a App) auditFailedPreparedRelease(st *store.FileStore, actor string, release preparedSecretRelease, reason string) {
+	st.Audit(actor, release.AuditAction, "failed", release.Secret.Scope, release.Secret.NameHash, reason, release.Metadata)
+}
+
 func (a App) env(st *store.FileStore, args []string) int {
 	if err := st.RequireInitialized(); err != nil {
 		return a.fail(err)
@@ -4223,33 +4470,52 @@ func (a App) env(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	secrets, err := a.resolveSecretSelection(st, pathSpec, agent, runtimeType, "inject", "secret_env_exported")
+	paths, err := a.selectedSecretPaths(st, pathSpec, agent, "inject")
 	if err != nil {
-		_ = st.Save()
-		a.syncRuntimeAuditBestEffort(st)
 		return a.fail(err)
 	}
-	envAdds := make(map[string]string, len(secrets))
-	for _, secret := range secrets {
+	envAdds := make(map[string]string, len(paths))
+	prepared := []preparedSecretRelease{}
+	for _, path := range paths {
+		secret, err := st.SecretMetadata(path)
+		if err != nil {
+			return a.fail(err)
+		}
 		if !envNamePattern.MatchString(secret.Name) {
 			return a.fail(fmt.Errorf("secret name %q is not a valid environment variable name", secret.Name))
 		}
 		if _, exists := envAdds[secret.Name]; exists {
 			return a.fail(fmt.Errorf("environment variable %s would collide", secret.Name))
 		}
-		envAdds[secret.Name] = secret.Value
+		envAdds[secret.Name] = ""
+		release, err := a.prepareSecretRelease(st, agent, runtimeType, "inject", "secret_env_exported", path, "inject materialization", map[string]string{"mode": "inject"})
+		if err != nil {
+			_ = st.Save()
+			a.syncRuntimeAuditBestEffort(st)
+			return a.fail(err)
+		}
+		prepared = append(prepared, release)
+	}
+	if err := a.gatePreparedSecretReleases(st, agent, prepared); err != nil {
+		return a.fail(err)
+	}
+	for _, release := range prepared {
+		value, secret, err := st.GetSecret(release.Path)
+		if err != nil {
+			a.auditFailedPreparedRelease(st, agent, release, "secret release failed after audit gate: "+err.Error())
+			_ = st.Save()
+			a.syncRuntimeAuditBestEffort(st)
+			return a.fail(err)
+		}
+		envAdds[secret.Name] = value
 	}
 	env := os.Environ()
 	for name, value := range envAdds {
 		env = append(env, name+"="+value)
 	}
-	for _, secret := range secrets {
-		st.Audit(agent, "secret_env_exported", "allowed", secret.Scope, secret.Hash, "inject materialization", runtimeAuditMetadata(st, secret.Scope, agent, runtimeType, nil))
-	}
 	if err := st.Save(); err != nil {
 		return a.fail(err)
 	}
-	a.syncRuntimeAuditBestEffort(st)
 	return a.execChild(commandArgs[0], commandArgs[1:], env)
 }
 
@@ -4279,11 +4545,51 @@ func (a App) mount(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	secrets, err := a.resolveSecretSelection(st, pathPart, agent, runtimeType, "mount", "secret_mounted")
+	paths, err := a.selectedSecretPaths(st, pathPart, agent, "mount")
 	if err != nil {
-		_ = st.Save()
-		a.syncRuntimeAuditBestEffort(st)
 		return a.fail(err)
+	}
+	if hasExplicitDest && len(paths) != 1 {
+		return a.fail(errors.New("explicit mount destination requires an exact single secret path"))
+	}
+	type reservedMountTarget struct {
+		release preparedSecretRelease
+		path    string
+		file    *os.File
+	}
+	reservedTargets := []reservedMountTarget{}
+	defer func() {
+		for _, target := range reservedTargets {
+			if target.file != nil {
+				_ = target.file.Close()
+			}
+		}
+	}()
+	seenTargets := map[string]bool{}
+	for _, path := range paths {
+		release, err := a.prepareSecretRelease(st, agent, runtimeType, "mount", "secret_mounted", path, "mount materialization", map[string]string{"mode": "mount"})
+		if err != nil {
+			_ = st.Save()
+			a.syncRuntimeAuditBestEffort(st)
+			return a.fail(err)
+		}
+		targetPath := ""
+		if hasExplicitDest {
+			if err := validateExplicitMountDest(explicitDest); err != nil {
+				return a.fail(err)
+			}
+			targetPath = explicitDest
+		} else {
+			if err := validateSecretFileName(release.Secret.Name); err != nil {
+				return a.fail(err)
+			}
+			targetPath = release.Secret.Name
+		}
+		if seenTargets[targetPath] {
+			return a.fail(fmt.Errorf("mount target %s would collide", targetPath))
+		}
+		seenTargets[targetPath] = true
+		reservedTargets = append(reservedTargets, reservedMountTarget{release: release, path: targetPath})
 	}
 	mountDir := mountDirFromArgs(remaining)
 	createdTempDir := false
@@ -4309,37 +4615,46 @@ func (a App) mount(st *store.FileStore, args []string) int {
 			}
 		}()
 	}
-	if hasExplicitDest && len(secrets) != 1 {
-		return a.fail(errors.New("explicit mount destination requires an exact single secret path"))
-	}
-	seenTargets := map[string]bool{}
-	for _, secret := range secrets {
-		target := ""
+	for index := range reservedTargets {
+		targetPath := reservedTargets[index].path
 		if hasExplicitDest {
-			if err := validateExplicitMountDest(explicitDest); err != nil {
-				return a.fail(err)
-			}
-			target = explicitDest
-			if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0o700); err != nil {
 				return a.fail(err)
 			}
 		} else {
-			if err := validateSecretFileName(secret.Name); err != nil {
-				return a.fail(err)
-			}
-			target = filepath.Join(mountDir, secret.Name)
+			targetPath = filepath.Join(mountDir, targetPath)
+			reservedTargets[index].path = targetPath
 		}
-		if seenTargets[target] {
-			return a.fail(fmt.Errorf("mount target %s would collide", target))
-		}
-		seenTargets[target] = true
-		if err := writeExclusiveSecretFile(target, []byte(secret.Value)); err != nil {
+		file, err := reserveExclusiveSecretFile(targetPath)
+		if err != nil {
 			return a.fail(err)
 		}
-		cleanupPaths = append(cleanupPaths, target)
+		reservedTargets[index].file = file
+		cleanupPaths = append(cleanupPaths, targetPath)
 	}
-	for _, secret := range secrets {
-		st.Audit(agent, "secret_mounted", "allowed", secret.Scope, secret.Hash, "mount materialization", runtimeAuditMetadata(st, secret.Scope, agent, runtimeType, nil))
+	preparedReleases := make([]preparedSecretRelease, 0, len(reservedTargets))
+	for _, target := range reservedTargets {
+		preparedReleases = append(preparedReleases, target.release)
+	}
+	if err := a.gatePreparedSecretReleases(st, agent, preparedReleases); err != nil {
+		return a.fail(err)
+	}
+	for index := range reservedTargets {
+		value, _, err := st.GetSecret(reservedTargets[index].release.Path)
+		if err != nil {
+			a.auditFailedPreparedRelease(st, agent, reservedTargets[index].release, "secret release failed after audit gate: "+err.Error())
+			_ = st.Save()
+			a.syncRuntimeAuditBestEffort(st)
+			return a.fail(err)
+		}
+		if err := writeReservedSecretFile(reservedTargets[index].file, []byte(value)); err != nil {
+			a.auditFailedPreparedRelease(st, agent, reservedTargets[index].release, "secret file write failed after audit gate: "+err.Error())
+			_ = st.Save()
+			a.syncRuntimeAuditBestEffort(st)
+			return a.fail(err)
+		}
+		_ = reservedTargets[index].file.Close()
+		reservedTargets[index].file = nil
 	}
 	env := os.Environ()
 	if !hasExplicitDest || mountDir != "" {
@@ -4348,7 +4663,6 @@ func (a App) mount(st *store.FileStore, args []string) int {
 	if err := st.Save(); err != nil {
 		return a.fail(err)
 	}
-	a.syncRuntimeAuditBestEffort(st)
 	return a.execChild(commandArgs[0], commandArgs[1:], env)
 }
 
@@ -4408,6 +4722,22 @@ func mountDirFromArgs(args []string) string {
 }
 
 func (a App) resolveSecretSelection(st *store.FileStore, pathSpec, agent, runtimeType, action, auditAction string) ([]resolvedSecret, error) {
+	paths, err := a.selectedSecretPaths(st, pathSpec, agent, action)
+	if err != nil {
+		return nil, err
+	}
+	resolved := make([]resolvedSecret, 0, len(paths))
+	for _, path := range paths {
+		item, err := a.resolveOneSecret(st, agent, runtimeType, action, auditAction, path)
+		if err != nil {
+			return nil, err
+		}
+		resolved = append(resolved, item)
+	}
+	return resolved, nil
+}
+
+func (a App) selectedSecretPaths(st *store.FileStore, pathSpec, agent, action string) ([]string, error) {
 	pathSpec = strings.Trim(pathSpec, "/")
 	if pathSpec == "" {
 		return nil, errors.New("secret path or scope is required")
@@ -4415,11 +4745,7 @@ func (a App) resolveSecretSelection(st *store.FileStore, pathSpec, agent, runtim
 	if scope, name, err := store.ParseSecretPath(pathSpec); err == nil {
 		key := store.SecretKey(scope, name)
 		if _, ok := st.State.Secrets[key]; ok {
-			secret, err := a.resolveOneSecret(st, agent, runtimeType, action, auditAction, pathSpec)
-			if err != nil {
-				return nil, err
-			}
-			return []resolvedSecret{secret}, nil
+			return []string{pathSpec}, nil
 		}
 	}
 	keys := make([]string, 0)
@@ -4437,16 +4763,12 @@ func (a App) resolveSecretSelection(st *store.FileStore, pathSpec, agent, runtim
 		return nil, fmt.Errorf("no exact secret or direct child secrets found for %s", pathSpec)
 	}
 	sort.Strings(keys)
-	resolved := make([]resolvedSecret, 0, len(keys))
+	paths := make([]string, 0, len(keys))
 	for _, key := range keys {
 		secret := st.State.Secrets[key]
-		item, err := a.resolveOneSecret(st, agent, runtimeType, action, auditAction, secret.Scope+"/"+secret.Name)
-		if err != nil {
-			return nil, err
-		}
-		resolved = append(resolved, item)
+		paths = append(paths, secret.Scope+"/"+secret.Name)
 	}
-	return resolved, nil
+	return paths, nil
 }
 
 func remoteHintPolicy(st *store.FileStore, pathSpec, agent, action string) (bool, bool) {
@@ -4572,6 +4894,20 @@ func (a App) resolveOneSecret(st *store.FileStore, agent, runtimeType, action, a
 			st.Audit(agent, auditAction, "denied", "", "", reason, metadata)
 		}
 		return resolvedSecret{}, fmt.Errorf("%s: %s cannot %s %s", reason, agent, action, fullPath)
+	}
+	secret, err := st.SecretMetadata(fullPath)
+	if err != nil {
+		return resolvedSecret{}, err
+	}
+	auditReason := fmt.Sprintf("%s materialization", action)
+	if action == "inject" {
+		auditReason = "inject materialization"
+	}
+	if action == "mount" {
+		auditReason = "mount materialization"
+	}
+	if err := a.gateSecretRelease(st, agent, auditAction, secret.Scope, secret.NameHash, auditReason, metadata); err != nil {
+		return resolvedSecret{}, err
 	}
 	value, secret, err := st.GetSecret(fullPath)
 	if err != nil {
@@ -4743,7 +5079,7 @@ func (a App) syncRuntimeAuditBestEffortFromPath(path string, mu *sync.Mutex) {
 		mu.Unlock()
 		return
 	}
-	ids, events := pendingRuntimeAuditEvents(st)
+	_, events := pendingRuntimeAuditEvents(st)
 	if len(events) == 0 {
 		mu.Unlock()
 		return
@@ -4754,8 +5090,17 @@ func (a App) syncRuntimeAuditBestEffortFromPath(path string, mu *sync.Mutex) {
 		return
 	}
 	endpoint := strings.TrimRight(st.State.ControlPlane.Origin, "/") + "/v1/audit/batch"
+	batches := runtimeAuditBatchesByWorkspace(events)
 	mu.Unlock()
-	if err := postJSONBearerTimeout(st, endpoint, accessToken, runtimeAuditBatchRequest{Events: events}, nil, runtimeAuditSyncTimeout); err != nil {
+	acks := []store.RemoteAuditAck{}
+	for _, batch := range batches {
+		var response runtimeAuditBatchResponse
+		if err := postJSONBearerTimeout(st, endpoint, accessToken, runtimeAuditBatchRequest{Events: batch}, &response, runtimeAuditSyncTimeout); err != nil {
+			continue
+		}
+		acks = append(acks, runtimeAuditRemoteAcks(batch, response.Acks)...)
+	}
+	if len(acks) == 0 {
 		return
 	}
 	mu.Lock()
@@ -4764,7 +5109,8 @@ func (a App) syncRuntimeAuditBestEffortFromPath(path string, mu *sync.Mutex) {
 	if err != nil {
 		return
 	}
-	latest.MarkAuditEventsRemoteSynced(ids, time.Now().UTC())
+	// A 2xx without matching acks stays pending; the ack is the durable sync boundary.
+	latest.MarkAuditEventsRemoteAcked(acks)
 	_ = latest.Save()
 }
 
@@ -4906,7 +5252,7 @@ func (a App) handleBrokerValueRequest(requestCtx context.Context, runtimeStore *
 		requestAuditSync()
 		return broker.ValueResponse{}, &broker.Error{Status: http.StatusForbidden, Code: "policy_denied", Message: reason}
 	}
-	value, secret, err := st.GetSecret(fullPath)
+	secretMetadata, err := st.SecretMetadata(fullPath)
 	if err != nil {
 		message := err.Error()
 		if hint := a.remoteSelectionHint(st, fullPath, subject, "broker", false); hint != "" {
@@ -4916,8 +5262,25 @@ func (a App) handleBrokerValueRequest(requestCtx context.Context, runtimeStore *
 		requestAuditSync()
 		return broker.ValueResponse{}, &broker.Error{Status: http.StatusNotFound, Code: "secret_not_local", Message: message}
 	}
-	if err := runtimeStore.audit(subject, "secret_brokered", "allowed", secret.Scope, secret.NameHash, "broker value request", target.Slug, subject, runtimeType, requestID, map[string]string{"mode": "broker"}); err != nil {
+	if err := st.CheckSecretReadable(fullPath); err != nil {
+		_ = runtimeStore.audit(subject, "secret_brokered", "failed", scope, hash, "secret not locally usable", target.Slug, subject, runtimeType, requestID, map[string]string{"mode": "broker"})
+		requestAuditSync()
+		return broker.ValueResponse{}, &broker.Error{Status: http.StatusNotFound, Code: "secret_not_local", Message: err.Error()}
+	}
+	if err := a.gateSecretRelease(st, subject, "secret_brokered", secretMetadata.Scope, secretMetadata.NameHash, "broker value request", brokerRuntimeAuditMetadata(st, target.Slug, subject, runtimeType, requestID, map[string]string{"mode": "broker"})); err != nil {
+		runtimeStore.current = st
 		return broker.ValueResponse{}, err
+	}
+	runtimeStore.current = st
+	value, _, err := st.GetSecret(fullPath)
+	if err != nil {
+		message := err.Error()
+		if hint := a.remoteSelectionHint(st, fullPath, subject, "broker", false); hint != "" {
+			message = hint
+		}
+		_ = runtimeStore.audit(subject, "secret_brokered", "failed", scope, hash, "secret not locally usable", target.Slug, subject, runtimeType, requestID, map[string]string{"mode": "broker"})
+		requestAuditSync()
+		return broker.ValueResponse{}, &broker.Error{Status: http.StatusNotFound, Code: "secret_not_local", Message: message}
 	}
 	if err := requestCtx.Err(); err != nil {
 		return broker.ValueResponse{}, &broker.Error{Status: http.StatusUnauthorized, Code: "token_expired", Message: "broker token expired"}
@@ -4981,10 +5344,21 @@ func (a App) audit(st *store.FileStore, args []string) int {
 		if len(workspaceSet) > 0 && !auditEventMatchesWorkspace(event, workspaceSet) {
 			continue
 		}
-		fmt.Fprintf(a.Out, "%s\t%s\t%s\t%s\t%s\n", event.CreatedAt.Format(time.RFC3339), event.Actor, event.Action, event.Result, event.Reason)
+		syncStatus := auditSyncStatus(st, event)
+		fmt.Fprintf(a.Out, "%s\t%s\t%s\t%s\t%s\t%s\n", event.CreatedAt.Format(time.RFC3339), event.Actor, event.Action, event.Result, syncStatus, event.Reason)
 		printed++
 	}
 	return 0
+}
+
+func auditSyncStatus(st *store.FileStore, event asiri.AuditEvent) string {
+	if event.RemoteSyncedAt != nil {
+		return "synced"
+	}
+	if isRuntimeAuditAction(event.Action) && event.Metadata != nil && event.Metadata["runtimeLabel"] != "" && runtimeAuditEventWorkspaceID(st, event) != "" {
+		return "pending"
+	}
+	return "local"
 }
 
 func auditEventMatchesWorkspace(event asiri.AuditEvent, workspaces map[string]bool) bool {
@@ -5003,7 +5377,7 @@ func (a App) syncRuntimeAuditBestEffort(st *store.FileStore) {
 	if st.State.ControlPlane == nil {
 		return
 	}
-	ids, events := pendingRuntimeAuditEvents(st)
+	_, events := pendingRuntimeAuditEvents(st)
 	if len(events) == 0 {
 		return
 	}
@@ -5012,11 +5386,23 @@ func (a App) syncRuntimeAuditBestEffort(st *store.FileStore) {
 		return
 	}
 	endpoint := strings.TrimRight(st.State.ControlPlane.Origin, "/") + "/v1/audit/batch"
-	if err := postJSONBearerTimeout(st, endpoint, accessToken, runtimeAuditBatchRequest{Events: events}, nil, runtimeAuditSyncTimeout); err != nil {
-		return
+	updated := false
+	for _, batch := range runtimeAuditBatchesByWorkspace(events) {
+		var response runtimeAuditBatchResponse
+		if err := postJSONBearerTimeout(st, endpoint, accessToken, runtimeAuditBatchRequest{Events: batch}, &response, runtimeAuditSyncTimeout); err != nil {
+			continue
+		}
+		// A 2xx without matching acks stays pending; the ack is the durable sync boundary.
+		acks := runtimeAuditRemoteAcks(batch, response.Acks)
+		if len(acks) == 0 {
+			continue
+		}
+		st.MarkAuditEventsRemoteAcked(acks)
+		updated = true
 	}
-	st.MarkAuditEventsRemoteSynced(ids, time.Now().UTC())
-	_ = st.Save()
+	if updated {
+		_ = st.Save()
+	}
 }
 
 var runtimeAuditSyncTimeout = 2 * time.Second
@@ -5039,7 +5425,20 @@ type runtimeAuditBatchRequest struct {
 	Events []runtimeAuditUploadEvent `json:"events"`
 }
 
+type runtimeAuditBatchResponse struct {
+	Acks []runtimeAuditAck `json:"acks"`
+}
+
+type runtimeAuditAck struct {
+	LocalAuditID    string `json:"localAuditId"`
+	EventDigest     string `json:"eventDigest"`
+	ServerEventID   string `json:"serverEventId"`
+	ServerCreatedAt string `json:"serverCreatedAt"`
+}
+
 type runtimeAuditUploadEvent struct {
+	LocalAuditID   string            `json:"localAuditId,omitempty"`
+	EventDigest    string            `json:"eventDigest,omitempty"`
 	OrgID          string            `json:"orgId"`
 	Action         string            `json:"action"`
 	Result         string            `json:"result"`
@@ -5064,25 +5463,154 @@ func pendingRuntimeAuditEvents(st *store.FileStore) ([]string, []runtimeAuditUpl
 			continue
 		}
 		eventWorkspaceID := runtimeAuditEventWorkspaceID(st, event)
-		if eventWorkspaceID == "" || eventWorkspaceID != st.State.ControlPlane.WorkspaceID {
+		if eventWorkspaceID == "" {
 			continue
 		}
-		metadata := copyStringMap(event.Metadata)
-		metadata["localAuditId"] = event.ID
-		metadata["reportedCreatedAt"] = event.CreatedAt.Format(time.RFC3339)
 		ids = append(ids, event.ID)
-		events = append(events, runtimeAuditUploadEvent{
-			OrgID:          eventWorkspaceID,
-			Action:         event.Action,
-			Result:         event.Result,
-			Scope:          event.Scope,
-			SecretNameHash: event.SecretNameHash,
-			Reason:         event.Reason,
-			CreatedAt:      event.CreatedAt.Format(time.RFC3339),
-			Metadata:       metadata,
-		})
+		events = append(events, runtimeAuditUploadEventFromEvent(eventWorkspaceID, event))
 	}
 	return ids, events
+}
+
+func runtimeAuditUploadEventFromEvent(orgID string, event asiri.AuditEvent) runtimeAuditUploadEvent {
+	metadata := copyStringMap(event.Metadata)
+	if metadata == nil {
+		metadata = map[string]string{}
+	}
+	digest := event.Digest
+	if digest == "" {
+		digest = store.AuditEventDigest(event)
+	}
+	metadata["localAuditId"] = event.ID
+	metadata["eventDigest"] = digest
+	metadata["reportedCreatedAt"] = event.CreatedAt.Format(time.RFC3339)
+	return runtimeAuditUploadEvent{
+		LocalAuditID:   event.ID,
+		EventDigest:    digest,
+		OrgID:          orgID,
+		Action:         event.Action,
+		Result:         event.Result,
+		Scope:          event.Scope,
+		SecretNameHash: event.SecretNameHash,
+		Reason:         event.Reason,
+		CreatedAt:      event.CreatedAt.Format(time.RFC3339),
+		Metadata:       metadata,
+	}
+}
+
+func runtimeAuditBatchesByWorkspace(events []runtimeAuditUploadEvent) [][]runtimeAuditUploadEvent {
+	order := []string{}
+	grouped := map[string][]runtimeAuditUploadEvent{}
+	for _, event := range events {
+		if _, ok := grouped[event.OrgID]; !ok {
+			order = append(order, event.OrgID)
+		}
+		grouped[event.OrgID] = append(grouped[event.OrgID], event)
+	}
+	batches := make([][]runtimeAuditUploadEvent, 0, len(order))
+	for _, orgID := range order {
+		batches = append(batches, grouped[orgID])
+	}
+	return batches
+}
+
+func runtimeAuditRemoteAcks(events []runtimeAuditUploadEvent, acks []runtimeAuditAck) []store.RemoteAuditAck {
+	expected := map[string]string{}
+	for _, event := range events {
+		if event.LocalAuditID != "" && event.EventDigest != "" {
+			expected[event.LocalAuditID] = event.EventDigest
+		}
+	}
+	out := []store.RemoteAuditAck{}
+	seen := map[string]bool{}
+	for _, ack := range acks {
+		if expected[ack.LocalAuditID] == "" || expected[ack.LocalAuditID] != ack.EventDigest {
+			continue
+		}
+		if seen[ack.LocalAuditID] {
+			continue
+		}
+		seen[ack.LocalAuditID] = true
+		syncedAt, _ := time.Parse(time.RFC3339, ack.ServerCreatedAt)
+		if syncedAt.IsZero() {
+			syncedAt = time.Now().UTC()
+		}
+		out = append(out, store.RemoteAuditAck{LocalAuditID: ack.LocalAuditID, EventDigest: ack.EventDigest, RemoteEventID: ack.ServerEventID, SyncedAt: syncedAt})
+	}
+	return out
+}
+
+func (a App) gateSecretRelease(st *store.FileStore, actor, auditAction, scope, secretNameHash, reason string, metadata map[string]string) error {
+	st.Audit(actor, auditAction, "allowed", scope, secretNameHash, reason, metadata)
+	eventID := st.LatestAuditEventID()
+	if err := st.SaveWithAuditLedger(); err != nil {
+		return err
+	}
+	if st.ResolveEnvelopeAuditMode(scope) != asiri.AuditModeStrict {
+		a.syncRuntimeAuditBestEffort(st)
+		return nil
+	}
+	event, ok := st.AuditEventByID(eventID)
+	if !ok {
+		return errors.New("strict audit event missing after local append")
+	}
+	if err := a.syncRuntimeAuditStrict(st, event); err != nil {
+		failedMetadata := copyStringMap(metadata)
+		if failedMetadata == nil {
+			failedMetadata = map[string]string{}
+		}
+		failedMetadata["blockedLocalAuditId"] = event.ID
+		failedMetadata["blockedEventDigest"] = event.Digest
+		st.Audit(actor, auditAction, "failed", scope, secretNameHash, "secret release blocked because strict audit ack failed: "+err.Error(), failedMetadata)
+		if saveErr := st.SaveWithAuditLedger(); saveErr != nil {
+			return fmt.Errorf("strict audit ack required before secret release: %w; failed to persist failed audit record: %v", err, saveErr)
+		}
+		return fmt.Errorf("strict audit ack required before secret release: %w", err)
+	}
+	return nil
+}
+
+func (a App) syncRuntimeAuditStrict(st *store.FileStore, event asiri.AuditEvent) error {
+	return a.syncRuntimeAuditStrictBatch(st, []asiri.AuditEvent{event})
+}
+
+func (a App) syncRuntimeAuditStrictBatch(st *store.FileStore, events []asiri.AuditEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	if st.State.ControlPlane == nil {
+		return errors.New("control plane is not linked")
+	}
+	// The active session is only the authentication credential here. The
+	// requested secret workspace travels in the audit event orgId, so strict
+	// ack must never switch or overwrite the user's active CLI workspace.
+	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	if err != nil {
+		return err
+	}
+	uploads := make([]runtimeAuditUploadEvent, 0, len(events))
+	for _, event := range events {
+		orgID := runtimeAuditEventWorkspaceID(st, event)
+		if orgID == "" {
+			return errors.New("audit event is not attributable to a workspace")
+		}
+		uploads = append(uploads, runtimeAuditUploadEventFromEvent(orgID, event))
+	}
+	endpoint := strings.TrimRight(st.State.ControlPlane.Origin, "/") + "/v1/audit/batch"
+	allAcks := []store.RemoteAuditAck{}
+	for _, batch := range runtimeAuditBatchesByWorkspace(uploads) {
+		var response runtimeAuditBatchResponse
+		if err := postJSONBearerTimeout(st, endpoint, accessToken, runtimeAuditBatchRequest{Events: batch}, &response, runtimeAuditSyncTimeout); err != nil {
+			return err
+		}
+		acks := runtimeAuditRemoteAcks(batch, response.Acks)
+		if len(acks) != len(batch) {
+			return errors.New("control plane did not return matching audit acks")
+		}
+		allAcks = append(allAcks, acks...)
+	}
+	st.MarkAuditEventsRemoteAcked(allAcks)
+	return st.SaveWithAuditLedger()
 }
 
 func runtimeAuditEventWorkspaceID(st *store.FileStore, event asiri.AuditEvent) string {
@@ -5415,7 +5943,10 @@ type syncBundleResponse struct {
 	IssuedAt         string                      `json:"issuedAt"`
 	EncryptedSecrets []store.RemoteSecretVersion `json:"encryptedSecrets"`
 	Policies         []syncPolicyResponse        `json:"policies"`
+	Scopes           []syncScopeResponse         `json:"scopes"`
 }
+
+type syncScopeResponse = asiri.ScopeAuditMode
 
 type syncPolicyResponse struct {
 	ID            string     `json:"id"`

@@ -6,7 +6,9 @@ Asiri CLI is the local runtime for Asiri secrets. It gives you an encrypted loca
 
 You can use it entirely locally. An Asiri account is only needed when you want hosted sync, device approval, recovery, or workspace sharing.
 
-When hosted sync is enabled, Asiri keeps secret labels, encrypted secret material, trusted devices, policies, and audit state in one place. The hosted service cannot decrypt your secrets. It does not have the key material. Trusted devices handle decryption locally.
+When hosted sync is enabled, Asiri keeps secret labels, encrypted secret material, trusted devices, policies, envelope audit modes, and audit state in one place. The hosted service cannot decrypt your secrets. It does not have the key material. Trusted devices handle decryption locally.
+
+Envelope audit mode decides what happens before a value is released. Buffered mode appends an encrypted local audit record first, releases the secret, and syncs later. Strict mode appends locally, sends the event to the control plane, and requires a matching ack before the CLI, broker, mount, env injection, raw read, or unsafe argv path can materialize the value.
 
 This CLI is open source so teams can inspect how secrets are decrypted, injected, mounted, and enforced before they trust it.
 
@@ -62,6 +64,8 @@ asiri env --workspace personal --agent local-script dev/API_KEY -- ./deploy.sh
 For tools that read files instead of environment variables, use `asiri mount` to create temporary secret files for the child process.
 
 `asiri login`, `asiri push`, and `asiri pull` are optional. Use them when you want this local vault to sync encrypted secrets through the Asiri control plane.
+
+Workspace owners and delegated admins set envelope audit mode in the control plane. Use buffered for local or offline-friendly envelopes. Use strict for production, staging, SSH, deploy, and other paths where administrator visibility before release matters.
 
 ## Release Signing
 

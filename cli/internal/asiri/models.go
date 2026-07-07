@@ -93,6 +93,19 @@ type Policy struct {
 	ExpiresAt     *time.Time `json:"expiresAt,omitempty"`
 }
 
+type AuditMode string
+
+const (
+	AuditModeBuffered AuditMode = "buffered"
+	AuditModeStrict   AuditMode = "strict"
+)
+
+type ScopeAuditMode struct {
+	Path              string    `json:"path"`
+	AuditMode         AuditMode `json:"auditMode,omitempty"`
+	ResolvedAuditMode AuditMode `json:"resolvedAuditMode"`
+}
+
 type AuditEvent struct {
 	ID             string            `json:"id"`
 	Actor          string            `json:"actor"`
@@ -103,23 +116,52 @@ type AuditEvent struct {
 	Reason         string            `json:"reason,omitempty"`
 	Metadata       map[string]string `json:"metadata,omitempty"`
 	CreatedAt      time.Time         `json:"createdAt"`
+	Digest         string            `json:"digest,omitempty"`
+	RemoteEventID  string            `json:"remoteEventId,omitempty"`
 	RemoteSyncedAt *time.Time        `json:"remoteSyncedAt,omitempty"`
 }
 
+type AuditLedgerRecord struct {
+	Sequence       int       `json:"sequence"`
+	EventID        string    `json:"eventId"`
+	PreviousHash   string    `json:"previousHash"`
+	Hash           string    `json:"hash"`
+	Algorithm      string    `json:"algorithm"`
+	Nonce          string    `json:"nonce"`
+	AAD            string    `json:"aad"`
+	Ciphertext     string    `json:"ciphertext"`
+	Signature      string    `json:"signature"`
+	SignatureAlg   string    `json:"signatureAlg"`
+	SignerDeviceID string    `json:"signerDeviceId,omitempty"`
+	CreatedAt      time.Time `json:"createdAt"`
+}
+
+type AuditLedgerHead struct {
+	Count          int       `json:"count"`
+	Hash           string    `json:"hash"`
+	Signature      string    `json:"signature"`
+	SignatureAlg   string    `json:"signatureAlg"`
+	SignerDeviceID string    `json:"signerDeviceId,omitempty"`
+	UpdatedAt      time.Time `json:"updatedAt"`
+}
+
 type State struct {
-	Version        int                               `json:"version"`
-	VaultID        string                            `json:"vaultId"`
-	RemoteBindings map[string]RemoteWorkspaceBinding `json:"remoteBindings,omitempty"`
-	UserID         string                            `json:"userId"`
-	LocalDeviceID  string                            `json:"localDeviceId,omitempty"`
-	KeyStore       string                            `json:"keyStore"`
-	KeyRefs        []KeyRef                          `json:"keyRefs"`
-	ControlPlane   *ControlPlaneLink                 `json:"controlPlane,omitempty"`
-	Recoveries     map[string]RecoveryConfig         `json:"recoveries,omitempty"`
-	Devices        []Device                          `json:"devices"`
-	Secrets        map[string]Secret                 `json:"secrets"`
-	Policies       []Policy                          `json:"policies"`
-	Audit          []AuditEvent                      `json:"audit"`
-	CreatedAt      time.Time                         `json:"createdAt"`
-	UpdatedAt      time.Time                         `json:"updatedAt"`
+	Version            int                               `json:"version"`
+	VaultID            string                            `json:"vaultId"`
+	RemoteBindings     map[string]RemoteWorkspaceBinding `json:"remoteBindings,omitempty"`
+	UserID             string                            `json:"userId"`
+	LocalDeviceID      string                            `json:"localDeviceId,omitempty"`
+	KeyStore           string                            `json:"keyStore"`
+	KeyRefs            []KeyRef                          `json:"keyRefs"`
+	ControlPlane       *ControlPlaneLink                 `json:"controlPlane,omitempty"`
+	Recoveries         map[string]RecoveryConfig         `json:"recoveries,omitempty"`
+	Devices            []Device                          `json:"devices"`
+	Secrets            map[string]Secret                 `json:"secrets"`
+	Policies           []Policy                          `json:"policies"`
+	EnvelopeAuditModes map[string]AuditMode              `json:"envelopeAuditModes,omitempty"`
+	AuditLedger        []AuditLedgerRecord               `json:"auditLedger,omitempty"`
+	AuditLedgerHead    *AuditLedgerHead                  `json:"auditLedgerHead,omitempty"`
+	Audit              []AuditEvent                      `json:"-"`
+	CreatedAt          time.Time                         `json:"createdAt"`
+	UpdatedAt          time.Time                         `json:"updatedAt"`
 }
