@@ -139,7 +139,7 @@ func TestCLICommandMatrix(t *testing.T) {
 		t.Fatalf("policy list missing grants/denies: %s", policies)
 	}
 	expectOK("run", "--workspace", "qa", "--agent", "codex", "--env", "OPENAI_API_KEY=openai/api_key", "--", "sh", "-c", "test \"$OPENAI_API_KEY\" = qa_secret_value")
-	expectOK("broker", "start", "--once")
+	expectFail("requires --workspace", "broker", "start", "--once")
 	expectOK("rotate", "--workspace", "qa", "openai/api_key", "--value-file", testSecretFile(t, "qa_rotated_value"))
 	if value := expectOK("get", "--workspace", "qa", "openai/api_key"); strings.TrimSpace(value) != "qa_rotated_value" {
 		t.Fatalf("rotated get returned %q", value)

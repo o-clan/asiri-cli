@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -19,11 +20,14 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -170,7 +174,7 @@ Commands:
   run         Run a command with injected secrets.
   env         Run a command with one scope or secret injected.
   mount       Run a command with temporary secret files.
-  broker      Start the local broker. Example: asiri broker start.
+  broker      Start the local broker. Example: asiri broker start --workspace qa --agent app.
   audit       Read local audit events.
   cache       Wipe local Asiri cache and control-plane keys.
 
@@ -252,7 +256,7 @@ func (a App) helpFor(path []string) int {
 	case "service-account disable":
 		fmt.Fprint(a.Out, "Usage: asiri service-account disable --workspace <slug> --service-account <slug-or-id>\n")
 	case "service-account grant":
-		fmt.Fprint(a.Out, "Usage: asiri service-account grant --workspace <slug> --service-account <slug-or-id> --scope <scope> --secret <pattern> --inject-only|--read|--mount|--sign|--proxy-local [--approval-mode none|require-owner] [--expires-at <iso>]\n")
+		fmt.Fprint(a.Out, "Usage: asiri service-account grant --workspace <slug> --service-account <slug-or-id> --scope <scope> --secret <pattern> --inject-only|--read|--mount|--broker|--sign|--proxy-local [--approval-mode none|require-owner] [--expires-at <iso>]\n")
 	case "service-account login":
 		fmt.Fprintf(a.Out, "Usage: asiri service-account login --workspace <slug> --service-account <slug> [--origin <url>]\n\nCreates a browser approval link. A workspace owner or service-account admin must approve it. Default origin: %s.\n", defaultControlPlaneOrigin)
 	case "push":
@@ -306,7 +310,7 @@ func (a App) helpFor(path []string) int {
 	case "rm":
 		fmt.Fprint(a.Out, "Usage: asiri rm --workspace <slug> <scope/name>\n       asiri rm --remote --workspace <slug> <scope/name> [--dry-run|--confirm-token <token>]\n       asiri rm --remote --workspace <slug> --where remote-only [--dry-run|--confirm-token <token>]\n\nMarks a local secret as deleted by default. With --remote, soft-deletes active remote secret versions in the control plane. Use short paths without the workspace prefix.\n")
 	case "grant":
-		fmt.Fprint(a.Out, "Usage: asiri grant --workspace <slug> <subject-label> <scope/name> --inject-only|--read|--mount\n\nAdds a local policy rule allowing a non-human subject label to use a secret. Use short paths without the workspace prefix.\n")
+		fmt.Fprint(a.Out, "Usage: asiri grant --workspace <slug> <subject-label> <scope/name> --inject-only|--read|--mount|--broker\n\nAdds a local policy rule allowing a non-human subject label to use a secret. Use short paths without the workspace prefix.\n")
 	case "deny":
 		fmt.Fprint(a.Out, "Usage: asiri deny --workspace <slug> <subject-label> <scope/*>\n\nAdds a local policy rule denying a subject label at a scope. Use short paths without the workspace prefix.\n")
 	case "policy":
@@ -320,9 +324,9 @@ func (a App) helpFor(path []string) int {
 	case "mount":
 		fmt.Fprint(a.Out, "Usage: asiri mount --workspace <slug> [--agent <subject-label>] [--dir <dir>] <scope-or-secret[:dest]> -- <command...>\n\nRuns a command with temporary secret files mounted under a private directory. Use short paths without the workspace prefix.\n")
 	case "broker":
-		fmt.Fprint(a.Out, "Usage: asiri broker start [--once]\n\nStarts the local broker that serves approved local secret access requests.\n")
+		fmt.Fprint(a.Out, "Usage: asiri broker start --workspace <slug> --agent <subject-label> [--socket <path>|--listen <addr>] [--client-file <path>] [--token-ttl <duration>] [--idle-timeout <duration>] [--max-runtime <duration>] [--once]\n\nStarts a local broker for approved per-request secret access. Defaults to a Unix socket when supported and loopback HTTP otherwise.\n")
 	case "broker start":
-		fmt.Fprint(a.Out, "Usage: asiri broker start [--once]\n\nStarts the local broker. With --once, handles one request and exits.\n")
+		fmt.Fprint(a.Out, "Usage: asiri broker start --workspace <slug> --agent <subject-label> [--socket <path>|--listen <addr>] [--client-file <path>] [--token-ttl <duration>] [--idle-timeout <duration>] [--max-runtime <duration>] [--once]\n\nStarts the local broker. With --once, handles one request and exits.\n")
 	case "audit":
 		fmt.Fprint(a.Out, "Usage: asiri audit tail [--limit N] [--workspace <slug>...]\n\nShows recent local audit events.\n")
 	case "audit tail":
@@ -663,7 +667,7 @@ func parseServiceAccountGrantArgs(args []string) (serviceAccountGrantOptions, er
 		return options, errors.New("service-account grant requires --secret")
 	}
 	if len(options.Actions) == 0 {
-		return options, errors.New("service-account grant requires --inject-only, --read, --mount, --sign, or --proxy-local")
+		return options, errors.New("service-account grant requires --inject-only, --read, --mount, --broker, --sign, or --proxy-local")
 	}
 	if options.ApprovalMode != "none" && options.ApprovalMode != "require-owner" {
 		return options, errors.New("--approval-mode must be none or require-owner")
@@ -679,6 +683,8 @@ func servicePolicyAction(flag string) (string, bool) {
 		return "inject", true
 	case "--mount":
 		return "mount", true
+	case "--broker":
+		return "broker", true
 	case "--sign":
 		return "sign", true
 	case "--proxy-local":
@@ -3795,10 +3801,13 @@ func (a App) grant(st *store.FileStore, args []string) int {
 	if hasFlag(remaining[2:], "--mount") {
 		actions = append(actions, "mount")
 	}
-	if len(actions) == 0 {
-		return a.fail(errors.New("grant requires --inject-only, --read, or --mount"))
+	if hasFlag(remaining[2:], "--broker") {
+		actions = append(actions, "broker")
 	}
-	if err := rejectUnknownArgs(remaining[2:], "--inject-only", "--read", "--mount"); err != nil {
+	if len(actions) == 0 {
+		return a.fail(errors.New("grant requires --inject-only, --read, --mount, or --broker"))
+	}
+	if err := rejectUnknownArgs(remaining[2:], "--inject-only", "--read", "--mount", "--broker"); err != nil {
 		return a.fail(err)
 	}
 	target, err := a.workspacePathTarget(st, workspaceArg, "grant")
@@ -4598,14 +4607,344 @@ func (a App) broker(st *store.FileStore, args []string) int {
 	if err := st.RequireInitialized(); err != nil {
 		return a.fail(err)
 	}
-	if hasFlag(args[1:], "--once") {
-		summary := broker.StartOnce()
-		st.Audit(st.State.UserID, "broker_started", "allowed", "", "", summary.Policy, map[string]string{"mode": summary.Mode})
-		_ = st.Save()
-		fmt.Fprintln(a.Out, summary.String())
-		return 0
+	options, err := parseBrokerStartArgs(args[1:])
+	if err != nil {
+		return a.fail(err)
 	}
-	return a.fail(errors.New("long-running broker is not started in this local smoke path; use --once for QA"))
+	target, err := a.workspacePathTarget(st, options.Workspace, "broker start")
+	if err != nil {
+		return a.fail(err)
+	}
+	if options.Agent == "" && (st.State.ControlPlane == nil || st.State.ControlPlane.Source != "service-account") {
+		return a.fail(errors.New("broker start requires --agent"))
+	}
+	subject, runtimeType, err := runtimeSubject(st, options.Agent, "", options.Agent != "")
+	if err != nil {
+		return a.fail(err)
+	}
+	if subject == "" {
+		return a.fail(errors.New("broker start requires a subject"))
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	var mu sync.Mutex
+	runtimeStore := brokerRuntimeStore{path: st.Path, current: st}
+	requestAuditSync, waitAuditSync := a.startRuntimeAuditSyncWorker(ctx, st.Path, &mu)
+	defer func() {
+		stop()
+		waitAuditSync()
+	}()
+	brokerOptions := broker.Options{
+		Workspace:   target.Slug,
+		Subject:     subject,
+		SocketPath:  options.SocketPath,
+		ListenAddr:  options.ListenAddr,
+		ClientFile:  options.ClientFile,
+		TokenTTL:    options.TokenTTL,
+		IdleTimeout: options.IdleTimeout,
+		MaxRuntime:  options.MaxRuntime,
+		Once:        options.Once,
+		OnReady: func(summary broker.Summary) {
+			mu.Lock()
+			_ = runtimeStore.audit(subject, "broker_started", "allowed", "", "", "local broker started", target.Slug, subject, runtimeType, "", map[string]string{"mode": summary.Mode})
+			requestAuditSync()
+			mu.Unlock()
+			fmt.Fprintf(a.Out, "asiri broker ready\nmode\t%s\naddress\t%s\nclient\t%s\nworkspace\t%s\nsubject\t%s\nexpires\t%s\n", summary.Mode, summary.Address, summary.ClientFile, summary.Workspace, summary.Subject, summary.ExpiresAt.Format(time.RFC3339))
+		},
+		OnEvent: func(event broker.Event) {
+			mu.Lock()
+			_ = runtimeStore.audit(subject, event.Action, event.Result, "", "", event.Reason, target.Slug, subject, runtimeType, event.RequestID, nil)
+			requestAuditSync()
+			mu.Unlock()
+		},
+	}
+	_, runErr := broker.Run(ctx, brokerOptions, func(requestCtx context.Context, request broker.ValueRequest) (broker.ValueResponse, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return a.handleBrokerValueRequest(requestCtx, &runtimeStore, target, subject, runtimeType, request, requestAuditSync)
+	})
+	mu.Lock()
+	result := "allowed"
+	reason := "local broker stopped"
+	if runErr != nil {
+		result = "failed"
+		reason = runErr.Error()
+	}
+	_ = runtimeStore.audit(subject, "broker_stopped", result, "", "", reason, target.Slug, subject, runtimeType, "", nil)
+	a.syncRuntimeAuditBestEffort(runtimeStore.currentStore())
+	mu.Unlock()
+	if runErr != nil {
+		return a.fail(runErr)
+	}
+	return 0
+}
+
+type brokerRuntimeStore struct {
+	path    string
+	current *store.FileStore
+}
+
+func (runtime *brokerRuntimeStore) currentStore() *store.FileStore {
+	return runtime.current
+}
+
+func (runtime *brokerRuntimeStore) load() (*store.FileStore, error) {
+	latest, err := store.Load(runtime.path)
+	if err != nil {
+		return nil, err
+	}
+	runtime.current = latest
+	return latest, nil
+}
+
+func (runtime *brokerRuntimeStore) audit(actor, action, result, scope, nameHash, reason, workspaceSlug, label, labelType, requestID string, extra map[string]string) error {
+	latest, err := runtime.load()
+	if err != nil {
+		return err
+	}
+	latest.Audit(actor, action, result, scope, nameHash, reason, brokerRuntimeAuditMetadata(latest, workspaceSlug, label, labelType, requestID, extra))
+	if err := latest.Save(); err != nil {
+		return err
+	}
+	runtime.current = latest
+	return nil
+}
+
+func (a App) startRuntimeAuditSyncWorker(ctx context.Context, path string, mu *sync.Mutex) (func(), func()) {
+	requested := make(chan struct{}, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-requested:
+				a.syncRuntimeAuditBestEffortFromPath(path, mu)
+			}
+		}
+	}()
+	requestSync := func() {
+		select {
+		case requested <- struct{}{}:
+		default:
+		}
+	}
+	wait := func() {
+		<-done
+	}
+	return requestSync, wait
+}
+
+func (a App) syncRuntimeAuditBestEffortFromPath(path string, mu *sync.Mutex) {
+	mu.Lock()
+	st, err := store.Load(path)
+	if err != nil || st.State.ControlPlane == nil {
+		mu.Unlock()
+		return
+	}
+	ids, events := pendingRuntimeAuditEvents(st)
+	if len(events) == 0 {
+		mu.Unlock()
+		return
+	}
+	accessToken, ok := runtimeAuditAccessToken(st)
+	if !ok {
+		mu.Unlock()
+		return
+	}
+	endpoint := strings.TrimRight(st.State.ControlPlane.Origin, "/") + "/v1/audit/batch"
+	mu.Unlock()
+	if err := postJSONBearerTimeout(st, endpoint, accessToken, runtimeAuditBatchRequest{Events: events}, nil, runtimeAuditSyncTimeout); err != nil {
+		return
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	latest, err := store.Load(path)
+	if err != nil {
+		return
+	}
+	latest.MarkAuditEventsRemoteSynced(ids, time.Now().UTC())
+	_ = latest.Save()
+}
+
+type brokerStartOptions struct {
+	Workspace   string
+	Agent       string
+	SocketPath  string
+	ListenAddr  string
+	ClientFile  string
+	TokenTTL    time.Duration
+	IdleTimeout time.Duration
+	MaxRuntime  time.Duration
+	Once        bool
+}
+
+func parseBrokerStartArgs(args []string) (brokerStartOptions, error) {
+	options := brokerStartOptions{}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--workspace", "-w":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--workspace requires a slug")
+			}
+			options.Workspace = args[i+1]
+			i++
+		case "--agent":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--agent requires a subject")
+			}
+			options.Agent = store.NormalizeSubjectLabel(args[i+1])
+			i++
+		case "--socket":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--socket requires a path")
+			}
+			options.SocketPath = args[i+1]
+			i++
+		case "--listen":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--listen requires an address")
+			}
+			options.ListenAddr = args[i+1]
+			i++
+		case "--client-file":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return options, errors.New("--client-file requires a path")
+			}
+			options.ClientFile = args[i+1]
+			i++
+		case "--token-ttl":
+			value, err := parseBrokerDurationFlag(args, &i, "--token-ttl")
+			if err != nil {
+				return options, err
+			}
+			options.TokenTTL = value
+		case "--idle-timeout":
+			value, err := parseBrokerDurationFlag(args, &i, "--idle-timeout")
+			if err != nil {
+				return options, err
+			}
+			options.IdleTimeout = value
+		case "--max-runtime":
+			value, err := parseBrokerDurationFlag(args, &i, "--max-runtime")
+			if err != nil {
+				return options, err
+			}
+			options.MaxRuntime = value
+		case "--once":
+			options.Once = true
+		default:
+			return options, fmt.Errorf("unknown broker start argument %q", args[i])
+		}
+	}
+	if options.Workspace == "" {
+		return options, errors.New("broker start requires --workspace")
+	}
+	return options, nil
+}
+
+func parseBrokerDurationFlag(args []string, index *int, flag string) (time.Duration, error) {
+	if *index+1 >= len(args) || strings.HasPrefix(args[*index+1], "--") {
+		return 0, fmt.Errorf("%s requires a duration", flag)
+	}
+	value, err := time.ParseDuration(args[*index+1])
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a duration like 15m or 1h: %w", flag, err)
+	}
+	if value < time.Second {
+		return 0, fmt.Errorf("%s must be at least 1s", flag)
+	}
+	*index = *index + 1
+	return value, nil
+}
+
+func (a App) handleBrokerValueRequest(requestCtx context.Context, runtimeStore *brokerRuntimeStore, target workspacePathTarget, subject, runtimeType string, request broker.ValueRequest, requestAuditSync func()) (broker.ValueResponse, error) {
+	if err := requestCtx.Err(); err != nil {
+		return broker.ValueResponse{}, &broker.Error{Status: http.StatusUnauthorized, Code: "token_expired", Message: "broker token expired"}
+	}
+	st, err := runtimeStore.load()
+	if err != nil {
+		return broker.ValueResponse{}, err
+	}
+	requestID := strings.TrimSpace(request.RequestID)
+	if requestID == "" || len(requestID) > 128 {
+		_ = runtimeStore.audit(subject, "broker_request", "denied", "", "", "invalid broker request id", target.Slug, subject, runtimeType, "", nil)
+		requestAuditSync()
+		return broker.ValueResponse{}, &broker.Error{Status: http.StatusBadRequest, Code: "invalid_request_id", Message: "broker request requires a short requestId"}
+	}
+	if strings.TrimSpace(request.Workspace) != target.Slug {
+		_ = runtimeStore.audit(subject, "broker_request", "denied", "", "", "broker workspace mismatch", target.Slug, subject, runtimeType, requestID, nil)
+		requestAuditSync()
+		return broker.ValueResponse{}, &broker.Error{Status: http.StatusForbidden, Code: "workspace_mismatch", Message: "broker workspace mismatch"}
+	}
+	if store.NormalizeSubjectLabel(request.Subject) != subject {
+		_ = runtimeStore.audit(subject, "broker_request", "denied", "", "", "broker subject mismatch", target.Slug, subject, runtimeType, requestID, nil)
+		requestAuditSync()
+		return broker.ValueResponse{}, &broker.Error{Status: http.StatusForbidden, Code: "subject_mismatch", Message: "broker subject mismatch"}
+	}
+	shortPath := strings.TrimSpace(request.Path)
+	if shortPath == "" {
+		_ = runtimeStore.audit(subject, "broker_request", "denied", "", "", "missing broker secret path", target.Slug, subject, runtimeType, requestID, nil)
+		requestAuditSync()
+		return broker.ValueResponse{}, &broker.Error{Status: http.StatusBadRequest, Code: "missing_path", Message: "broker request requires a secret path"}
+	}
+	fullPath, err := workspacePrefixedPath(target, shortPath, "broker")
+	if err != nil {
+		_ = runtimeStore.audit(subject, "broker_request", "denied", "", "", "invalid broker secret path", target.Slug, subject, runtimeType, requestID, nil)
+		requestAuditSync()
+		return broker.ValueResponse{}, &broker.Error{Status: http.StatusBadRequest, Code: "invalid_path", Message: err.Error()}
+	}
+	allowed, reason := st.CheckPolicy(subject, fullPath, "broker")
+	scope, name, parseErr := store.ParseSecretPath(fullPath)
+	hash := ""
+	if parseErr == nil {
+		hash = store.HashSecretName(scope, name)
+	}
+	if !allowed {
+		_ = runtimeStore.audit(subject, "secret_brokered", "denied", scope, hash, reason, target.Slug, subject, runtimeType, requestID, map[string]string{"mode": "broker"})
+		requestAuditSync()
+		return broker.ValueResponse{}, &broker.Error{Status: http.StatusForbidden, Code: "policy_denied", Message: reason}
+	}
+	value, secret, err := st.GetSecret(fullPath)
+	if err != nil {
+		message := err.Error()
+		if hint := a.remoteSelectionHint(st, fullPath, subject, "broker", false); hint != "" {
+			message = hint
+		}
+		_ = runtimeStore.audit(subject, "secret_brokered", "failed", scope, hash, "secret not locally usable", target.Slug, subject, runtimeType, requestID, map[string]string{"mode": "broker"})
+		requestAuditSync()
+		return broker.ValueResponse{}, &broker.Error{Status: http.StatusNotFound, Code: "secret_not_local", Message: message}
+	}
+	if err := runtimeStore.audit(subject, "secret_brokered", "allowed", secret.Scope, secret.NameHash, "broker value request", target.Slug, subject, runtimeType, requestID, map[string]string{"mode": "broker"}); err != nil {
+		return broker.ValueResponse{}, err
+	}
+	if err := requestCtx.Err(); err != nil {
+		return broker.ValueResponse{}, &broker.Error{Status: http.StatusUnauthorized, Code: "token_expired", Message: "broker token expired"}
+	}
+	requestAuditSync()
+	return broker.ValueResponse{RequestID: requestID, Value: value}, nil
+}
+
+func brokerRuntimeAuditMetadata(st *store.FileStore, workspaceSlug, label, labelType, requestID string, extra map[string]string) map[string]string {
+	metadata := runtimeAuditMetadata(st, "", label, labelType, extra)
+	if metadata == nil {
+		metadata = map[string]string{}
+	}
+	if workspaceSlug != "" {
+		metadata["workspaceSlug"] = workspaceSlug
+		if st != nil {
+			if binding, ok := st.RemoteBindingForPrefix(workspaceSlug); ok && binding.WorkspaceID != "" {
+				metadata["workspaceId"] = binding.WorkspaceID
+			} else if st.State.ControlPlane != nil && st.State.ControlPlane.WorkspaceSlug == workspaceSlug {
+				metadata["workspaceId"] = st.State.ControlPlane.WorkspaceID
+			}
+		}
+	}
+	if requestID != "" {
+		metadata["requestId"] = requestID
+	}
+	return metadata
 }
 
 func (a App) audit(st *store.FileStore, args []string) int {
@@ -4758,7 +5097,7 @@ func runtimeAuditEventWorkspaceID(st *store.FileStore, event asiri.AuditEvent) s
 
 func isRuntimeAuditAction(action string) bool {
 	switch action {
-	case "secret_read", "secret_injected", "secret_env_exported", "secret_mounted", "secret_unsafe_argv_injected":
+	case "secret_read", "secret_injected", "secret_env_exported", "secret_mounted", "secret_unsafe_argv_injected", "secret_brokered", "broker_request", "broker_started", "broker_stopped":
 		return true
 	default:
 		return false

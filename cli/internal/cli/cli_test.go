@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -33,6 +34,98 @@ func testSecretFile(t *testing.T, value string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+type brokerClientTestConfig struct {
+	URL       string    `json:"url"`
+	Token     string    `json:"token"`
+	Workspace string    `json:"workspace"`
+	Subject   string    `json:"subject"`
+	ExpiresAt time.Time `json:"expiresAt"`
+}
+
+func runBrokerValueRequest(t *testing.T, app App, request map[string]string, tokenOverride string, extraArgs ...string) (*http.Response, string) {
+	t.Helper()
+	clientFile := filepath.Join(t.TempDir(), "broker-client.json")
+	args := []string{"broker", "start", "--workspace", "qa", "--agent", "codex", "--listen", "127.0.0.1:0", "--client-file", clientFile, "--idle-timeout", "5s", "--token-ttl", "30s", "--once"}
+	args = append(args, extraArgs...)
+	done := make(chan int, 1)
+	go func() {
+		done <- app.Run(args)
+	}()
+	cfg := waitForBrokerClientConfig(t, clientFile)
+	if tokenOverride == "" {
+		tokenOverride = cfg.Token
+	}
+	resp, payload := postBrokerValueRequest(t, cfg, request, tokenOverride)
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("broker exited with code %d", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("broker did not exit after one request")
+	}
+	return resp, payload
+}
+
+func postBrokerValueRequest(t *testing.T, cfg brokerClientTestConfig, request map[string]string, tokenOverride string) (*http.Response, string) {
+	t.Helper()
+	if tokenOverride == "" {
+		tokenOverride = cfg.Token
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpReq, err := http.NewRequest(http.MethodPost, cfg.URL, strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpReq.Header.Set("authorization", "Bearer "+tokenOverride)
+	httpReq.Header.Set("content-type", "application/json")
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	return resp, string(payload)
+}
+
+func waitForBrokerClientConfig(t *testing.T, path string) brokerClientTestConfig {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			var cfg brokerClientTestConfig
+			if err := json.Unmarshal(data, &cfg); err != nil {
+				t.Fatal(err)
+			}
+			if cfg.URL == "" || cfg.Token == "" {
+				t.Fatalf("broker client config missing URL or token: %s", string(data))
+			}
+			return cfg
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("broker client config was not written")
+	return brokerClientTestConfig{}
+}
+
+func TestParseBrokerStartArgsRejectsInvalidDurations(t *testing.T) {
+	for _, flag := range []string{"--token-ttl", "--idle-timeout", "--max-runtime"} {
+		if _, err := parseBrokerStartArgs([]string{"--workspace", "qa", "--agent", "codex", flag, "0s"}); err == nil {
+			t.Fatalf("%s accepted zero duration", flag)
+		}
+		if _, err := parseBrokerStartArgs([]string{"--workspace", "qa", "--agent", "codex", flag, "-1s"}); err == nil {
+			t.Fatalf("%s accepted negative duration", flag)
+		}
+	}
 }
 
 func TestDefaultControlPlaneOriginMatchesLocalDev(t *testing.T) {
@@ -1593,13 +1686,39 @@ func TestCLIEndToEndLocalRuntime(t *testing.T) {
 		{"init", "--device", "qa-laptop"},
 		{"add", "--workspace", "qa", "openai/api_key", "--value-file", testSecretFile(t, "qa_secret_value")},
 		{"grant", "--workspace", "qa", "codex", "openai/api_key", "--inject-only"},
+		{"grant", "--workspace", "qa", "codex", "openai/api_key", "--broker"},
 		{"run", "--workspace", "qa", "--agent", "codex", "--env", "OPENAI_API_KEY=openai/api_key", "--", "sh", "-c", "test \"$OPENAI_API_KEY\" = qa_secret_value"},
-		{"broker", "start", "--once"},
 	}
 	for _, step := range steps {
 		if code := app.Run(step); code != 0 {
 			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
 		}
+	}
+	brokerApp := New(io.Discard, io.Discard)
+	resp, payload := runBrokerValueRequest(t, brokerApp, map[string]string{
+		"requestId": "req_allowed",
+		"workspace": "qa",
+		"subject":   "codex",
+		"path":      "openai/api_key",
+	}, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("broker request failed status=%d body=%s", resp.StatusCode, payload)
+	}
+	var brokerResponse map[string]string
+	if err := json.Unmarshal([]byte(payload), &brokerResponse); err != nil {
+		t.Fatal(err)
+	}
+	if brokerResponse["value"] != "qa_secret_value" {
+		t.Fatalf("broker returned wrong value")
+	}
+	resp, payload = runBrokerValueRequest(t, brokerApp, map[string]string{
+		"requestId": "req_bad_token",
+		"workspace": "qa",
+		"subject":   "codex",
+		"path":      "openai/api_key",
+	}, "bad-token")
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("broker bad token returned status=%d body=%s", resp.StatusCode, payload)
 	}
 	if strings.Contains(out.String(), "qa_secret_value") {
 		t.Fatalf("asiri output leaked secret: %s", out.String())
@@ -1609,6 +1728,124 @@ func TestCLIEndToEndLocalRuntime(t *testing.T) {
 	}
 	if !strings.Contains(errb.String(), "raw read requires") {
 		t.Fatalf("expected raw read denial, got stderr=%s", errb.String())
+	}
+}
+
+func TestBrokerReloadsLocalStateBetweenRequests(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "qa", "openai/api_key", "--value-file", testSecretFile(t, "old_secret")},
+		{"grant", "--workspace", "qa", "codex", "openai/api_key", "--broker"},
+	} {
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	clientFile := filepath.Join(t.TempDir(), "broker-client.json")
+	done := make(chan int, 1)
+	go func() {
+		done <- New(io.Discard, io.Discard).Run([]string{"broker", "start", "--workspace", "qa", "--agent", "codex", "--listen", "127.0.0.1:0", "--client-file", clientFile, "--idle-timeout", "1s", "--token-ttl", "30s"})
+	}()
+	cfg := waitForBrokerClientConfig(t, clientFile)
+	resp, payload := postBrokerValueRequest(t, cfg, map[string]string{
+		"requestId": "req_old",
+		"workspace": "qa",
+		"subject":   "codex",
+		"path":      "openai/api_key",
+	}, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("broker old request failed status=%d body=%s", resp.StatusCode, payload)
+	}
+	var body map[string]string
+	if err := json.Unmarshal([]byte(payload), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["value"] != "old_secret" {
+		t.Fatalf("broker returned old request value %q", body["value"])
+	}
+	if code := app.Run([]string{"rotate", "--workspace", "qa", "openai/api_key", "--value-file", testSecretFile(t, "new_secret")}); code != 0 {
+		t.Fatalf("rotate failed with code %d stderr=%s", code, errb.String())
+	}
+	resp, payload = postBrokerValueRequest(t, cfg, map[string]string{
+		"requestId": "req_new",
+		"workspace": "qa",
+		"subject":   "codex",
+		"path":      "openai/api_key",
+	}, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("broker new request failed status=%d body=%s", resp.StatusCode, payload)
+	}
+	body = map[string]string{}
+	if err := json.Unmarshal([]byte(payload), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["value"] != "new_secret" {
+		t.Fatalf("broker did not reload rotated value: %q", body["value"])
+	}
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("broker exited with code %d", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("broker did not stop after idle timeout")
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"get", "--workspace", "qa", "openai/api_key"}); code != 0 {
+		t.Fatalf("get after broker stop failed with code %d stderr=%s", code, errb.String())
+	}
+	if strings.TrimSpace(out.String()) != "new_secret" {
+		t.Fatalf("broker stop overwrote rotated value: %q", out.String())
+	}
+}
+
+func TestBrokerRequiresExplicitBrokerGrant(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"add", "--workspace", "qa", "openai/api_key", "--value-file", testSecretFile(t, "qa_secret_value")},
+		{"grant", "--workspace", "qa", "codex", "openai/api_key", "--inject-only"},
+	} {
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	resp, payload := runBrokerValueRequest(t, New(io.Discard, io.Discard), map[string]string{
+		"requestId": "req_no_broker_grant",
+		"workspace": "qa",
+		"subject":   "codex",
+		"path":      "openai/api_key",
+	}, "")
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("broker without grant returned status=%d body=%s", resp.StatusCode, payload)
+	}
+	if strings.Contains(payload, "qa_secret_value") {
+		t.Fatalf("broker denial leaked secret: %s", payload)
+	}
+	out.Reset()
+	if audit := app.Run([]string{"audit", "tail", "--limit", "10"}); audit != 0 {
+		t.Fatalf("audit tail failed")
+	}
+	if !strings.Contains(out.String(), "secret_brokered") {
+		t.Fatalf("audit tail missing broker denial: %s", out.String())
 	}
 }
 
@@ -7117,6 +7354,52 @@ func TestPendingRuntimeAuditEventsStayInOriginalWorkspace(t *testing.T) {
 	}
 	if events[0].OrgID != "org_one" || events[0].Metadata["workspaceId"] != "org_one" || events[0].Metadata["workspaceSlug"] != "one" {
 		t.Fatalf("uploaded event should keep original workspace attribution: %#v", events[0])
+	}
+}
+
+func TestPendingRuntimeAuditEventsIncludeBrokerLifecycle(t *testing.T) {
+	createdAt := time.Now().UTC()
+	st := &store.FileStore{State: asiri.State{
+		ControlPlane: &asiri.ControlPlaneLink{
+			WorkspaceID:   "org_runtime",
+			WorkspaceSlug: "qa",
+		},
+		RemoteBindings: map[string]asiri.RemoteWorkspaceBinding{
+			"qa": {WorkspaceID: "org_runtime", WorkspaceSlug: "qa", BoundAt: createdAt},
+		},
+	}}
+	st.State.Audit = []asiri.AuditEvent{
+		{
+			ID:        "aud_broker_started",
+			Actor:     "codex",
+			Action:    "broker_started",
+			Result:    "allowed",
+			Reason:    "local broker started",
+			Metadata:  brokerRuntimeAuditMetadata(st, "qa", "codex", "agent", "", nil),
+			CreatedAt: createdAt,
+		},
+		{
+			ID:        "aud_broker_stopped",
+			Actor:     "codex",
+			Action:    "broker_stopped",
+			Result:    "allowed",
+			Reason:    "local broker stopped",
+			Metadata:  brokerRuntimeAuditMetadata(st, "qa", "codex", "agent", "", nil),
+			CreatedAt: createdAt,
+		},
+	}
+
+	ids, events := pendingRuntimeAuditEvents(st)
+	if len(ids) != 2 || len(events) != 2 {
+		t.Fatalf("expected broker lifecycle audit events to upload: ids=%#v events=%#v", ids, events)
+	}
+	if events[0].Action != "broker_started" || events[1].Action != "broker_stopped" {
+		t.Fatalf("unexpected broker lifecycle actions: %#v", events)
+	}
+	for _, event := range events {
+		if event.OrgID != "org_runtime" || event.Metadata["workspaceId"] != "org_runtime" || event.Metadata["workspaceSlug"] != "qa" {
+			t.Fatalf("broker lifecycle event missing workspace attribution: %#v", event)
+		}
 	}
 }
 

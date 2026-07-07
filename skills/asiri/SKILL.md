@@ -106,6 +106,7 @@ Grant the smallest action that lets the target command work:
 ```sh
 asiri grant --workspace <workspace> <label> <scope/SECRET_NAME> --inject-only
 asiri grant --workspace <workspace> <label> <scope/SECRET_NAME> --mount
+asiri grant --workspace <workspace> <label> <scope/SECRET_NAME> --broker
 ```
 
 Avoid `--read` for agents unless the user explicitly wants plaintext returned to that agent.
