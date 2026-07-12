@@ -37,6 +37,18 @@ func testSecretFile(t *testing.T, value string) string {
 	return path
 }
 
+func requireOrderedText(t *testing.T, value string, expected ...string) {
+	t.Helper()
+	position := -1
+	for _, item := range expected {
+		next := strings.Index(value[position+1:], item)
+		if next < 0 {
+			t.Fatalf("output missing %q after position %d: %s", item, position, value)
+		}
+		position += next + len(item) + 1
+	}
+}
+
 type brokerClientTestConfig struct {
 	URL       string    `json:"url"`
 	Token     string    `json:"token"`
@@ -167,6 +179,32 @@ func TestWorkspaceParsersRejectDuplicateWorkspaceFlags(t *testing.T) {
 func TestDefaultControlPlaneOriginMatchesLocalDev(t *testing.T) {
 	if defaultControlPlaneOrigin != "http://127.0.0.1:4173" {
 		t.Fatalf("source default control-plane origin must match local dev, got %s", defaultControlPlaneOrigin)
+	}
+}
+
+func TestLoginHelpDistinguishesSessionReplacementFromKeyRecovery(t *testing.T) {
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"help", "login"}); code != 0 {
+		t.Fatalf("login help failed: %s", errb.String())
+	}
+	help := out.String()
+	for _, expected := range []string{"expired session", "--force", "does not create new device keys"} {
+		if !strings.Contains(help, expected) {
+			t.Fatalf("login help missing %q: %s", expected, help)
+		}
+	}
+	requireOrderedText(t, help, "asiri logout", "asiri device enroll --name <new-name>", "asiri login")
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"help", "logout"}); code != 0 {
+		t.Fatalf("logout help failed: %s", errb.String())
+	}
+	for _, expected := range []string{"local vault", "secrets", "device keys", "preserved"} {
+		if !strings.Contains(out.String(), expected) {
+			t.Fatalf("logout help missing %q: %s", expected, out.String())
+		}
 	}
 }
 
@@ -494,6 +532,11 @@ func TestLoginRecoversExpiredSessionWithoutForce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	secret, err := st.AddSecret("old/local/API_KEY", "preserved-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataKeyAccount := secret.Versions[0].DataKeyAccount
 	if err := st.LinkControlPlaneForDevice(server.URL, "org_old", "old", "usr_old", "dev_old", device.ID, "at_old", "rt_old", 3600, time.Now().UTC().Add(24*time.Hour).Format(time.RFC3339)); err != nil {
 		t.Fatal(err)
 	}
@@ -516,6 +559,232 @@ func TestLoginRecoversExpiredSessionWithoutForce(t *testing.T) {
 	}
 	if refreshToken != "rt_new" {
 		t.Fatalf("expired-session recovery did not persist replacement credentials: %s", refreshToken)
+	}
+	if value, _, err := reloaded.GetSecret("old/local/API_KEY"); err != nil || value != "preserved-secret" {
+		t.Fatalf("expired-session recovery changed the local secret: value=%q err=%v", value, err)
+	}
+	if got := reloaded.State.Secrets[store.SecretKey("old/local", "API_KEY")].Versions[0].DataKeyAccount; got != dataKeyAccount {
+		t.Fatalf("expired-session recovery changed the data-key account: got=%q want=%q", got, dataKeyAccount)
+	}
+}
+
+func TestLoginTrustFailuresPreserveLocalVaultAndGiveSafeRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		errorCode     string
+		message       string
+		expectsEnroll bool
+	}{
+		{name: "revoked keys", errorCode: "device_revoked", message: "device has been revoked", expectsEnroll: true},
+		{name: "untrusted session", errorCode: "device_not_trusted", expectsEnroll: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			old := os.Getenv("ASIRI_HOME")
+			t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+			if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+				t.Fatal(err)
+			}
+
+			deviceCodeStarted := false
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("content-type", "application/json")
+				switch r.URL.Path {
+				case "/v1/auth/session/refresh":
+					w.WriteHeader(http.StatusForbidden)
+					_ = json.NewEncoder(w).Encode(map[string]any{"error": tc.errorCode, "message": tc.message})
+				case "/v1/auth/device-code/start":
+					deviceCodeStarted = true
+					http.Error(w, "unexpected device-code start", http.StatusInternalServerError)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			var out, errb bytes.Buffer
+			app := New(&out, &errb)
+			if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+				t.Fatalf("init failed: %s", errb.String())
+			}
+			st, err := store.LoadDefault()
+			if err != nil {
+				t.Fatal(err)
+			}
+			device, err := st.ActiveDevice()
+			if err != nil {
+				t.Fatal(err)
+			}
+			secret, err := st.AddSecret("prod/local/API_KEY", "preserved-secret")
+			if err != nil {
+				t.Fatal(err)
+			}
+			dataKeyAccount := secret.Versions[0].DataKeyAccount
+			if err := st.LinkControlPlaneForDevice(server.URL, "org_prod", "prod", "usr_owner", "dev_remote", device.ID, "at_old", "rt_old", 3600, time.Now().UTC().Add(24*time.Hour).Format(time.RFC3339)); err != nil {
+				t.Fatal(err)
+			}
+			keyRefsBefore := append([]asiri.KeyRef(nil), st.State.KeyRefs...)
+
+			out.Reset()
+			errb.Reset()
+			if code := app.Run([]string{"login", "--origin", server.URL}); code == 0 {
+				t.Fatal("login should fail until the linked device state is recovered")
+			}
+			if deviceCodeStarted {
+				t.Fatal("login should not start another device code with the rejected linked session")
+			}
+			guidance := errb.String()
+			if tc.expectsEnroll {
+				requireOrderedText(t, guidance, "asiri logout", "asiri device enroll --name <new-name>", "asiri login --origin "+server.URL)
+			} else {
+				requireOrderedText(t, guidance, "asiri logout", "asiri login --origin "+server.URL)
+				if strings.Contains(guidance, "device enroll") {
+					t.Fatalf("generic untrusted-session recovery should keep existing device keys: %s", guidance)
+				}
+			}
+			if !strings.Contains(guidance, "local vault") || !strings.Contains(guidance, "preserved") {
+				t.Fatalf("recovery guidance should confirm local vault preservation: %s", guidance)
+			}
+
+			reloaded, err := store.LoadDefault()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reloaded.State.ControlPlane == nil || reloaded.State.LocalDeviceID != device.ID {
+				t.Fatalf("trust failure changed the linked session or local device: %#v", reloaded.State.ControlPlane)
+			}
+			if !reflect.DeepEqual(reloaded.State.KeyRefs, keyRefsBefore) {
+				t.Fatalf("trust failure changed local key refs: got=%#v want=%#v", reloaded.State.KeyRefs, keyRefsBefore)
+			}
+			if got := reloaded.State.Secrets[store.SecretKey("prod/local", "API_KEY")].Versions[0].DataKeyAccount; got != dataKeyAccount {
+				t.Fatalf("trust failure changed the data-key account: got=%q want=%q", got, dataKeyAccount)
+			}
+			if value, _, err := reloaded.GetSecret("prod/local/API_KEY"); err != nil || value != "preserved-secret" {
+				t.Fatalf("trust failure made the local secret unusable: value=%q err=%v", value, err)
+			}
+		})
+	}
+}
+
+func TestRefreshAccessTrustFailurePreservesLocalVault(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		if r.URL.Path != "/v1/auth/session/refresh" {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": "device_not_trusted"})
+	}))
+	defer server.Close()
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret, err := st.AddSecret("prod/local/API_KEY", "preserved-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataKeyAccount := secret.Versions[0].DataKeyAccount
+	if err := st.LinkControlPlaneForDevice(server.URL, "org_prod", "prod", "usr_owner", "dev_remote", device.ID, "at_old", "rt_old", 3600, time.Now().UTC().Add(24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	keyRefsBefore := append([]asiri.KeyRef(nil), st.State.KeyRefs...)
+
+	if _, err := refreshControlPlaneAccess(server.URL, st); err == nil {
+		t.Fatal("refresh should fail for an untrusted linked session")
+	} else {
+		guidance := err.Error()
+		requireOrderedText(t, guidance, "asiri logout", "asiri login --origin "+server.URL)
+		if strings.Contains(guidance, "device enroll") {
+			t.Fatalf("generic untrusted-session refresh should keep existing device keys: %s", guidance)
+		}
+	}
+
+	reloaded, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(reloaded.State.KeyRefs, keyRefsBefore) {
+		t.Fatalf("refresh trust failure changed local key refs: got=%#v want=%#v", reloaded.State.KeyRefs, keyRefsBefore)
+	}
+	if got := reloaded.State.Secrets[store.SecretKey("prod/local", "API_KEY")].Versions[0].DataKeyAccount; got != dataKeyAccount {
+		t.Fatalf("refresh trust failure changed the data-key account: got=%q want=%q", got, dataKeyAccount)
+	}
+	if value, _, err := reloaded.GetSecret("prod/local/API_KEY"); err != nil || value != "preserved-secret" {
+		t.Fatalf("refresh trust failure made the local secret unusable: value=%q err=%v", value, err)
+	}
+}
+
+func TestDeviceEnrollRequiresLogoutBeforeCreatingKeys(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddSecret("prod/local/API_KEY", "preserved-secret"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkControlPlaneForDevice("http://control.test", "org_prod", "prod", "usr_owner", "dev_remote", device.ID, "at_old", "rt_old", 3600, time.Now().UTC().Add(24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	devicesBefore := append([]asiri.Device(nil), st.State.Devices...)
+	keyRefsBefore := append([]asiri.KeyRef(nil), st.State.KeyRefs...)
+	localDeviceIDBefore := st.State.LocalDeviceID
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"device", "enroll", "--name", "replacement"}); code == 0 {
+		t.Fatal("device enroll should require logout while a session is linked")
+	}
+	if !strings.Contains(errb.String(), "asiri logout first") || !strings.Contains(errb.String(), "local vault and secrets are preserved") {
+		t.Fatalf("device enroll missing safe logout guidance: %s", errb.String())
+	}
+
+	reloaded, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(reloaded.State.Devices, devicesBefore) || reloaded.State.LocalDeviceID != localDeviceIDBefore {
+		t.Fatalf("rejected enrollment changed local devices: devices=%#v local=%s", reloaded.State.Devices, reloaded.State.LocalDeviceID)
+	}
+	if !reflect.DeepEqual(reloaded.State.KeyRefs, keyRefsBefore) {
+		t.Fatalf("rejected enrollment created or removed key refs: got=%#v want=%#v", reloaded.State.KeyRefs, keyRefsBefore)
+	}
+	if value, _, err := reloaded.GetSecret("prod/local/API_KEY"); err != nil || value != "preserved-secret" {
+		t.Fatalf("rejected enrollment made the local secret unusable: value=%q err=%v", value, err)
 	}
 }
 
@@ -1053,6 +1322,83 @@ func TestSetupDoctorBeforeInitPrintsBootstrapSteps(t *testing.T) {
 	}
 }
 
+func TestSetupDoctorExpiredSessionRecommendsLoginWithoutForce(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	workspaceRequested := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/session/refresh":
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid_refresh_token"})
+		case "/v1/orgs":
+			workspaceRequested = true
+			http.Error(w, "unexpected workspace request", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddSecret("prod/local/API_KEY", "preserved-secret"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkControlPlaneForDevice(server.URL, "org_prod", "prod", "usr_owner", "dev_remote", device.ID, "at_old", "rt_old", 3600, time.Now().UTC().Add(24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	st.State.ControlPlane.AccessTokenExpiresAt = time.Now().UTC().Add(-time.Minute)
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+	keyRefsBefore := append([]asiri.KeyRef(nil), st.State.KeyRefs...)
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"setup", "doctor", "--workspace", "prod"}); code != 0 {
+		t.Fatalf("setup doctor should report an expired session without failing: %s", errb.String())
+	}
+	if workspaceRequested {
+		t.Fatal("setup doctor should stop after the expired session check")
+	}
+	result := out.String()
+	if !strings.Contains(result, "session") || !strings.Contains(result, "failed") || !strings.Contains(result, "asiri login") {
+		t.Fatalf("setup doctor missing normal login recovery: %s", result)
+	}
+	if strings.Contains(result, "login --force") || strings.Contains(result, "device enroll") || strings.Contains(result, "wipe") {
+		t.Fatalf("expired-session guidance should not rotate or delete keys: %s", result)
+	}
+
+	reloaded, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(reloaded.State.KeyRefs, keyRefsBefore) {
+		t.Fatalf("setup doctor changed key refs after an expired session: got=%#v want=%#v", reloaded.State.KeyRefs, keyRefsBefore)
+	}
+	if value, _, err := reloaded.GetSecret("prod/local/API_KEY"); err != nil || value != "preserved-secret" {
+		t.Fatalf("setup doctor made the local secret unusable: value=%q err=%v", value, err)
+	}
+}
+
 func TestSetupDoctorReportsTrustedDeviceNextSteps(t *testing.T) {
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")
@@ -1146,6 +1492,75 @@ func TestSetupDoctorReportsTrustedDeviceNextSteps(t *testing.T) {
 	} {
 		if !strings.Contains(got, expected) {
 			t.Fatalf("setup doctor output missing %q: %s", expected, got)
+		}
+	}
+}
+
+func TestSetupDoctorReportsRevokedCurrentDeviceRecovery(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		if r.URL.Path != "/v1/orgs" {
+			http.NotFound(w, r)
+			return
+		}
+		assertWorkspaceOverviewTarget(t, r, "prod")
+		if r.URL.Query().Get("includeSecrets") != "1" {
+			t.Fatalf("setup doctor should request secret metadata: %s", r.URL.RawQuery)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"organizations": []map[string]any{{
+				"id": "org_prod", "slug": "prod", "role": "owner", "canPull": false, "canWrite": true,
+				"currentDeviceTrusted": false, "currentDeviceStatus": "revoked", "canApproveDevice": true,
+			}},
+			"secrets": []map[string]any{},
+		})
+	}))
+	defer server.Close()
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkControlPlaneForDevice(server.URL, "org_prod", "prod", "usr_owner", "dev_revoked", device.ID, "at_cached", "rt_cached", 3600, time.Now().UTC().Add(24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"setup", "doctor", "--workspace", "prod"}); code != 0 {
+		t.Fatalf("setup doctor failed: %s", errb.String())
+	}
+	result := out.String()
+	for _, expected := range []string{"revoked", "replace revoked device keys"} {
+		if !strings.Contains(result, expected) {
+			t.Fatalf("setup doctor output missing %q: %s", expected, result)
+		}
+	}
+	requireOrderedText(t, result,
+		"asiri logout",
+		"asiri device enroll --name <new-name>",
+		"asiri login --origin "+server.URL,
+		"asiri rewrap --workspace prod",
+	)
+	for _, unsafe := range []string{"asiri device trust", "login --force", "asiri init", "wipe"} {
+		if strings.Contains(result, unsafe) {
+			t.Fatalf("revoked-device recovery should not suggest %q: %s", unsafe, result)
 		}
 	}
 }
@@ -1275,6 +1690,33 @@ func TestSetupDoctorDoesNotMarkUnknownChecksReady(t *testing.T) {
 	}
 	if strings.Contains(got, "Setup looks ready") {
 		t.Fatalf("setup doctor should not report ready when checks are unknown: %s", got)
+	}
+}
+
+func TestWorkspaceDeviceStatusLabelsAreExplicit(t *testing.T) {
+	for _, tc := range []struct {
+		status  string
+		label   string
+		trusted bool
+	}{
+		{status: "trusted", label: "trusted", trusted: true},
+		{status: "pending", label: "pending"},
+		{status: "revoked", label: "revoked"},
+		{status: "not-enrolled", label: "not-enrolled"},
+		{status: "not_enrolled", label: "not-enrolled"},
+	} {
+		workspace := remoteWorkspaceResponse{CurrentDeviceStatus: tc.status}
+		if got := deviceTrustLabelForWorkspace(workspace); got != tc.label {
+			t.Fatalf("status %q label mismatch: got=%q want=%q", tc.status, got, tc.label)
+		}
+		if got := workspaceDeviceTrusted(workspace); got != tc.trusted {
+			t.Fatalf("status %q trusted mismatch: got=%v want=%v", tc.status, got, tc.trusted)
+		}
+	}
+
+	legacyFalse := false
+	if got := deviceTrustLabelForWorkspace(remoteWorkspaceResponse{CurrentDeviceTrusted: &legacyFalse}); got != "not trusted" {
+		t.Fatalf("legacy servers should retain the honest fallback label, got %q", got)
 	}
 }
 
@@ -7514,6 +7956,68 @@ func TestDeviceStatusShowsTrustAndKeyCoverage(t *testing.T) {
 	if strings.Contains(status, "asiri-dev") || strings.Contains(status, "recallstack-com") {
 		t.Fatalf("device status included unrequested workspaces: %s", status)
 	}
+}
+
+func TestDeviceTrustStopsBeforeStartingCodeForRevokedKeys(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	deviceCodeStarted := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "prod")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"organizations": []map[string]any{{
+					"id": "org_prod", "slug": "prod", "role": "owner", "canPull": false, "canWrite": true,
+					"currentDeviceTrusted": false, "currentDeviceStatus": "revoked", "canApproveDevice": true,
+				}},
+			})
+		case "/v1/auth/device-code/start":
+			deviceCodeStarted = true
+			http.Error(w, "unexpected device-code start", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkControlPlaneForDevice(server.URL, "org_prod", "prod", "usr_owner", "dev_revoked", device.ID, "at_cached", "rt_cached", 3600, time.Now().UTC().Add(24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"device", "trust", "--workspace", "prod"}); code == 0 {
+		t.Fatal("device trust should reject permanently revoked keys")
+	}
+	if deviceCodeStarted {
+		t.Fatal("device trust should not start a device code for revoked keys")
+	}
+	requireOrderedText(t, errb.String(),
+		"asiri logout",
+		"asiri device enroll --name <new-name>",
+		"asiri login --origin "+server.URL,
+		"asiri rewrap --workspace prod",
+	)
 }
 
 func TestDeviceTrustTargetsOneWorkspaceWithoutChangingSession(t *testing.T) {

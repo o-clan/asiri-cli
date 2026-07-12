@@ -44,7 +44,7 @@ type App struct {
 	In  io.Reader
 }
 
-var Version = "0.1.33"
+var Version = "0.1.34"
 
 var defaultControlPlaneOrigin = "http://127.0.0.1:4173"
 
@@ -238,9 +238,9 @@ func (a App) helpFor(path []string) int {
 	case "version":
 		fmt.Fprint(a.Out, "Usage: asiri version\n       asiri --version\n\nPrints the CLI version.\n")
 	case "login":
-		fmt.Fprintf(a.Out, "Usage: asiri login [--origin <url>] [--force]\n\nLinks this local device to the control plane. Default origin: %s.\n", defaultControlPlaneOrigin)
+		fmt.Fprintf(a.Out, "Usage: asiri login [--origin <url>] [--force]\n\nLinks this local device to the control plane. Rerun without --force to recover an expired session. --force replaces a linked session but does not create new device keys. For revoked keys, run asiri logout, then asiri device enroll --name <new-name>, then asiri login. Default origin: %s.\n", defaultControlPlaneOrigin)
 	case "logout":
-		fmt.Fprint(a.Out, "Usage: asiri logout\n\nRevokes the local control-plane session and removes local session tokens.\n")
+		fmt.Fprint(a.Out, "Usage: asiri logout\n\nRevokes the local control-plane session and removes local session tokens. The local vault, secrets, and device keys are preserved.\n")
 	case "whoami":
 		fmt.Fprint(a.Out, "Usage: asiri whoami\n\nShows the signed-in control-plane identity and authentication device. User sessions do not select a workspace.\n")
 	case "workspace":
@@ -280,7 +280,7 @@ func (a App) helpFor(path []string) int {
 	case "device name":
 		fmt.Fprint(a.Out, "Usage: asiri device name\n\nPrints the current local device name.\n")
 	case "device enroll":
-		fmt.Fprint(a.Out, "Usage: asiri device enroll --name <device>\n\nCreates a new local device keypair and local trusted-device record.\n")
+		fmt.Fprint(a.Out, "Usage: asiri device enroll --name <device>\n\nCreates a new local device keypair and local trusted-device record without changing the vault or local secrets. Log out first when replacing keys for a linked device.\n")
 	case "device list":
 		fmt.Fprint(a.Out, "Usage: asiri device list --remote --workspace <slug> [--include-revoked]\n       asiri device list --local [--include-revoked]\n\nLists remote devices in one explicit workspace, or this machine's local device records. Revoked devices are hidden unless --include-revoked is set.\n")
 	case "device status":
@@ -451,11 +451,11 @@ func (a App) login(st *store.FileStore, args []string) int {
 			fmt.Fprintln(a.Out, "✓ Control-plane account session refreshed")
 			return 0
 		}
-		if err == nil && remoteDeviceNotTrusted(status, result.Error) {
-			if err := st.QuarantineLocalKeys("remote device is no longer trusted"); err != nil {
-				return a.fail(fmt.Errorf("remote device is no longer trusted, but local key cleanup failed: %w", err))
-			}
-			return a.fail(errors.New("remote device is no longer trusted; local key material was cleared"))
+		if err == nil && remoteDeviceRevoked(status, result.Error, result.Message) {
+			return a.fail(revokedDeviceRecoveryError(st, ""))
+		}
+		if err == nil && remoteDeviceNotTrusted(status, result.Error, result.Message) {
+			return a.fail(untrustedSessionRecoveryError(st))
 		}
 		if err != nil || status != http.StatusUnauthorized {
 			if err != nil {
@@ -1107,7 +1107,7 @@ func (a App) setupDoctor(st *store.FileStore, args []string) int {
 
 	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
 	if err != nil {
-		checks = append(checks, setupDoctorCheck{Name: "session", Status: "failed", Detail: err.Error(), Next: "asiri login --force"})
+		checks = append(checks, setupDoctorCheck{Name: "session", Status: "failed", Detail: err.Error(), Next: "asiri login"})
 		printChecks(checks)
 		printNextSteps()
 		return 0
@@ -1118,7 +1118,7 @@ func (a App) setupDoctor(st *store.FileStore, args []string) int {
 	workspaceResult, err := listRemoteWorkspaceOverview(st, st.State.ControlPlane.Origin, accessToken, workspaceArg, true, false)
 	if err != nil {
 		fmt.Fprintf(a.Out, "\nWorkspace checks unavailable: %s\n", err)
-		addStep("asiri login --force")
+		addStep("asiri login")
 		printNextSteps()
 		return 0
 	}
@@ -1156,7 +1156,13 @@ func (a App) setupDoctor(st *store.FileStore, args []string) int {
 			Recovery:  recoveryStatus,
 			Next:      next,
 		})
-		addStep(next)
+		if explicitWorkspaceDeviceStatus(workspace) == "revoked" {
+			for _, step := range revokedDeviceRecoverySteps(st, workspace.Slug) {
+				addStep(step)
+			}
+		} else {
+			addStep(next)
+		}
 	}
 
 	fmt.Fprintln(a.Out, "\nWorkspace:")
@@ -1194,6 +1200,9 @@ func (a App) setupDoctorRecoveryStatus(st *store.FileStore, accessToken string, 
 func setupDoctorWorkspaceNext(st *store.FileStore, workspace remoteWorkspaceResponse, keys, recovery string) string {
 	if st.State.ControlPlane != nil && st.State.ControlPlane.Source == "service-account" {
 		return "-"
+	}
+	if explicitWorkspaceDeviceStatus(workspace) == "revoked" {
+		return "replace revoked device keys"
 	}
 	if !workspaceDeviceTrusted(workspace) {
 		if workspaceCanApproveDevice(workspace) {
@@ -1826,6 +1835,9 @@ func workspaceNextAction(st *store.FileStore, workspace remoteWorkspaceResponse,
 	if st.State.ControlPlane != nil && st.State.ControlPlane.Source == "service-account" {
 		return "-"
 	}
+	if explicitWorkspaceDeviceStatus(workspace) == "revoked" {
+		return "replace revoked device keys"
+	}
 	if !workspaceDeviceTrusted(workspace) {
 		if workspaceCanApproveDevice(workspace) {
 			return deviceTrustCommand(st, workspace.Slug)
@@ -1842,6 +1854,9 @@ func workspaceNextAction(st *store.FileStore, workspace remoteWorkspaceResponse,
 }
 
 func workspaceDeviceTrusted(workspace remoteWorkspaceResponse) bool {
+	if status := explicitWorkspaceDeviceStatus(workspace); status != "" {
+		return status == "trusted"
+	}
 	if workspace.CurrentDeviceTrusted != nil {
 		return *workspace.CurrentDeviceTrusted
 	}
@@ -1849,6 +1864,16 @@ func workspaceDeviceTrusted(workspace remoteWorkspaceResponse) bool {
 		return *workspace.CanPull
 	}
 	return false
+}
+
+func explicitWorkspaceDeviceStatus(workspace remoteWorkspaceResponse) string {
+	status := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(workspace.CurrentDeviceStatus)), "_", "-")
+	switch status {
+	case "trusted", "pending", "revoked", "not-enrolled":
+		return status
+	default:
+		return ""
+	}
 }
 
 func workspaceCanApproveDevice(workspace remoteWorkspaceResponse) bool {
@@ -1859,6 +1884,9 @@ func workspaceCanApproveDevice(workspace remoteWorkspaceResponse) bool {
 }
 
 func deviceTrustLabelForWorkspace(workspace remoteWorkspaceResponse) string {
+	if status := explicitWorkspaceDeviceStatus(workspace); status != "" {
+		return status
+	}
 	if workspaceDeviceTrusted(workspace) {
 		return "trusted"
 	}
@@ -2608,6 +2636,9 @@ func (a App) deviceTrust(st *store.FileStore, args []string) int {
 		return a.fail(err)
 	}
 	if target, ok := findWorkspace(workspaceResult.Organizations, options.Workspace); ok {
+		if explicitWorkspaceDeviceStatus(target) == "revoked" {
+			return a.fail(revokedDeviceRecoveryError(st, target.Slug))
+		}
 		if workspaceDeviceTrusted(target) {
 			fmt.Fprintf(a.Out, "This device is already trusted for workspace %s\n", options.Workspace)
 			return 0
@@ -2684,12 +2715,15 @@ func (a App) device(st *store.FileStore, args []string) int {
 		if err := st.RequireInitialized(); err != nil {
 			return a.fail(err)
 		}
-		if err := rejectServiceAccountLocalMutation(st); err != nil {
-			return a.fail(err)
-		}
 		name := flagValue(args[1:], "--name", "")
 		if name == "" {
 			return a.fail(errors.New("--name is required"))
+		}
+		if st.State.ControlPlane != nil {
+			return a.fail(errors.New("device enroll requires no linked control-plane session; run asiri logout first, then rerun asiri device enroll --name <new-name>. The local vault and secrets are preserved"))
+		}
+		if err := rejectServiceAccountLocalMutation(st); err != nil {
+			return a.fail(err)
 		}
 		device, refs, err := createDevice(name)
 		if err != nil {
@@ -5628,6 +5662,7 @@ type deviceCodeTokenResponse struct {
 type sessionRefreshResponse struct {
 	Status             string `json:"status"`
 	Error              string `json:"error"`
+	Message            string `json:"message"`
 	OrgID              string `json:"orgId"`
 	WorkspaceSlug      string `json:"workspaceSlug"`
 	UserID             string `json:"userId"`
@@ -5685,6 +5720,7 @@ type remoteWorkspaceResponse struct {
 	CanPull              *bool  `json:"canPull"`
 	CanWrite             *bool  `json:"canWrite"`
 	CurrentDeviceTrusted *bool  `json:"currentDeviceTrusted"`
+	CurrentDeviceStatus  string `json:"currentDeviceStatus"`
 	CurrentDeviceID      string `json:"currentDeviceId"`
 	CanApproveDevice     *bool  `json:"canApproveDevice"`
 }
@@ -6236,6 +6272,9 @@ func (a App) remoteWorkspaceTarget(st *store.FileStore, accessToken, requested s
 	if st.State.ControlPlane.Source == "service-account" && workspace.ID != st.State.ControlPlane.WorkspaceID {
 		return remoteWorkspaceResponse{}, "", fmt.Errorf("service account session is scoped to workspace %s", st.State.ControlPlane.WorkspaceSlug)
 	}
+	if explicitWorkspaceDeviceStatus(workspace) == "revoked" {
+		return remoteWorkspaceResponse{}, "", revokedDeviceRecoveryError(st, requested)
+	}
 	if !workspaceDeviceTrusted(workspace) || workspace.CurrentDeviceID == "" {
 		return remoteWorkspaceResponse{}, "", fmt.Errorf("this device is not trusted for workspace %s; device %s; next: %s", requested, currentDeviceDescription(st), deviceTrustCommand(st, requested))
 	}
@@ -6390,11 +6429,11 @@ func refreshControlPlaneAccess(origin string, st *store.FileStore) (string, erro
 	if err != nil {
 		return "", err
 	}
-	if remoteDeviceNotTrusted(status, result.Error) {
-		if err := st.QuarantineLocalKeys("remote device is no longer trusted"); err != nil {
-			return "", fmt.Errorf("remote device is no longer trusted, but local key cleanup failed: %w", err)
-		}
-		return "", errors.New("remote device is no longer trusted; local key material was cleared")
+	if remoteDeviceRevoked(status, result.Error, result.Message) {
+		return "", revokedDeviceRecoveryError(st, "")
+	}
+	if remoteDeviceNotTrusted(status, result.Error, result.Message) {
+		return "", untrustedSessionRecoveryError(st)
 	}
 	if status != http.StatusOK {
 		return "", fmt.Errorf("control plane returned HTTP %d", status)
@@ -6430,6 +6469,63 @@ func remoteDeviceNotTrusted(status int, values ...string) bool {
 		}
 	}
 	return false
+}
+
+func remoteDeviceRevoked(status int, values ...string) bool {
+	if status != http.StatusForbidden {
+		return false
+	}
+	for _, value := range values {
+		normalized := strings.ToLower(strings.TrimSpace(value))
+		if normalized == "device_revoked" || normalized == "device revoked" || normalized == "device has been revoked" {
+			return true
+		}
+	}
+	return false
+}
+
+func recoveryLoginCommand(st *store.FileStore) string {
+	command := "asiri login"
+	if st != nil && st.State.ControlPlane != nil {
+		origin := strings.TrimRight(st.State.ControlPlane.Origin, "/")
+		if origin != "" && origin != defaultControlPlaneOrigin {
+			command += " --origin " + origin
+		}
+	}
+	return command
+}
+
+func untrustedSessionRecoveryError(st *store.FileStore) error {
+	steps := []string{"asiri logout", recoveryLoginCommand(st)}
+	lines := []string{"remote access no longer trusts the linked device session. The local vault, secrets, and device keys were preserved. Start a fresh session with the existing device keys:"}
+	for index, step := range steps {
+		lines = append(lines, fmt.Sprintf("%d. %s", index+1, step))
+	}
+	return errors.New(strings.Join(lines, "\n"))
+}
+
+func revokedDeviceRecoverySteps(st *store.FileStore, workspace string) []string {
+	steps := []string{
+		"asiri logout",
+		"asiri device enroll --name <new-name>",
+		recoveryLoginCommand(st),
+	}
+	if workspace != "" {
+		steps = append(steps, fmt.Sprintf("asiri rewrap --workspace %s", workspace))
+	}
+	return steps
+}
+
+func revokedDeviceRecoveryError(st *store.FileStore, workspace string) error {
+	detail := "remote access reports this device key pair as revoked and it cannot be approved again"
+	if workspace != "" {
+		detail = fmt.Sprintf("this device key pair was revoked for workspace %s and cannot be approved again", workspace)
+	}
+	lines := []string{detail + ". The local vault and secrets were preserved. Recover with fresh device keys:"}
+	for index, step := range revokedDeviceRecoverySteps(st, workspace) {
+		lines = append(lines, fmt.Sprintf("%d. %s", index+1, step))
+	}
+	return errors.New(strings.Join(lines, "\n"))
 }
 
 type controlPlaneFailureResponse struct {
