@@ -129,6 +129,41 @@ func TestParseBrokerStartArgsRejectsInvalidDurations(t *testing.T) {
 	}
 }
 
+func TestWorkspaceParsersRejectDuplicateWorkspaceFlags(t *testing.T) {
+	tests := []struct {
+		name  string
+		parse func() error
+	}{
+		{name: "service account create", parse: func() error {
+			_, err := parseServiceAccountCreateArgs([]string{"--workspace", "prod", "--workspace", "other"})
+			return err
+		}},
+		{name: "service account list", parse: func() error {
+			_, err := parseServiceAccountSelectArgs([]string{"--workspace", "prod", "--workspace", "other"}, "list")
+			return err
+		}},
+		{name: "service account grant", parse: func() error {
+			_, err := parseServiceAccountGrantArgs([]string{"--workspace", "prod", "--workspace", "other"})
+			return err
+		}},
+		{name: "device trust", parse: func() error {
+			_, err := parseDeviceTrustArgs([]string{"--workspace", "prod", "--workspace", "other"})
+			return err
+		}},
+		{name: "broker start aliases", parse: func() error {
+			_, err := parseBrokerStartArgs([]string{"--workspace", "prod", "-w", "other"})
+			return err
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.parse(); err == nil || !strings.Contains(err.Error(), "accepts one --workspace") {
+				t.Fatalf("expected duplicate workspace rejection, got %v", err)
+			}
+		})
+	}
+}
+
 func TestDefaultControlPlaneOriginMatchesLocalDev(t *testing.T) {
 	if defaultControlPlaneOrigin != "http://127.0.0.1:4173" {
 		t.Fatalf("source default control-plane origin must match local dev, got %s", defaultControlPlaneOrigin)
@@ -214,6 +249,276 @@ func TestLoginOriginSelection(t *testing.T) {
 	}
 }
 
+func TestLoginRejectsWorkspaceSelection(t *testing.T) {
+	if err := validateLoginArgs([]string{"--workspace", "prod"}); err == nil || !strings.Contains(err.Error(), "does not accept --workspace") {
+		t.Fatalf("expected account login to reject workspace selection, got %v", err)
+	}
+	if err := validateLoginArgs([]string{"--origin", "http://127.0.0.1:4173", "unexpected"}); err == nil || !strings.Contains(err.Error(), "unknown login argument") {
+		t.Fatalf("expected unknown login argument rejection, got %v", err)
+	}
+}
+
+func TestLoginForceRevokesDisplacedServerSession(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	logoutSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/session/logout":
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["refreshToken"] != "rt_old" || r.Header.Get("x-asiri-device") != "dev_old" {
+				t.Fatalf("forced login revoked the wrong session: body=%#v device=%s", body, r.Header.Get("x-asiri-device"))
+			}
+			logoutSeen = true
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "logged_out"})
+		case "/v1/auth/device-code/start":
+			if !logoutSeen {
+				t.Fatal("forced login started replacement before revoking the existing session")
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode": "dc_new", "userCode": "NEW1-2345",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=NEW1-2345",
+				"expiresIn":               30, "interval": 0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "approved", "orgId": "org_new", "workspaceSlug": "new",
+				"userId": "usr_new", "deviceId": "dev_new",
+				"accessToken": "at_new", "refreshToken": "rt_new", "expiresIn": 3600,
+				"refreshExpiresAt": time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339),
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkControlPlaneForDevice(server.URL, "org_old", "old", "usr_old", "dev_old", device.ID, "at_old", "rt_old", 3600, time.Now().UTC().Add(24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"login", "--force", "--origin", server.URL}); code != 0 {
+		t.Fatalf("forced login failed: %s", errb.String())
+	}
+	if !logoutSeen {
+		t.Fatal("forced login did not revoke the displaced server session")
+	}
+	reloaded, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshToken, err := reloaded.ControlPlaneRefreshToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshToken != "rt_new" || reloaded.State.ControlPlane == nil || reloaded.State.ControlPlane.DeviceID != "dev_new" {
+		t.Fatalf("forced login did not persist only the replacement session: %#v token=%s", reloaded.State.ControlPlane, refreshToken)
+	}
+}
+
+func TestLoginForceFailsBeforeReplacementWhenServerLogoutFails(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	startSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/session/logout":
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "temporarily_unavailable"})
+		case "/v1/auth/device-code/start":
+			startSeen = true
+			http.Error(w, "unexpected replacement", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkControlPlaneForDevice(server.URL, "org_old", "old", "usr_old", "dev_old", device.ID, "at_old", "rt_old", 3600, time.Now().UTC().Add(24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"login", "--force", "--origin", server.URL}); code == 0 {
+		t.Fatal("forced login should fail when the displaced session cannot be revoked")
+	}
+	if startSeen || !strings.Contains(errb.String(), "cannot replace the existing control-plane session safely") {
+		t.Fatalf("forced login did not fail safely: start=%v stderr=%s", startSeen, errb.String())
+	}
+	reloaded, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshToken, err := reloaded.ControlPlaneRefreshToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshToken != "rt_old" || reloaded.State.ControlPlane == nil || reloaded.State.ControlPlane.DeviceID != "dev_old" {
+		t.Fatalf("failed forced login changed the existing session: %#v token=%s", reloaded.State.ControlPlane, refreshToken)
+	}
+}
+
+func TestLoginRequiresForceToChangeControlPlaneOrigin(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	requestSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestSeen = true
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkControlPlaneForDevice("http://old-control.test", "org_old", "old", "usr_old", "dev_old", device.ID, "at_old", "rt_old", 3600, time.Now().UTC().Add(24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"login", "--origin", server.URL}); code == 0 {
+		t.Fatal("login should require --force before changing control-plane origin")
+	}
+	if requestSeen || !strings.Contains(errb.String(), "linked to a different origin") {
+		t.Fatalf("origin replacement did not fail safely: request=%v stderr=%s", requestSeen, errb.String())
+	}
+}
+
+func TestLoginRecoversExpiredSessionWithoutForce(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	refreshSeen := false
+	startSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/session/refresh":
+			refreshSeen = true
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid_refresh_token"})
+		case "/v1/auth/device-code/start":
+			if !refreshSeen {
+				t.Fatal("login started replacement before checking the existing session")
+			}
+			startSeen = true
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode": "dc_recovery", "userCode": "RCVR-1234",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=RCVR-1234",
+				"expiresIn":               30, "interval": 0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "approved", "orgId": "org_new", "workspaceSlug": "new",
+				"userId": "usr_new", "deviceId": "dev_new",
+				"accessToken": "at_new", "refreshToken": "rt_new", "expiresIn": 3600,
+				"refreshExpiresAt": time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339),
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkControlPlaneForDevice(server.URL, "org_old", "old", "usr_old", "dev_old", device.ID, "at_old", "rt_old", 3600, time.Now().UTC().Add(24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"login", "--origin", server.URL}); code != 0 {
+		t.Fatalf("expired-session recovery failed: %s", errb.String())
+	}
+	if !refreshSeen || !startSeen {
+		t.Fatalf("expired-session recovery did not complete: refresh=%v start=%v", refreshSeen, startSeen)
+	}
+	reloaded, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshToken, err := reloaded.ControlPlaneRefreshToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshToken != "rt_new" {
+		t.Fatalf("expired-session recovery did not persist replacement credentials: %s", refreshToken)
+	}
+}
+
 func TestServiceAccountControlPlaneSessionsRejectMutations(t *testing.T) {
 	serviceStore := &store.FileStore{State: asiri.State{ControlPlane: &asiri.ControlPlaneLink{Source: "service-account"}}}
 	if err := rejectServiceAccountControlPlaneMutation(serviceStore); err == nil {
@@ -229,6 +534,67 @@ func TestServiceAccountControlPlaneSessionsRejectMutations(t *testing.T) {
 	}
 	if err := rejectServiceAccountLocalMutation(humanStore); err != nil {
 		t.Fatalf("human sessions should allow local mutations: %v", err)
+	}
+}
+
+func TestServiceAccountSessionRejectsOtherExplicitWorkspaces(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	remoteHit := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteHit = true
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "service-host"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	if code := app.Run([]string{"add", "--workspace", "other", "app/KEY", "--value-file", testSecretFile(t, "must_not_release")}); code != 0 {
+		t.Fatalf("add failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkServiceAccountControlPlane(server.URL, "org_prod", "prod", "usr_owner", "svc_prod", "prod-api", "Production API", "wdev_prod", device.ID, "at_service", "rt_service", 3600, time.Now().UTC().Add(7*24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+
+	commands := [][]string{
+		{"setup", "doctor", "--workspace", "other"},
+		{"get", "--workspace", "other", "app/KEY"},
+		{"list", "--local", "--workspace", "other"},
+		{"run", "--workspace", "other", "--env", "KEY=app/KEY", "--", "sh", "-c", "true"},
+		{"broker", "start", "--workspace", "other", "--agent", "app"},
+		{"device", "status", "--workspace", "other"},
+		{"pull", "--workspace", "other"},
+	}
+	for _, command := range commands {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(command); code == 0 {
+			t.Fatalf("%v should reject the other workspace", command)
+		}
+		if !strings.Contains(errb.String(), "service account session is scoped to workspace prod") {
+			t.Fatalf("%v returned the wrong error: %s", command, errb.String())
+		}
+		if strings.Contains(out.String(), "must_not_release") {
+			t.Fatalf("%v released a secret", command)
+		}
+	}
+	if remoteHit {
+		t.Fatal("other-workspace rejection should happen before remote calls")
 	}
 }
 
@@ -366,6 +732,108 @@ func TestServiceAccountLoginRejectsInvalidArgs(t *testing.T) {
 	}
 }
 
+func TestServiceAccountLoginRejectsExistingControlPlaneSession(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "service-host"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkControlPlaneForDevice("http://control.test", "org_prod", "prod", "usr_owner", "dev_prod", device.ID, "at", "rt", 3600, time.Now().UTC().Add(24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"service-account", "login", "--workspace", "prod", "--service-account", "prod-api"}); code == 0 {
+		t.Fatal("service-account login should reject an existing control-plane session")
+	}
+	if !strings.Contains(errb.String(), "requires no existing control-plane session") {
+		t.Fatalf("unexpected error: %s", errb.String())
+	}
+}
+
+func TestServiceAccountLoginRejectsMismatchedApproval(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["workspaceSlug"] != "prod" || body["serviceAccountSlug"] != "prod-api" {
+				t.Fatalf("unexpected service-account login request: %#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_service_mismatch",
+				"userCode":                "SVCM-1234",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=SVCM-1234",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":             "approved",
+				"orgId":              "org_other",
+				"workspaceSlug":      "other",
+				"userId":             "usr_owner",
+				"deviceId":           "dev_other",
+				"serviceAccountId":   "svc_prod",
+				"serviceAccountSlug": "prod-api",
+				"accessToken":        "at_service",
+				"refreshToken":       "rt_service",
+				"expiresIn":          3600,
+				"refreshExpiresAt":   time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "service-host"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"service-account", "login", "--origin", server.URL, "--workspace", "prod", "--service-account", "prod-api"}); code == 0 {
+		t.Fatal("mismatched service-account approval should fail")
+	}
+	if !strings.Contains(errb.String(), "approved a different workspace or service account") {
+		t.Fatalf("unexpected mismatch error: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State.ControlPlane != nil {
+		t.Fatalf("mismatched approval should not persist a session: %#v", st.State.ControlPlane)
+	}
+}
+
 func TestTrustedCLIConfiguresServiceAccounts(t *testing.T) {
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")
@@ -393,6 +861,11 @@ func TestTrustedCLIConfiguresServiceAccounts(t *testing.T) {
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
+		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "prod")
+			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{
+				"id": "org_setup", "slug": "prod", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_remote",
+			}}})
 		case "/v1/service-accounts":
 			if r.Method == http.MethodGet {
 				if r.URL.Query().Get("orgId") != "org_setup" {
@@ -438,6 +911,7 @@ func TestTrustedCLIConfiguresServiceAccounts(t *testing.T) {
 			if r.Header.Get("authorization") != "Bearer at_cached" || r.Header.Get("x-asiri-device") != "dev_remote" || r.Header.Get("x-asiri-signature") == "" {
 				t.Fatalf("service account disable missing signed trusted session: auth=%s device=%s", r.Header.Get("authorization"), r.Header.Get("x-asiri-device"))
 			}
+			assertRequestWorkspace(t, r, "org_setup")
 			accounts[0]["status"] = "disabled"
 			_ = json.NewEncoder(w).Encode(accounts[0])
 		case "/v1/policies":
@@ -568,7 +1042,7 @@ func TestSetupDoctorBeforeInitPrintsBootstrapSteps(t *testing.T) {
 	var out bytes.Buffer
 	var errb bytes.Buffer
 	app := New(&out, &errb)
-	if code := app.Run([]string{"setup", "doctor"}); code != 0 {
+	if code := app.Run([]string{"setup", "doctor", "--workspace", "personal"}); code != 0 {
 		t.Fatalf("setup doctor should diagnose missing init without failing: %s", errb.String())
 	}
 	got := out.String()
@@ -631,7 +1105,7 @@ func TestSetupDoctorReportsTrustedDeviceNextSteps(t *testing.T) {
 		case "/v1/recovery-recipient":
 			recoveryChecked = true
 			if r.URL.Query().Get("orgId") != "org_prod" {
-				t.Fatalf("setup doctor should only query active workspace recovery, got %s", r.URL.RawQuery)
+				t.Fatalf("setup doctor should only query requested workspace recovery, got %s", r.URL.RawQuery)
 			}
 			http.Error(w, "not configured", http.StatusNotFound)
 		default:
@@ -660,17 +1134,15 @@ func TestSetupDoctorReportsTrustedDeviceNextSteps(t *testing.T) {
 
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"setup", "doctor"}); code != 0 {
+	if code := app.Run([]string{"setup", "doctor", "--workspace", "prod"}); code != 0 {
 		t.Fatalf("setup doctor failed: %s", errb.String())
 	}
 	if !recoveryChecked {
-		t.Fatal("setup doctor should check active workspace recovery")
+		t.Fatal("setup doctor should check requested workspace recovery")
 	}
 	got := out.String()
 	for _, expected := range []string{
 		"prod", "ready", "not-configured", "asiri recovery setup --workspace prod --output-file <path>",
-		"staging", "not trusted", "asiri device trust --workspace staging",
-		"shared", "ask owner to approve this device",
 	} {
 		if !strings.Contains(got, expected) {
 			t.Fatalf("setup doctor output missing %q: %s", expected, got)
@@ -700,12 +1172,8 @@ func TestSetupDoctorReportsMissingWorkspaceFilter(t *testing.T) {
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
 		case "/v1/orgs":
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"activeOrgId": "org_prod",
-				"organizations": []map[string]any{{
-					"id": "org_prod", "name": "Production", "slug": "prod", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_remote", "canApproveDevice": true,
-				}},
-			})
+			assertWorkspaceOverviewTarget(t, r, "prdo")
+			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -732,7 +1200,7 @@ func TestSetupDoctorReportsMissingWorkspaceFilter(t *testing.T) {
 
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"setup", "doctor", "--workspace", "prod", "--workspace", "prdo"}); code == 0 {
+	if code := app.Run([]string{"setup", "doctor", "--workspace", "prdo"}); code == 0 {
 		t.Fatal("setup doctor should fail when any requested workspace is not visible")
 	}
 	if !strings.Contains(errb.String(), "workspace prdo is not visible") {
@@ -762,12 +1230,9 @@ func TestSetupDoctorDoesNotMarkUnknownChecksReady(t *testing.T) {
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
 		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "stage")
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"activeOrgId": "org_prod",
-				"organizations": []map[string]any{
-					{"id": "org_prod", "name": "Production", "slug": "prod", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_remote", "canApproveDevice": true},
-					{"id": "org_stage", "name": "Staging", "slug": "stage", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_stage", "canApproveDevice": true},
-				},
+				"organizations": []map[string]any{{"id": "org_stage", "name": "Staging", "slug": "stage", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_stage", "canApproveDevice": true}},
 			})
 		case "/v1/recovery-recipient":
 			http.Error(w, "not configured", http.StatusNotFound)
@@ -797,12 +1262,11 @@ func TestSetupDoctorDoesNotMarkUnknownChecksReady(t *testing.T) {
 
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"setup", "doctor"}); code != 0 {
+	if code := app.Run([]string{"setup", "doctor", "--workspace", "stage"}); code != 0 {
 		t.Fatalf("setup doctor failed: %s", errb.String())
 	}
 	got := out.String()
 	for _, expected := range []string{
-		"prod", "unknown", "asiri setup doctor --workspace prod",
 		"stage", "unknown", "asiri setup doctor --workspace stage",
 	} {
 		if !strings.Contains(got, expected) {
@@ -909,21 +1373,12 @@ func TestServiceAccountWipeCommandsAreRejected(t *testing.T) {
 	}
 }
 
-func TestServiceAccountPullTargetsStayOnBoundWorkspace(t *testing.T) {
-	active := &asiri.ControlPlaneLink{Source: "service-account", WorkspaceID: "org_prod", WorkspaceSlug: "prod"}
-	workspaces := []remoteWorkspaceResponse{
-		{ID: "org_prod", Slug: "prod", CurrentDeviceTrusted: boolPtr(true), CanPull: boolPtr(true)},
-		{ID: "org_staging", Slug: "staging", CurrentDeviceTrusted: boolPtr(true), CanPull: boolPtr(true)},
+func TestPullRequiresExactlyOneWorkspace(t *testing.T) {
+	if _, err := parsePullArgs(nil); err == nil || !strings.Contains(err.Error(), "requires --workspace") {
+		t.Fatalf("pull without workspace should fail, got %v", err)
 	}
-
-	targets, results := pullTargets(active, workspaces, pullOptions{})
-	if len(results) != 0 || len(targets) != 1 || targets[0].Workspace.Slug != "prod" {
-		t.Fatalf("default service account pull should target only active workspace, targets=%#v results=%#v", targets, results)
-	}
-
-	targets, results = pullTargets(active, workspaces, pullOptions{Workspaces: []string{"staging", "prod"}})
-	if len(targets) != 1 || targets[0].Workspace.Slug != "prod" || len(results) != 1 || results[0].Result != "failed" {
-		t.Fatalf("explicit service account pull should fail non-active workspace and keep active target, targets=%#v results=%#v", targets, results)
+	if _, err := parsePullArgs([]string{"--workspace", "prod", "--workspace", "staging"}); err == nil || !strings.Contains(err.Error(), "accepts one --workspace") {
+		t.Fatalf("pull with two workspaces should fail, got %v", err)
 	}
 }
 
@@ -931,10 +1386,18 @@ func TestServiceAccountRuntimeUsesSyncedServicePolicies(t *testing.T) {
 	expiredAt := time.Now().UTC().Add(-time.Minute)
 	validUntil := time.Now().UTC().Add(time.Hour)
 	st := &store.FileStore{State: asiri.State{
-		ControlPlane: &asiri.ControlPlaneLink{Source: "service-account", ServiceAccountSlug: "prod-api"},
+		ControlPlane: &asiri.ControlPlaneLink{Source: "service-account", ServiceAccountID: "svc_prod", ServiceAccountSlug: "prod-api"},
 		Policies: []asiri.Policy{{
 			ID:            "pol_stale",
 			Subject:       "prod-api",
+			ScopePattern:  "prod/*",
+			SecretPattern: "*",
+			Actions:       []string{"read"},
+			ApprovalMode:  "none",
+			CreatedAt:     time.Now().UTC(),
+		}, {
+			ID:            "pol_previous_sync",
+			Subject:       store.ServiceAccountRuntimeSubject("svc_prod"),
 			ScopePattern:  "prod/*",
 			SecretPattern: "*",
 			Actions:       []string{"read"},
@@ -968,7 +1431,7 @@ func TestServiceAccountRuntimeUsesSyncedServicePolicies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if subject != "prod-api" || labelType != "service" {
+	if subject != store.ServiceAccountRuntimeSubject("svc_prod") || labelType != "service" {
 		t.Fatalf("service account runtime subject mismatch: subject=%s type=%s", subject, labelType)
 	}
 	if allowed, _ := st.CheckPolicy(subject, "prod/api/DATABASE_URL", "read"); allowed {
@@ -977,8 +1440,15 @@ func TestServiceAccountRuntimeUsesSyncedServicePolicies(t *testing.T) {
 	if allowed, reason := st.CheckPolicy(subject, "prod/api/DATABASE_URL", "inject"); !allowed {
 		t.Fatalf("synced service account policy should allow inject: %s", reason)
 	}
-	if st.State.Policies[1].ExpiresAt == nil || !st.State.Policies[1].ExpiresAt.Equal(validUntil) {
-		t.Fatalf("synced service account policy should preserve expiry: %#v", st.State.Policies[1].ExpiresAt)
+	var syncedInject *asiri.Policy
+	for i := range st.State.Policies {
+		if st.State.Policies[i].ID == "pol_inject" {
+			syncedInject = &st.State.Policies[i]
+			break
+		}
+	}
+	if syncedInject == nil || syncedInject.ExpiresAt == nil || !syncedInject.ExpiresAt.Equal(validUntil) {
+		t.Fatalf("synced service account policy should preserve expiry: %#v", syncedInject)
 	}
 }
 
@@ -1086,10 +1556,13 @@ func TestWhoamiUsesFreshCachedControlPlaneToken(t *testing.T) {
 		t.Fatalf("expected cached whoami without refresh, refreshes=%d whoami=%v", refreshCalls, whoamiSeen)
 	}
 	got := out.String()
-	for _, expected := range []string{"peter@example.com", "Peter Owner", "oclan-co", "LOCAL DEVICE", "qa-laptop", "REMOTE DEVICE", "dev_remote"} {
+	for _, expected := range []string{"peter@example.com", "Peter Owner", "LOCAL DEVICE", "qa-laptop", "AUTH DEVICE", "dev_remote"} {
 		if !strings.Contains(got, expected) {
 			t.Fatalf("whoami output missing %q: %s", expected, got)
 		}
+	}
+	if strings.Contains(got, "WORKSPACE") || strings.Contains(got, "oclan-co") {
+		t.Fatalf("user whoami should not report workspace selection: %s", got)
 	}
 }
 
@@ -1413,7 +1886,7 @@ func TestLoginReportsCloudflareChallengeInsteadOfJSONDecodeError(t *testing.T) {
 	}
 }
 
-func TestDeviceListDefaultsToRemoteWhenLinked(t *testing.T) {
+func TestDeviceListRequiresExplicitRemoteWorkspaceWhenLinked(t *testing.T) {
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")
 	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
@@ -1496,7 +1969,7 @@ func TestDeviceListDefaultsToRemoteWhenLinked(t *testing.T) {
 
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"device", "list"}); code != 0 {
+	if code := app.Run([]string{"device", "list", "--remote", "--workspace", "oclan-co"}); code != 0 {
 		t.Fatalf("device list failed: %s", errb.String())
 	}
 	if !deviceListSeen {
@@ -1515,7 +1988,7 @@ func TestDeviceListDefaultsToRemoteWhenLinked(t *testing.T) {
 
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"device", "list", "--include-revoked"}); code != 0 {
+	if code := app.Run([]string{"device", "list", "--remote", "--workspace", "oclan-co", "--include-revoked"}); code != 0 {
 		t.Fatalf("device list --include-revoked failed: %s", errb.String())
 	}
 	if !includeRevokedSeen {
@@ -1537,7 +2010,7 @@ func TestDeviceListDefaultsToRemoteWhenLinked(t *testing.T) {
 	}
 }
 
-func TestRemoteSelfRevokeClearsLocalRuntime(t *testing.T) {
+func TestRemoteSelfRevokeKeepsLocalRuntimeAndAuthSession(t *testing.T) {
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")
 	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
@@ -1567,10 +2040,21 @@ func TestRemoteSelfRevokeClearsLocalRuntime(t *testing.T) {
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
+		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
+			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{
+				"id": "org_remote", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_remote",
+			}}})
+		case "/v1/devices":
+			if r.URL.Query().Get("orgId") != "org_remote" {
+				t.Fatalf("unexpected remote device query: %s", r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"devices": []map[string]any{{"id": "dev_remote", "name": "qa-laptop", "status": "trusted"}}})
 		case "/v1/devices/dev_remote/revoke":
 			if r.Header.Get("authorization") != "Bearer at_self" {
 				t.Fatalf("unexpected remote revoke auth header: %s", r.Header.Get("authorization"))
 			}
+			assertRequestWorkspace(t, r, "org_remote")
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": "dev_remote", "name": "qa-laptop", "status": "revoked"})
 		default:
 			http.NotFound(w, r)
@@ -1596,14 +2080,14 @@ func TestRemoteSelfRevokeClearsLocalRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.State.ControlPlane != nil {
-		t.Fatalf("remote self-revoke should clear control-plane link: %#v", st.State.ControlPlane)
+	if st.State.ControlPlane == nil {
+		t.Fatal("workspace device revocation should not clear the account session")
 	}
-	if len(st.State.KeyRefs) != 0 {
-		t.Fatalf("remote self-revoke should clear local key refs: %#v", st.State.KeyRefs)
+	if len(st.State.KeyRefs) == 0 {
+		t.Fatal("workspace device revocation should not clear local key refs")
 	}
-	if _, _, err := st.GetSecret("oclan-co/local/asiri/API_KEY"); err == nil {
-		t.Fatal("remote self-revoke should block local decryption")
+	if value, _, err := st.GetSecret("oclan-co/local/asiri/API_KEY"); err != nil || value != "blocked_after_revoke" {
+		t.Fatalf("workspace device revocation should preserve local decryption, value=%q err=%v", value, err)
 	}
 }
 
@@ -1617,11 +2101,22 @@ func TestRemoteRevokeConflictKeepsLocalRuntime(t *testing.T) {
 	revokeSeen := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
+			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{
+				"id": "org_remote", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_remote",
+			}}})
+		case "/v1/devices":
+			if r.URL.Query().Get("orgId") != "org_remote" {
+				t.Fatalf("unexpected remote device query: %s", r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"devices": []map[string]any{{"id": "dev_remote", "name": "qa-laptop", "status": "trusted"}}})
 		case "/v1/devices/dev_remote/revoke":
 			revokeSeen = true
 			if r.Header.Get("authorization") != "Bearer at_test" {
 				t.Fatalf("unexpected remote revoke auth header: %s", r.Header.Get("authorization"))
 			}
+			assertRequestWorkspace(t, r, "org_remote")
 			w.WriteHeader(http.StatusConflict)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"error":               "request_failed",
@@ -1670,6 +2165,64 @@ func TestRemoteRevokeConflictKeepsLocalRuntime(t *testing.T) {
 	}
 	if len(reloaded.State.KeyRefs) == 0 {
 		t.Fatalf("failed remote revoke should keep local key refs")
+	}
+}
+
+func TestRemoteRevokeRejectsDeviceOutsideRequestedWorkspace(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	mutationSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/orgs":
+			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{
+				"id": "org_target", "slug": "target", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_target",
+			}}})
+		case "/v1/devices":
+			if r.URL.Query().Get("orgId") != "org_target" {
+				t.Fatalf("unexpected device list workspace: %s", r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"devices": []map[string]any{{"id": "dev_target", "name": "target-device", "status": "trusted"}}})
+		case "/v1/devices/dev_foreign/revoke":
+			mutationSeen = true
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "dev_foreign", "status": "revoked"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "target-device"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkControlPlaneForDevice(server.URL, "org_target", "target", "usr_owner", "dev_target", device.ID, "at_target", "rt_target", 3600, time.Now().UTC().Add(7*24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"device", "revoke", "--remote", "--workspace", "target", "dev_foreign"}); code == 0 {
+		t.Fatal("foreign workspace device should not be revoked")
+	}
+	if mutationSeen {
+		t.Fatal("foreign device revoke endpoint should not be called")
+	}
+	if !strings.Contains(errb.String(), "was not found in workspace target") {
+		t.Fatalf("unexpected foreign-device error: %s", errb.String())
 	}
 }
 
@@ -1967,15 +2520,18 @@ func TestAuditTailShowsLocalStatusForLocalOnlyEvents(t *testing.T) {
 	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
 		t.Fatalf("init failed with code %d stderr=%s", code, errb.String())
 	}
+	if code := app.Run([]string{"add", "--workspace", "qa", "local/TEST", "--value-file", testSecretFile(t, "test")}); code != 0 {
+		t.Fatalf("add failed with code %d stderr=%s", code, errb.String())
+	}
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"audit", "tail", "--limit", "5"}); code != 0 {
+	if code := app.Run([]string{"audit", "tail", "--workspace", "qa", "--limit", "5"}); code != 0 {
 		t.Fatalf("audit tail failed with code %d stderr=%s", code, errb.String())
 	}
 	if strings.Contains(out.String(), "\tpending\t") {
 		t.Fatalf("local-only audit rows should not be shown as pending: %s", out.String())
 	}
-	if !strings.Contains(out.String(), "\tlocal_vault_initialized\tallowed\tlocal\t") {
+	if !strings.Contains(out.String(), "\tsecret_created\tallowed\tlocal\t") {
 		t.Fatalf("expected local audit status, got: %s", out.String())
 	}
 }
@@ -2090,7 +2646,7 @@ func TestBrokerRequiresExplicitBrokerGrant(t *testing.T) {
 		t.Fatalf("broker denial leaked secret: %s", payload)
 	}
 	out.Reset()
-	if audit := app.Run([]string{"audit", "tail", "--limit", "10"}); audit != 0 {
+	if audit := app.Run([]string{"audit", "tail", "--workspace", "qa", "--limit", "10"}); audit != 0 {
 		t.Fatalf("audit tail failed")
 	}
 	if !strings.Contains(out.String(), "secret_brokered") {
@@ -2258,11 +2814,22 @@ func TestLoginUsesDeviceCodeFlow(t *testing.T) {
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
+		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
+			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{
+				"id": "org_remote", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_remote",
+			}}})
+		case "/v1/devices":
+			if r.URL.Query().Get("orgId") != "org_remote" {
+				t.Fatalf("unexpected remote device query: %s", r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"devices": []map[string]any{{"id": "dev_other", "name": "ci-runner", "status": "trusted"}}})
 		case "/v1/devices/dev_other/revoke":
 			remoteRevokeSeen = true
 			if r.Header.Get("authorization") != "Bearer at_refreshed" {
 				t.Fatalf("unexpected remote revoke auth header: %s", r.Header.Get("authorization"))
 			}
+			assertRequestWorkspace(t, r, "org_remote")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"id":     "dev_other",
 				"name":   "ci-runner",
@@ -2301,8 +2868,8 @@ func TestLoginUsesDeviceCodeFlow(t *testing.T) {
 	if !startSeen || !tokenSeen {
 		t.Fatalf("expected start and token endpoints to be called")
 	}
-	if !strings.Contains(out.String(), "ABCD-2345") || !strings.Contains(out.String(), "oclan-co") {
-		t.Fatalf("login output missing code or workspace: %s", out.String())
+	if !strings.Contains(out.String(), "ABCD-2345") || !strings.Contains(out.String(), "control-plane account") {
+		t.Fatalf("login output missing code or account confirmation: %s", out.String())
 	}
 	st, err := store.LoadDefault()
 	if err != nil {
@@ -2357,7 +2924,7 @@ func TestLoginUsesDeviceCodeFlow(t *testing.T) {
 	}
 }
 
-func TestRemoteRevocationClearsLocalKeyMaterial(t *testing.T) {
+func TestRemoteWorkspaceRevocationDoesNotClearLocalKeyMaterial(t *testing.T) {
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")
 	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
@@ -2395,7 +2962,7 @@ func TestRemoteRevocationClearsLocalKeyMaterial(t *testing.T) {
 		case "/v1/orgs":
 			revoked = true
 			w.WriteHeader(http.StatusForbidden)
-			_ = json.NewEncoder(w).Encode(map[string]any{"error": "request_failed", "message": "device not trusted"})
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "device_not_trusted", "message": "device_not_trusted"})
 		case "/v1/sync":
 			revoked = true
 			w.WriteHeader(http.StatusForbidden)
@@ -2422,21 +2989,21 @@ func TestRemoteRevocationClearsLocalKeyMaterial(t *testing.T) {
 	}
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"pull"}); code == 0 {
+	if code := app.Run([]string{"pull", "--workspace", "oclan-co"}); code == 0 {
 		t.Fatalf("expected revoked device pull failure, stdout=%s", out.String())
 	}
-	if !revoked || !strings.Contains(errb.String(), "local key material was cleared") {
-		t.Fatalf("expected remote revocation cleanup, revoked=%v stderr=%s", revoked, errb.String())
+	if !revoked || !strings.Contains(errb.String(), "device_not_trusted") {
+		t.Fatalf("expected workspace trust failure, revoked=%v stderr=%s", revoked, errb.String())
 	}
 	st, err := store.LoadDefault()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.State.ControlPlane != nil || len(st.State.KeyRefs) != 0 {
-		t.Fatalf("revoked device kept control-plane link or key refs: %#v", st.State)
+	if st.State.ControlPlane == nil || len(st.State.KeyRefs) == 0 {
+		t.Fatalf("workspace revocation cleared the account session or local keys: %#v", st.State)
 	}
-	if _, _, err := st.GetSecret("oclan-co/local/asiri/API_KEY"); err == nil {
-		t.Fatal("revoked local vault still decrypted existing secret")
+	if value, _, err := st.GetSecret("oclan-co/local/asiri/API_KEY"); err != nil || value != "secret_value" {
+		t.Fatalf("workspace revocation should preserve local vault access, value=%q err=%v", value, err)
 	}
 }
 
@@ -2503,13 +3070,13 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"activeOrgId": "org_remote",
 				"organizations": []map[string]any{
-					{"id": "org_remote", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true},
+					{"id": "org_remote", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_remote"},
 				},
 			})
 		case "/v1/sync/write-options":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"requestedWorkspaceSlug": "oclan-co",
-				"activeWorkspace": map[string]any{
+				"workspace": map[string]any{
 					"id":       "org_remote",
 					"slug":     "oclan-co",
 					"canWrite": true,
@@ -2625,7 +3192,7 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 		{"login", "--origin", server.URL},
 		{"push", "--workspace", "oclan-co"},
 		{"push", "--workspace", "oclan-co"},
-		{"pull"},
+		{"pull", "--workspace", "oclan-co"},
 		{"rewrap", "--workspace", "oclan-co"},
 	} {
 		out.Reset()
@@ -2715,17 +3282,18 @@ func TestPushDryRunFirstWorkspaceEvaluatesRemoteState(t *testing.T) {
 						"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 					})
 				case "/v1/orgs":
+					assertWorkspaceOverviewTarget(t, r, "oclan-co")
 					_ = json.NewEncoder(w).Encode(map[string]any{
 						"activeOrgId": "org_dry_run",
 						"organizations": []map[string]any{
-							{"id": "org_dry_run", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true},
+							{"id": "org_dry_run", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_dry_run"},
 						},
 					})
 				case "/v1/sync/write-options":
 					writeOptionsSeen = true
 					_ = json.NewEncoder(w).Encode(map[string]any{
 						"requestedWorkspaceSlug": "oclan-co",
-						"activeWorkspace": map[string]any{
+						"workspace": map[string]any{
 							"id":       "org_dry_run",
 							"slug":     "oclan-co",
 							"canWrite": true,
@@ -2870,7 +3438,7 @@ func TestPushDryRunFirstWorkspaceEvaluatesRemoteState(t *testing.T) {
 	}
 }
 
-func TestPushDryRunRemoteWorkspaceDoesNotPersistSessionSwitch(t *testing.T) {
+func TestPushDryRunRemoteWorkspaceDoesNotSwitchAccountSession(t *testing.T) {
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")
 	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
@@ -2879,6 +3447,7 @@ func TestPushDryRunRemoteWorkspaceDoesNotPersistSessionSwitch(t *testing.T) {
 	}
 	switchSeen := false
 	encryptedSeen := false
+	refreshSeen := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "application/json")
 		switch r.URL.Path {
@@ -2902,13 +3471,30 @@ func TestPushDryRunRemoteWorkspaceDoesNotPersistSessionSwitch(t *testing.T) {
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
-		case "/v1/orgs":
+		case "/v1/auth/session/refresh":
+			refreshSeen++
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"activeOrgId": "org_oclan",
-				"organizations": []map[string]any{
-					{"id": "org_oclan", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true},
-					{"id": "org_asiri", "name": "Asiri Dev", "slug": "asiri-dev", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true},
-				},
+				"status":           "approved",
+				"orgId":            "org_oclan",
+				"workspaceSlug":    "oclan-co",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_oclan",
+				"accessToken":      "at_refreshed",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "asiri-dev")
+			if r.Header.Get("authorization") == "Bearer at_oclan" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "expired"})
+				return
+			}
+			if r.Header.Get("authorization") != "Bearer at_refreshed" {
+				t.Fatalf("workspace discovery should use the refreshed account token, got %s", r.Header.Get("authorization"))
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"organizations": []map[string]any{{"id": "org_asiri", "name": "Asiri Dev", "slug": "asiri-dev", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_asiri"}},
 			})
 		case "/v1/auth/session/switch":
 			switchSeen = true
@@ -2931,12 +3517,12 @@ func TestPushDryRunRemoteWorkspaceDoesNotPersistSessionSwitch(t *testing.T) {
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
 		case "/v1/sync/write-options":
-			if r.Header.Get("authorization") != "Bearer at_asiri" {
-				t.Fatalf("dry-run should use transient switched token, got %s", r.Header.Get("authorization"))
+			if r.Header.Get("authorization") != "Bearer at_refreshed" {
+				t.Fatalf("dry-run should reuse the refreshed account token, got %s", r.Header.Get("authorization"))
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"requestedWorkspaceSlug": "asiri-dev",
-				"activeWorkspace": map[string]any{
+				"workspace": map[string]any{
 					"id":       "org_asiri",
 					"slug":     "asiri-dev",
 					"canWrite": true,
@@ -2955,7 +3541,7 @@ func TestPushDryRunRemoteWorkspaceDoesNotPersistSessionSwitch(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"devices": []map[string]any{}})
 		case "/v1/secrets/encrypted":
 			encryptedSeen = true
-			if r.Header.Get("authorization") != "Bearer at_asiri" || r.URL.Query().Get("orgId") != "org_asiri" {
+			if r.Header.Get("authorization") != "Bearer at_refreshed" || r.URL.Query().Get("orgId") != "org_asiri" {
 				t.Fatalf("unexpected encrypted secrets request auth=%s query=%s", r.Header.Get("authorization"), r.URL.RawQuery)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{}})
@@ -2989,15 +3575,15 @@ func TestPushDryRunRemoteWorkspaceDoesNotPersistSessionSwitch(t *testing.T) {
 	if code := app.Run([]string{"push", "--workspace", "asiri-dev", "--dry-run"}); code != 0 {
 		t.Fatalf("remote workspace dry-run failed: %s", errb.String())
 	}
-	if !switchSeen || !encryptedSeen {
-		t.Fatalf("dry-run should switch transiently and evaluate remote state, switch=%v encrypted=%v", switchSeen, encryptedSeen)
+	if switchSeen || !encryptedSeen || refreshSeen != 1 {
+		t.Fatalf("dry-run should refresh one account session without switching, switch=%v encrypted=%v refreshes=%d", switchSeen, encryptedSeen, refreshSeen)
 	}
 	reloaded, err := store.LoadDefault()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if reloaded.State.ControlPlane == nil || reloaded.State.ControlPlane.WorkspaceID != "org_oclan" || reloaded.State.ControlPlane.WorkspaceSlug != "oclan-co" {
-		t.Fatalf("dry-run persisted workspace session switch: %#v", reloaded.State.ControlPlane)
+		t.Fatalf("dry-run changed the account session: %#v", reloaded.State.ControlPlane)
 	}
 	if _, ok := reloaded.RemoteBindingForPrefix("asiri-dev"); ok {
 		t.Fatal("dry-run should not persist remote workspace binding")
@@ -3035,10 +3621,15 @@ func TestPushFailsWhenTrustedDeviceDiscoveryUnavailable(t *testing.T) {
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
+		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
+			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{
+				"id": "org_devices_fail", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_devices_fail",
+			}}})
 		case "/v1/sync/write-options":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"requestedWorkspaceSlug": "oclan-co",
-				"activeWorkspace": map[string]any{
+				"workspace": map[string]any{
 					"id":       "org_devices_fail",
 					"slug":     "oclan-co",
 					"canWrite": true,
@@ -3283,6 +3874,11 @@ func TestRewrapSkipsRemoteVersionMissingLocally(t *testing.T) {
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
+		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
+			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{
+				"id": "org_remote", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_remote",
+			}}})
 		case "/v1/devices":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"devices": []map[string]any{
@@ -3389,6 +3985,11 @@ func TestRewrapAddsCurrentTrustedDeviceWhenLocalKeyExists(t *testing.T) {
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
+		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
+			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{
+				"id": "org_remote", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_remote",
+			}}})
 		case "/v1/devices":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"devices": []map[string]any{
@@ -3505,10 +4106,15 @@ func TestRecoverySetupShowsKeyOnceAndWrapsRemoteSecrets(t *testing.T) {
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
+		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
+			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{
+				"id": "org_recovery", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_recovery",
+			}}})
 		case "/v1/sync/write-options":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"requestedWorkspaceSlug": "oclan-co",
-				"activeWorkspace": map[string]any{
+				"workspace": map[string]any{
 					"id":       "org_recovery",
 					"slug":     "oclan-co",
 					"canWrite": true,
@@ -3713,6 +4319,11 @@ func TestRecoverySetupFreshLinkedWorkspaceSendsEmptyReplacements(t *testing.T) {
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
+		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
+			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{
+				"id": "org_empty_recovery", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_empty_recovery",
+			}}})
 		case "/v1/secrets/encrypted":
 			remoteSecretListSeen = true
 			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{}})
@@ -3765,7 +4376,7 @@ func TestRecoverySetupFreshLinkedWorkspaceSendsEmptyReplacements(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	staleSetup, err := staleStore.SetupRecovery(false)
+	staleSetup, err := staleStore.SetupRecovery(staleStore.State.ControlPlane.WorkspaceID, staleStore.State.ControlPlane.WorkspaceSlug, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3793,7 +4404,7 @@ func TestRecoverySetupFreshLinkedWorkspaceSendsEmptyReplacements(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if recovery := st.ActiveRecovery(); recovery == nil {
+	if recovery := st.RecoveryForWorkspace(st.State.ControlPlane.WorkspaceID); recovery == nil {
 		t.Fatal("fresh workspace recovery setup should commit local recovery metadata")
 	} else if recovery.RecipientID == staleSetup.RecipientID {
 		t.Fatal("fresh workspace recovery setup should replace stale local recovery metadata after server success")
@@ -3832,10 +4443,11 @@ func TestRecoveryStatusPreservesSameRecipientLocalWrappingCounters(t *testing.T)
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
 		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"activeOrgId": "org_status_recovery",
 				"organizations": []map[string]any{
-					{"id": "org_status_recovery", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true},
+					{"id": "org_status_recovery", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_status_recovery"},
 				},
 			})
 		case "/v1/recovery-recipient":
@@ -3879,16 +4491,16 @@ func TestRecoveryStatusPreservesSameRecipientLocalWrappingCounters(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.SetupRecovery(false); err != nil {
+	if _, err := st.SetupRecovery(st.State.ControlPlane.WorkspaceID, st.State.ControlPlane.WorkspaceSlug, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.Save(); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.MarkRecoveryWrapped("oclan-co", 3); err != nil {
+	if err := st.MarkRecoveryWrapped(st.State.ControlPlane.WorkspaceID, "oclan-co", 3); err != nil {
 		t.Fatal(err)
 	}
-	recovery := st.ActiveRecovery()
+	recovery := st.RecoveryForWorkspace(st.State.ControlPlane.WorkspaceID)
 	if recovery == nil {
 		t.Fatal("expected local recovery metadata")
 	}
@@ -3896,7 +4508,7 @@ func TestRecoveryStatusPreservesSameRecipientLocalWrappingCounters(t *testing.T)
 
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"recovery", "status"}); code != 0 {
+	if code := app.Run([]string{"recovery", "status", "--workspace", "oclan-co"}); code != 0 {
 		t.Fatalf("recovery status failed: %s", errb.String())
 	}
 	statusFields := strings.Fields(out.String())
@@ -3907,7 +4519,7 @@ func TestRecoveryStatusPreservesSameRecipientLocalWrappingCounters(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count := reloaded.RecoveryWrappedCountForPrefix("oclan-co"); count != 3 {
+	if count := reloaded.RecoveryWrappedCount("org_status_recovery"); count != 3 {
 		t.Fatalf("recovery status should persist local wrapping count, got %d", count)
 	}
 }
@@ -3945,16 +4557,17 @@ func TestTargetedPushPreservesRecoveryWrappedCount(t *testing.T) {
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
 		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"activeOrgId": "org_targeted_push",
 				"organizations": []map[string]any{
-					{"id": "org_targeted_push", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true},
+					{"id": "org_targeted_push", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_targeted_push"},
 				},
 			})
 		case "/v1/sync/write-options":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"requestedWorkspaceSlug": "oclan-co",
-				"activeWorkspace": map[string]any{
+				"workspace": map[string]any{
 					"id":       "org_targeted_push",
 					"slug":     "oclan-co",
 					"canWrite": true,
@@ -4014,16 +4627,16 @@ func TestTargetedPushPreservesRecoveryWrappedCount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.SetupRecovery(false); err != nil {
+	if _, err := st.SetupRecovery(st.State.ControlPlane.WorkspaceID, st.State.ControlPlane.WorkspaceSlug, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.Save(); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.MarkRecoveryWrapped("oclan-co", 3); err != nil {
+	if err := st.MarkRecoveryWrapped(st.State.ControlPlane.WorkspaceID, "oclan-co", 3); err != nil {
 		t.Fatal(err)
 	}
-	activeRecovery = st.ActiveRecovery()
+	activeRecovery = st.RecoveryForWorkspace(st.State.ControlPlane.WorkspaceID)
 	out.Reset()
 	errb.Reset()
 	if code := app.Run([]string{"push", "--workspace", "oclan-co", "--secret", "local/asiri/API_KEY"}); code != 0 {
@@ -4036,7 +4649,7 @@ func TestTargetedPushPreservesRecoveryWrappedCount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count := reloaded.RecoveryWrappedCountForPrefix("oclan-co"); count != 3 {
+	if count := reloaded.RecoveryWrappedCount("org_targeted_push"); count != 3 {
 		t.Fatalf("targeted push should preserve existing recovery wrapped count, got %d", count)
 	}
 	resetRecovery := reloaded.State.Recoveries["org_targeted_push"]
@@ -4056,7 +4669,7 @@ func TestTargetedPushPreservesRecoveryWrappedCount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count := reloaded.RecoveryWrappedCountForPrefix("oclan-co"); count != 1 {
+	if count := reloaded.RecoveryWrappedCount("org_targeted_push"); count != 1 {
 		t.Fatalf("first targeted push should record selected recovery wrapped count, got %d", count)
 	}
 }
@@ -4093,10 +4706,15 @@ func TestRecoverySetupSkipsWrappingWhenRemoteRegistrationFails(t *testing.T) {
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
+		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
+			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{
+				"id": "org_recovery", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_recovery",
+			}}})
 		case "/v1/sync/write-options":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"requestedWorkspaceSlug": "oclan-co",
-				"activeWorkspace": map[string]any{
+				"workspace": map[string]any{
 					"id":       "org_recovery",
 					"slug":     "oclan-co",
 					"canWrite": true,
@@ -4178,7 +4796,7 @@ func TestRecoverySetupSkipsWrappingWhenRemoteRegistrationFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.ActiveRecovery() != nil {
+	if st.RecoveryForWorkspace(st.State.ControlPlane.WorkspaceID) != nil {
 		t.Fatalf("local recovery config should not be active after remote registration failure: %#v", st.State.Recoveries)
 	}
 }
@@ -4216,10 +4834,15 @@ func TestRecoverySetupFailsWhenRemoteReplacementFails(t *testing.T) {
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
+		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
+			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{
+				"id": "org_recovery", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_recovery",
+			}}})
 		case "/v1/sync/write-options":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"requestedWorkspaceSlug": "oclan-co",
-				"activeWorkspace": map[string]any{
+				"workspace": map[string]any{
 					"id":       "org_recovery",
 					"slug":     "oclan-co",
 					"canWrite": true,
@@ -4305,7 +4928,7 @@ func TestRecoverySetupFailsWhenRemoteReplacementFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.ActiveRecovery() != nil {
+	if st.RecoveryForWorkspace(st.State.ControlPlane.WorkspaceID) != nil {
 		t.Fatalf("local recovery config should not be active after remote wrapping failure: %#v", st.State.Recoveries)
 	}
 }
@@ -4345,10 +4968,15 @@ func TestRecoverySetupForceCommitsWhenPreviousRecipientIsRetired(t *testing.T) {
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
+		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
+			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{
+				"id": "org_recovery", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_recovery",
+			}}})
 		case "/v1/sync/write-options":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"requestedWorkspaceSlug": "oclan-co",
-				"activeWorkspace": map[string]any{
+				"workspace": map[string]any{
 					"id":       "org_recovery",
 					"slug":     "oclan-co",
 					"canWrite": true,
@@ -4484,7 +5112,7 @@ func TestRecoverySetupForceCommitsWhenPreviousRecipientIsRetired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if recovery := st.ActiveRecovery(); recovery == nil || recovery.RecipientID != registeredRecipients[1] {
+	if recovery := st.RecoveryForWorkspace(st.State.ControlPlane.WorkspaceID); recovery == nil || recovery.RecipientID != registeredRecipients[1] {
 		t.Fatalf("forced replacement should commit the new local recovery config: %#v", st.State.Recoveries)
 	}
 }
@@ -4520,6 +5148,11 @@ func TestRecoveryRestoreUsesSuppliedKeyWhenLocalMetadataIsStale(t *testing.T) {
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
+		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
+			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{
+				"id": "org_recovery", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_recovery",
+			}}})
 		case "/v1/secrets/encrypted":
 			remoteListSeen = true
 			if got := r.URL.Query().Get("recoveryRecipientId"); !strings.HasPrefix(got, "rec_") {
@@ -4549,11 +5182,11 @@ func TestRecoveryRestoreUsesSuppliedKeyWhenLocalMetadataIsStale(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldSetup, err := st.SetupRecovery(false)
+	oldSetup, err := st.SetupRecovery(st.State.ControlPlane.WorkspaceID, st.State.ControlPlane.WorkspaceSlug, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.SetupRecovery(true); err != nil {
+	if _, err := st.SetupRecovery(st.State.ControlPlane.WorkspaceID, st.State.ControlPlane.WorkspaceSlug, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.Save(); err != nil {
@@ -4578,7 +5211,7 @@ func TestRecoveryRestoreUsesSuppliedKeyWhenLocalMetadataIsStale(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if recovery := st.ActiveRecovery(); recovery == nil || recovery.RecipientID != oldSetup.RecipientID {
+	if recovery := st.RecoveryForWorkspace(st.State.ControlPlane.WorkspaceID); recovery == nil || recovery.RecipientID != oldSetup.RecipientID {
 		t.Fatalf("restore should refresh local recovery metadata from the supplied key: %#v", st.State.Recoveries)
 	}
 }
@@ -4735,7 +5368,7 @@ func TestPushOffersConfirmedWorkspacePrefixRenameWhenSourceWorkspaceIsNotVisible
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"requestedWorkspaceSlug": "google-com",
-				"activeWorkspace": map[string]any{
+				"workspace": map[string]any{
 					"id":       "org_oclan",
 					"slug":     "oclan-co",
 					"canWrite": true,
@@ -4809,7 +5442,7 @@ func TestPushOffersConfirmedWorkspacePrefixRenameWhenSourceWorkspaceIsNotVisible
 	}
 }
 
-func TestPushListsWritableAlternativesWhenActiveWorkspaceCannotWrite(t *testing.T) {
+func TestPushReportsRequestedWorkspaceWriteDenial(t *testing.T) {
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")
 	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
@@ -4840,10 +5473,15 @@ func TestPushListsWritableAlternativesWhenActiveWorkspaceCannotWrite(t *testing.
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
+		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
+			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{
+				"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan",
+			}}})
 		case "/v1/sync/write-options":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"requestedWorkspaceSlug": "oclan-co",
-				"activeWorkspace": map[string]any{
+				"workspace": map[string]any{
 					"id":       "org_oclan",
 					"slug":     "oclan-co",
 					"canWrite": false,
@@ -4852,15 +5490,6 @@ func TestPushListsWritableAlternativesWhenActiveWorkspaceCannotWrite(t *testing.
 						"canWrite": false,
 					}},
 				},
-				"writableWorkspaces": []map[string]any{{
-					"id":       "org_personal",
-					"slug":     "peter-dev",
-					"canWrite": true,
-					"paths": []map[string]any{{
-						"fullPath": "peter-dev/recipe-app/API_KEY",
-						"canWrite": true,
-					}},
-				}},
 			})
 		case "/v1/secrets":
 			secretPushSeen = true
@@ -4929,6 +5558,11 @@ func TestPushRefusesToMoveVisibleReadOnlyWorkspaceSecrets(t *testing.T) {
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
+		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
+			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{
+				"id": "org_oclan", "slug": "oclan-co", "role": "member", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_member",
+			}}})
 		case "/v1/sync/write-options":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"requestedWorkspaceSlug": "google-com",
@@ -4941,7 +5575,7 @@ func TestPushRefusesToMoveVisibleReadOnlyWorkspaceSecrets(t *testing.T) {
 						"canWrite": false,
 					}},
 				},
-				"activeWorkspace": map[string]any{
+				"workspace": map[string]any{
 					"id":       "org_oclan",
 					"slug":     "oclan-co",
 					"canWrite": true,
@@ -4996,7 +5630,7 @@ func TestPushRefusesToMoveVisibleReadOnlyWorkspaceSecrets(t *testing.T) {
 	}
 }
 
-func TestListMergesActiveWorkspaceRemoteSecrets(t *testing.T) {
+func TestListMergesRequestedWorkspaceRemoteSecrets(t *testing.T) {
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")
 	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
@@ -5029,6 +5663,15 @@ func TestListMergesActiveWorkspaceRemoteSecrets(t *testing.T) {
 			})
 		case "/v1/orgs":
 			workspaceOverviewSeen = true
+			workspace := r.URL.Query().Get("workspace")
+			if workspace == "peter-dev" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"organizations": []map[string]any{{"id": "org_personal", "slug": "peter-dev", "role": "owner", "canPull": false, "canWrite": true, "currentDeviceTrusted": false}},
+					"secrets":       []map[string]any{},
+				})
+				return
+			}
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
 			if r.Header.Get("authorization") != "Bearer at_list" {
 				t.Fatalf("unexpected workspace overview auth header: %s", r.Header.Get("authorization"))
 			}
@@ -5046,7 +5689,7 @@ func TestListMergesActiveWorkspaceRemoteSecrets(t *testing.T) {
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"activeOrgId":   "org_oclan",
-				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan"}},
 				"secrets":       secrets,
 			})
 		default:
@@ -5072,7 +5715,7 @@ func TestListMergesActiveWorkspaceRemoteSecrets(t *testing.T) {
 	}
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"list"}); code != 0 {
+	if code := app.Run([]string{"list", "--workspace", "oclan-co"}); code != 0 {
 		t.Fatalf("list failed: %s", errb.String())
 	}
 	if !workspaceOverviewSeen {
@@ -5089,7 +5732,7 @@ func TestListMergesActiveWorkspaceRemoteSecrets(t *testing.T) {
 	}
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"list", "--include-inactive"}); code != 0 {
+	if code := app.Run([]string{"list", "--workspace", "oclan-co", "--include-inactive"}); code != 0 {
 		t.Fatalf("inactive list failed: %s", errb.String())
 	}
 	historyLines := []string{}
@@ -5117,7 +5760,7 @@ func TestListMergesActiveWorkspaceRemoteSecrets(t *testing.T) {
 	}
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"list", "--local"}); code != 0 {
+	if code := app.Run([]string{"list", "--local", "--workspace", "oclan-co"}); code != 0 {
 		t.Fatalf("local-filtered list failed: %s", errb.String())
 	}
 	if strings.Contains(out.String(), "REMOTE_ONLY") || !strings.Contains(out.String(), "UNPUSHED") {
@@ -5185,7 +5828,7 @@ func TestListLocalDoesNotRequireRemoteAuth(t *testing.T) {
 	}
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"list", "--local"}); code != 0 {
+	if code := app.Run([]string{"list", "--local", "--workspace", "oclan-co"}); code != 0 {
 		t.Fatalf("local list failed: %s", errb.String())
 	}
 	if remoteCallsAfterLogin != 0 {
@@ -5235,12 +5878,13 @@ func TestListExplainsRewrapLocationForUnusableRemoteKeys(t *testing.T) {
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
 		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
 			if r.URL.Query().Get("includeSecrets") != "1" {
 				t.Fatalf("list actions should request remote secret metadata, got %s", r.URL.RawQuery)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"activeOrgId":   "org_oclan",
-				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan"}},
 				"secrets": []map[string]any{
 					{"id": "sec_needs_rewrap", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "LOCAL_NEEDS_REWRAP", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": false, "currentDeviceId": "dev_oclan"},
 					{"id": "sec_unwrapped", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "REMOTE_ONLY_UNWRAPPED", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": false, "currentDeviceId": "dev_oclan"},
@@ -5270,22 +5914,23 @@ func TestListExplainsRewrapLocationForUnusableRemoteKeys(t *testing.T) {
 
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"list"}); code != 0 {
+	if code := app.Run([]string{"list", "--workspace", "oclan-co"}); code != 0 {
 		t.Fatalf("list failed: %s", errb.String())
 	}
 	all := out.String()
 	for _, expected := range []string{
 		"LOCAL_NEEDS_REWRAP", "synced,writable", "needs rewrap",
 		"REMOTE_ONLY_UNWRAPPED", "remote-only,writable", "unwrapped",
-		"REMOTE_NOT_TRUSTED", "remote-only,writable", "not trusted",
 		"Next:",
 		"run asiri rewrap --workspace oclan-co here",
 		"run asiri rewrap --workspace oclan-co on a device where these secrets are wrapped, then run asiri pull --workspace oclan-co here",
-		"run asiri device trust --workspace asiri-dev before pulling",
 	} {
 		if !strings.Contains(all, expected) {
 			t.Fatalf("list output missing %q: %s", expected, all)
 		}
+	}
+	if strings.Contains(all, "REMOTE_NOT_TRUSTED") {
+		t.Fatalf("workspace-scoped list included another workspace: %s", all)
 	}
 }
 
@@ -5394,20 +6039,21 @@ func TestRemoteSecretDeleteMarksActiveRemoteVersionDeleted(t *testing.T) {
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
 		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
 			if r.Header.Get("authorization") != "Bearer at_delete" {
 				t.Fatalf("unexpected workspace overview auth header: %s", r.Header.Get("authorization"))
 			}
 			if r.URL.Query().Get("includeSecrets") != "1" {
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"activeOrgId":   "org_oclan",
-					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan"}},
 				})
 				return
 			}
 			workspaceOverviewSeen = true
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"activeOrgId":   "org_oclan",
-				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan"}},
 				"secrets": []map[string]any{
 					{"id": "sec_delete", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "PUSHED", "version": 2, "status": "active", "canWrite": true},
 					{"id": "sec_other", "orgId": "org_other", "workspaceSlug": "other-co", "scope": "other-co/local/asiri", "name": "PUSHED", "version": 1, "status": "active", "canWrite": true},
@@ -5425,7 +6071,7 @@ func TestRemoteSecretDeleteMarksActiveRemoteVersionDeleted(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
 			}
-			if body["createdByDeviceId"] != "dev_oclan" || body["version"] != float64(2) {
+			if body["orgId"] != "org_oclan" || body["createdByDeviceId"] != "dev_oclan" || body["version"] != float64(2) {
 				t.Fatalf("preflight request used wrong body: %#v", body)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -5443,11 +6089,8 @@ func TestRemoteSecretDeleteMarksActiveRemoteVersionDeleted(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
 			}
-			if body["createdByDeviceId"] != "dev_oclan" {
-				t.Fatalf("delete request used wrong device id: %#v", body)
-			}
-			if body["version"] != float64(2) {
-				t.Fatalf("delete request used wrong version: %#v", body)
+			if body["orgId"] != "org_oclan" || body["createdByDeviceId"] != "dev_oclan" || body["version"] != float64(2) {
+				t.Fatalf("delete request used wrong body: %#v", body)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"id": "sec_delete", "orgId": "org_oclan", "scope": "oclan-co/local/asiri", "name": "PUSHED", "version": 2, "status": "deleted",
@@ -5539,23 +6182,31 @@ func TestRemoteSecretDeleteConfirmationAndPathGuards(t *testing.T) {
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
 		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
 			if r.URL.Query().Get("includeSecrets") != "1" {
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"activeOrgId":   "org_oclan",
-					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan"}},
 				})
 				return
 			}
 			overviewCount++
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"activeOrgId":   "org_oclan",
-				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan"}},
 				"secrets": []map[string]any{
 					{"id": "sec_confirm", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "PUSHED", "version": 1, "status": "active", "canWrite": true},
 				},
 			})
 		case "/v1/secrets/sec_confirm/delete":
 			deleteCount++
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["orgId"] != "org_oclan" || body["createdByDeviceId"] != "dev_oclan" || body["version"] != float64(1) {
+				t.Fatalf("confirmed delete request used wrong body: %#v", body)
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"id": "sec_confirm", "orgId": "org_oclan", "scope": "oclan-co/local/asiri", "name": "PUSHED", "version": 1, "status": "deleted",
 			})
@@ -5656,10 +6307,11 @@ func TestRemoteSecretRestoreRestoresDeletedRemoteVersion(t *testing.T) {
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
 		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
 			if r.URL.Query().Get("includeSecrets") != "1" {
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"activeOrgId":   "org_oclan",
-					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan"}},
 				})
 				return
 			}
@@ -5668,7 +6320,7 @@ func TestRemoteSecretRestoreRestoresDeletedRemoteVersion(t *testing.T) {
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"activeOrgId":   "org_oclan",
-				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan"}},
 				"secrets": []map[string]any{
 					{"id": "sec_restore", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "PUSHED", "version": 2, "status": "deleted", "canWrite": true},
 				},
@@ -5679,7 +6331,7 @@ func TestRemoteSecretRestoreRestoresDeletedRemoteVersion(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
 			}
-			if body["createdByDeviceId"] != "dev_oclan" || body["version"] != float64(2) {
+			if body["orgId"] != "org_oclan" || body["createdByDeviceId"] != "dev_oclan" || body["version"] != float64(2) {
 				t.Fatalf("restore request used wrong body: %#v", body)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -5779,13 +6431,13 @@ func TestRemoteSecretDeleteFailureModes(t *testing.T) {
 					if r.URL.Query().Get("includeSecrets") != "1" {
 						_ = json.NewEncoder(w).Encode(map[string]any{
 							"activeOrgId":   "org_oclan",
-							"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+							"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan"}},
 						})
 						return
 					}
 					_ = json.NewEncoder(w).Encode(map[string]any{
 						"activeOrgId":   "org_oclan",
-						"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+						"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan"}},
 						"secrets":       tc.secrets,
 					})
 				case "/v1/secrets/sec_forbidden/delete":
@@ -5862,10 +6514,11 @@ func TestRemoteSecretBulkDeleteOnlyRemoteOnlyUnwrapped(t *testing.T) {
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
 		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
 			if r.URL.Query().Get("includeSecrets") != "1" {
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"activeOrgId":   "org_oclan",
-					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan"}},
 				})
 				return
 			}
@@ -5873,7 +6526,7 @@ func TestRemoteSecretBulkDeleteOnlyRemoteOnlyUnwrapped(t *testing.T) {
 			unwrapped := false
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"activeOrgId":   "org_oclan",
-				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan"}},
 				"secrets": []map[string]any{
 					{"id": "sec_candidate_a", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/local/asiri", "name": "GHOST_A", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": unwrapped},
 					{"id": "sec_candidate_b", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/prod", "name": "GHOST_B", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": unwrapped},
@@ -5888,11 +6541,8 @@ func TestRemoteSecretBulkDeleteOnlyRemoteOnlyUnwrapped(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
 			}
-			if body["createdByDeviceId"] != "dev_oclan" {
-				t.Fatalf("bulk preflight used wrong device id: %#v", body)
-			}
-			if body["version"] != float64(1) {
-				t.Fatalf("bulk preflight used wrong version: %#v", body)
+			if body["orgId"] != "org_oclan" || body["createdByDeviceId"] != "dev_oclan" || body["version"] != float64(1) {
+				t.Fatalf("bulk preflight used wrong body: %#v", body)
 			}
 			id := strings.TrimPrefix(strings.TrimSuffix(r.URL.Path, "/delete-preflight"), "/v1/secrets/")
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -5903,11 +6553,8 @@ func TestRemoteSecretBulkDeleteOnlyRemoteOnlyUnwrapped(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
 			}
-			if body["createdByDeviceId"] != "dev_oclan" {
-				t.Fatalf("bulk delete used wrong device id: %#v", body)
-			}
-			if body["version"] != float64(1) {
-				t.Fatalf("bulk delete used wrong version: %#v", body)
+			if body["orgId"] != "org_oclan" || body["createdByDeviceId"] != "dev_oclan" || body["version"] != float64(1) {
+				t.Fatalf("bulk delete used wrong body: %#v", body)
 			}
 			id := strings.TrimPrefix(strings.TrimSuffix(r.URL.Path, "/delete"), "/v1/secrets/")
 			deletedIDs = append(deletedIDs, id)
@@ -5993,17 +6640,18 @@ func TestRemoteRemoveDeletesRemoteOnlyRecordsWithToken(t *testing.T) {
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
 		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
 			if r.URL.Query().Get("includeSecrets") != "1" {
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"activeOrgId":   "org_oclan",
-					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan"}},
 				})
 				return
 			}
 			wrapped := true
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"activeOrgId":   "org_oclan",
-				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan"}},
 				"secrets": []map[string]any{
 					{"id": "sec_wrapped_remote_only", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/prod", "name": "WRAPPED_ONLY", "version": 3, "status": "active", "canWrite": true, "wrappedToCurrentDevice": wrapped},
 				},
@@ -6013,7 +6661,7 @@ func TestRemoteRemoveDeletesRemoteOnlyRecordsWithToken(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
 			}
-			if body["createdByDeviceId"] != "dev_oclan" || body["version"] != float64(3) {
+			if body["orgId"] != "org_oclan" || body["createdByDeviceId"] != "dev_oclan" || body["version"] != float64(3) {
 				t.Fatalf("remote rm used wrong preflight body: %#v", body)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -6024,7 +6672,7 @@ func TestRemoteRemoveDeletesRemoteOnlyRecordsWithToken(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
 			}
-			if body["createdByDeviceId"] != "dev_oclan" || body["version"] != float64(3) {
+			if body["orgId"] != "org_oclan" || body["createdByDeviceId"] != "dev_oclan" || body["version"] != float64(3) {
 				t.Fatalf("remote rm used wrong delete body: %#v", body)
 			}
 			deleteCount++
@@ -6118,17 +6766,18 @@ func TestRemoteSecretBulkDeletePreflightsBeforeMutation(t *testing.T) {
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
 		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
 			if r.URL.Query().Get("includeSecrets") != "1" {
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"activeOrgId":   "org_oclan",
-					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan"}},
 				})
 				return
 			}
 			unwrapped := false
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"activeOrgId":   "org_oclan",
-				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan"}},
 				"secrets": []map[string]any{
 					{"id": "sec_preflight_a", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/prod", "name": "A", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": unwrapped},
 					{"id": "sec_preflight_b", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/prod", "name": "B", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": unwrapped},
@@ -6138,6 +6787,9 @@ func TestRemoteSecretBulkDeletePreflightsBeforeMutation(t *testing.T) {
 			var body map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
+			}
+			if body["orgId"] != "org_oclan" || body["createdByDeviceId"] != "dev_oclan" || body["version"] != float64(1) {
+				t.Fatalf("bulk preflight request used wrong body: %#v", body)
 			}
 			id := strings.TrimPrefix(strings.TrimSuffix(r.URL.Path, "/delete-preflight"), "/v1/secrets/")
 			if id == "sec_preflight_b" {
@@ -6150,6 +6802,9 @@ func TestRemoteSecretBulkDeletePreflightsBeforeMutation(t *testing.T) {
 			var body map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
+			}
+			if body["orgId"] != "org_oclan" || body["createdByDeviceId"] != "dev_oclan" || body["version"] != float64(1) {
+				t.Fatalf("bulk delete request used wrong body: %#v", body)
 			}
 			id := strings.TrimPrefix(strings.TrimSuffix(r.URL.Path, "/delete"), "/v1/secrets/")
 			actualDeletes++
@@ -6230,36 +6885,48 @@ func TestRemoteSecretBulkDeleteRestoresEarlierDeletesWhenLaterDeleteFails(t *tes
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
 		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
 			if r.URL.Query().Get("includeSecrets") != "1" {
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"activeOrgId":   "org_oclan",
-					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan"}},
 				})
 				return
 			}
 			unwrapped := false
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"activeOrgId":   "org_oclan",
-				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan"}},
 				"secrets": []map[string]any{
 					{"id": "sec_rollback_a", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/prod", "name": "A", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": unwrapped},
 					{"id": "sec_rollback_b", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/prod", "name": "B", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": unwrapped},
 				},
 			})
 		case "/v1/secrets/sec_rollback_a/delete-preflight", "/v1/secrets/sec_rollback_b/delete-preflight":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["orgId"] != "org_oclan" || body["createdByDeviceId"] != "dev_oclan" || body["version"] != float64(1) {
+				t.Fatalf("rollback preflight request used wrong body: %#v", body)
+			}
 			id := strings.TrimPrefix(strings.TrimSuffix(r.URL.Path, "/delete-preflight"), "/v1/secrets/")
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "orgId": "org_oclan", "scope": "oclan-co/prod", "name": strings.TrimPrefix(id, "sec_rollback_"), "version": 1, "status": "active"})
 		case "/v1/secrets/sec_rollback_a/delete":
+			assertSecretMutationBody(t, r, "org_oclan", "dev_oclan", 1)
 			deletedIDs = append(deletedIDs, "sec_rollback_a")
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": "sec_rollback_a", "orgId": "org_oclan", "scope": "oclan-co/prod", "name": "A", "version": 1, "status": "deleted"})
 		case "/v1/secrets/sec_rollback_b/delete":
+			assertSecretMutationBody(t, r, "org_oclan", "dev_oclan", 1)
 			deletedIDs = append(deletedIDs, "sec_rollback_b")
 			w.WriteHeader(http.StatusInternalServerError)
 			_ = json.NewEncoder(w).Encode(map[string]any{"error": "delete_failed", "message": "delete failed after preflight"})
 		case "/v1/secrets/sec_rollback_a/restore":
+			assertSecretMutationBody(t, r, "org_oclan", "dev_oclan", 1)
 			restoredIDs = append(restoredIDs, "sec_rollback_a")
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": "sec_rollback_a", "orgId": "org_oclan", "scope": "oclan-co/prod", "name": "A", "version": 1, "status": "active"})
 		case "/v1/secrets/sec_rollback_b/restore":
+			assertSecretMutationBody(t, r, "org_oclan", "dev_oclan", 1)
 			restoredIDs = append(restoredIDs, "sec_rollback_b")
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": "sec_rollback_b", "orgId": "org_oclan", "scope": "oclan-co/prod", "name": "B", "version": 1, "status": "active"})
 		default:
@@ -6329,17 +6996,18 @@ func TestRemoteSecretBulkDeleteConfirmation(t *testing.T) {
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
 		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
 			if r.URL.Query().Get("includeSecrets") != "1" {
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"activeOrgId":   "org_oclan",
-					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+					"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan"}},
 				})
 				return
 			}
 			unwrapped := false
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"activeOrgId":   "org_oclan",
-				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true}},
+				"organizations": []map[string]any{{"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan"}},
 				"secrets": []map[string]any{
 					{"id": "sec_confirm_bulk", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "scope": "oclan-co/prod", "name": "GHOST", "version": 1, "status": "active", "canWrite": true, "wrappedToCurrentDevice": unwrapped},
 				},
@@ -6349,7 +7017,7 @@ func TestRemoteSecretBulkDeleteConfirmation(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
 			}
-			if body["createdByDeviceId"] != "dev_oclan" || body["version"] != float64(1) {
+			if body["orgId"] != "org_oclan" || body["createdByDeviceId"] != "dev_oclan" || body["version"] != float64(1) {
 				t.Fatalf("bulk preflight used wrong body: %#v", body)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -6359,6 +7027,9 @@ func TestRemoteSecretBulkDeleteConfirmation(t *testing.T) {
 			var body map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
+			}
+			if body["orgId"] != "org_oclan" || body["createdByDeviceId"] != "dev_oclan" || body["version"] != float64(1) {
+				t.Fatalf("confirmed bulk delete used wrong body: %#v", body)
 			}
 			deleteCount++
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -6518,7 +7189,7 @@ func TestWorkspaceListAndUseDoesNotBindLocalPrefixBeforePushOrSync(t *testing.T)
 						"canWrite": true,
 					}},
 				},
-				"activeWorkspace": map[string]any{
+				"workspace": map[string]any{
 					"id":       "org_personal",
 					"slug":     "peter-dev",
 					"canWrite": false,
@@ -6616,6 +7287,7 @@ func TestWorkspaceListUsesCombinedWorkspaceOverview(t *testing.T) {
 		w.Header().Set("content-type", "application/json")
 		switch r.URL.Path {
 		case "/v1/orgs":
+			assertWorkspaceOverviewTarget(t, r, "")
 			if r.URL.Query().Get("includeSecrets") != "1" {
 				t.Fatalf("workspace list should request combined overview, got %s", r.URL.RawQuery)
 			}
@@ -6796,6 +7468,7 @@ func TestDeviceStatusShowsTrustAndKeyCoverage(t *testing.T) {
 			if r.URL.Query().Get("includeSecrets") != "1" {
 				t.Fatalf("device status should request workspace secret metadata, got %s", r.URL.RawQuery)
 			}
+			assertWorkspaceOverviewTarget(t, r, "oclan-co")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"activeOrgId": "org_oclan",
 				"organizations": []map[string]any{
@@ -6829,18 +7502,21 @@ func TestDeviceStatusShowsTrustAndKeyCoverage(t *testing.T) {
 	}
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"device", "status"}); code != 0 {
+	if code := app.Run([]string{"device", "status", "--workspace", "oclan-co"}); code != 0 {
 		t.Fatalf("device status failed: %s", errb.String())
 	}
 	status := out.String()
-	for _, expected := range []string{"This device: qa-laptop", "WORKSPACE", "THIS DEVICE", "ACCOUNT WRITE", "KEYS", "NEXT", "oclan-co", "ready", "asiri-dev", "not trusted", "asiri device trust --workspace asiri-dev --origin " + server.URL, "recallstack-com", "unwrapped", "rewrap on a device with local keys"} {
+	for _, expected := range []string{"This device: qa-laptop", "WORKSPACE", "THIS DEVICE", "ACCOUNT WRITE", "KEYS", "NEXT", "oclan-co", "ready"} {
 		if !strings.Contains(status, expected) {
 			t.Fatalf("device status output missing %q: %s", expected, status)
 		}
 	}
+	if strings.Contains(status, "asiri-dev") || strings.Contains(status, "recallstack-com") {
+		t.Fatalf("device status included unrequested workspaces: %s", status)
+	}
 }
 
-func TestDeviceTrustAllStartsTargetedApprovals(t *testing.T) {
+func TestDeviceTrustTargetsOneWorkspaceWithoutChangingSession(t *testing.T) {
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")
 	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
@@ -6849,6 +7525,7 @@ func TestDeviceTrustAllStartsTargetedApprovals(t *testing.T) {
 	}
 	targetedStarts := []string{}
 	restoreSeen := false
+	legacyCleanupSeen := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "application/json")
 		switch r.URL.Path {
@@ -6879,11 +7556,14 @@ func TestDeviceTrustAllStartsTargetedApprovals(t *testing.T) {
 				"interval":                0,
 			})
 		case "/v1/auth/device-code/token":
-			var body map[string]string
+			var body map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
 			}
 			if body["deviceCode"] == "dc_asiri" {
+				if body["trustOnly"] != true {
+					t.Fatalf("device trust must request a trust-only claim: %#v", body)
+				}
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"status":           "approved",
 					"orgId":            "org_asiri",
@@ -6896,6 +7576,9 @@ func TestDeviceTrustAllStartsTargetedApprovals(t *testing.T) {
 					"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 				})
 				return
+			}
+			if _, ok := body["trustOnly"]; ok {
+				t.Fatalf("account login must not request a trust-only claim: %#v", body)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"status":           "approved",
@@ -6919,6 +7602,16 @@ func TestDeviceTrustAllStartsTargetedApprovals(t *testing.T) {
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
+		case "/v1/auth/session/logout":
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["refreshToken"] != "rt_asiri" || r.Header.Get("x-asiri-device") != "dev_asiri" {
+				t.Fatalf("legacy cleanup targeted the wrong session: body=%#v device=%s", body, r.Header.Get("x-asiri-device"))
+			}
+			legacyCleanupSeen = true
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "logged_out"})
 		case "/v1/orgs":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"activeOrgId": "org_oclan",
@@ -6967,26 +7660,224 @@ func TestDeviceTrustAllStartsTargetedApprovals(t *testing.T) {
 			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
 		}
 	}
+	before, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeAccess, err := before.ControlPlaneAccessToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeRefresh, err := before.ControlPlaneRefreshToken()
+	if err != nil {
+		t.Fatal(err)
+	}
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"device", "trust", "--all"}); code != 0 {
-		t.Fatalf("device trust --all failed: %s", errb.String())
+	if code := app.Run([]string{"device", "trust", "--workspace", "asiri-dev"}); code != 0 {
+		t.Fatalf("device trust failed: %s", errb.String())
 	}
 	if !reflect.DeepEqual(targetedStarts, []string{"", "asiri-dev"}) {
 		t.Fatalf("unexpected device-code targets: %#v", targetedStarts)
 	}
-	if !restoreSeen {
-		t.Fatal("expected original workspace session to be restored")
+	if restoreSeen {
+		t.Fatal("device trust must not switch or restore sessions")
+	}
+	if !legacyCleanupSeen {
+		t.Fatal("device trust should revoke a temporary session returned by a legacy backend")
 	}
 	output := out.String()
-	for _, expected := range []string{"oclan-co", "trusted", "asiri-dev", "eligible", "recallstack-com", "ask owner to approve", "Trust this device for workspace asiri-dev", "✓ This device is trusted for workspace asiri-dev"} {
+	for _, expected := range []string{"Trust this device for workspace asiri-dev", "✓ This device is trusted for workspace asiri-dev"} {
 		if !strings.Contains(output, expected) {
-			t.Fatalf("device trust --all output missing %q: %s", expected, output)
+			t.Fatalf("device trust output missing %q: %s", expected, output)
 		}
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State.ControlPlane == nil || st.State.ControlPlane.WorkspaceID != "org_oclan" {
+		t.Fatalf("device trust changed the account session: %#v", st.State.ControlPlane)
+	}
+	afterAccess, err := st.ControlPlaneAccessToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterRefresh, err := st.ControlPlaneRefreshToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterAccess != beforeAccess || afterRefresh != beforeRefresh {
+		t.Fatal("device trust replaced the stored account credentials")
 	}
 }
 
-func TestPullAllPrintsRowsSkipsIneligibleAndRestoresWorkspace(t *testing.T) {
+func TestDeviceTrustClaimUsesNewBackendWithoutSessionCleanup(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logoutSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/token":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["deviceCode"] != "dc_trust_only" || body["trustOnly"] != true {
+				t.Fatalf("unexpected trust-only claim: %#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":        "approved",
+				"sessionIssued": false,
+				"orgId":         "org_target",
+				"workspaceSlug": "target",
+				"userId":        "usr_owner",
+				"deviceId":      "dev_target",
+			})
+		case "/v1/auth/session/logout":
+			logoutSeen = true
+			http.Error(w, "unexpected logout", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	result, err := pollDeviceCodeTrust(st, server.URL, deviceCodeStartResponse{DeviceCode: "dc_trust_only", ExpiresIn: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if logoutSeen || result.SessionIssued == nil || *result.SessionIssued || result.AccessToken != "" || result.RefreshToken != "" {
+		t.Fatalf("new backend trust claim created cleanup work: result=%#v logout=%v", result, logoutSeen)
+	}
+}
+
+func TestDeviceTrustRejectsApprovalForDifferentAccount(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode": "dc_other_user", "userCode": "OTHR-1234",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=OTHR-1234",
+				"expiresIn":               30, "interval": 0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "approved", "sessionIssued": false,
+				"orgId": "org_target", "workspaceSlug": "target",
+				"userId": "usr_other", "deviceId": "dev_target",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	if err := st.LinkControlPlaneForDevice(server.URL, "org_source", "source", "usr_expected", "dev_source", device.ID, "at", "rt", 3600, time.Now().UTC().Add(24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := app.trustDeviceInWorkspace(st, server.URL, "at", "target", *device); err == nil || !strings.Contains(err.Error(), "different account") {
+		t.Fatalf("cross-account device trust should fail, got %v", err)
+	}
+}
+
+func TestDeviceTrustStopsWhenLegacySessionCleanupFails(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":        "approved",
+				"orgId":         "org_target",
+				"workspaceSlug": "target",
+				"userId":        "usr_owner",
+				"deviceId":      "dev_target",
+				"accessToken":   "at_temporary",
+				"refreshToken":  "rt_temporary",
+			})
+		case "/v1/auth/session/logout":
+			if r.Header.Get("x-asiri-device") != "dev_target" {
+				t.Fatalf("temporary cleanup used the wrong device: %s", r.Header.Get("x-asiri-device"))
+			}
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "cleanup_unavailable"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	if err := st.LinkControlPlaneForDevice(server.URL, "org_original", "original", "usr_owner", "dev_original", device.ID, "at_original", "rt_original", 3600, time.Now().UTC().Add(7*24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = pollDeviceCodeTrust(st, server.URL, deviceCodeStartResponse{DeviceCode: "dc_legacy_cleanup", ExpiresIn: 5})
+	if err == nil || !strings.Contains(err.Error(), "temporary server session could not be revoked") {
+		t.Fatalf("expected cleanup failure, got %v", err)
+	}
+	accessToken, accessErr := st.ControlPlaneAccessToken()
+	refreshToken, refreshErr := st.ControlPlaneRefreshToken()
+	if accessErr != nil || refreshErr != nil || accessToken != "at_original" || refreshToken != "rt_original" {
+		t.Fatalf("cleanup failure changed the original credentials: access=%q refresh=%q errors=%v/%v", accessToken, refreshToken, accessErr, refreshErr)
+	}
+}
+
+func TestPullTargetsOneWorkspaceWithoutSwitchingSession(t *testing.T) {
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")
 	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
@@ -7047,9 +7938,9 @@ func TestPullAllPrintsRowsSkipsIneligibleAndRestoresWorkspace(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"activeOrgId": "org_oclan",
 				"organizations": []map[string]any{
-					{"id": "org_oclan", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true},
-					{"id": "org_asiri", "name": "Asiri Dev", "slug": "asiri-dev", "ownerUserId": "usr_owner", "role": "owner", "canPull": false, "canWrite": true},
-					{"id": "org_recall", "name": "Recallstack", "slug": "recallstack-com", "ownerUserId": "usr_other", "role": "member", "canPull": true, "canWrite": false},
+					{"id": "org_oclan", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan"},
+					{"id": "org_asiri", "name": "Asiri Dev", "slug": "asiri-dev", "ownerUserId": "usr_owner", "role": "owner", "canPull": false, "canWrite": true, "currentDeviceTrusted": false},
+					{"id": "org_recall", "name": "Recallstack", "slug": "recallstack-com", "ownerUserId": "usr_other", "role": "member", "canPull": true, "canWrite": false, "currentDeviceTrusted": true, "currentDeviceId": "dev_recall"},
 				},
 			})
 		case "/v1/auth/session/switch":
@@ -7105,7 +7996,7 @@ func TestPullAllPrintsRowsSkipsIneligibleAndRestoresWorkspace(t *testing.T) {
 					t.Fatalf("unexpected active sync request auth=%s query=%s", auth, r.URL.RawQuery)
 				}
 			} else if orgID == "org_recall" {
-				if auth != "Bearer at_recall" || deviceID != "dev_recall" {
+				if auth != "Bearer at_oclan" || deviceID != "dev_recall" {
 					t.Fatalf("unexpected recall sync request auth=%s query=%s", auth, r.URL.RawQuery)
 				}
 			} else {
@@ -7138,26 +8029,26 @@ func TestPullAllPrintsRowsSkipsIneligibleAndRestoresWorkspace(t *testing.T) {
 	}
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"pull"}); code != 0 {
+	if code := app.Run([]string{"pull", "--workspace", "recallstack-com"}); code != 0 {
 		t.Fatalf("pull failed with code %d stderr=%s stdout=%s", code, errb.String(), out.String())
 	}
 	allOutput := out.String()
-	for _, expected := range []string{"WORKSPACE", "oclan-co", "pulled", "asiri-dev", "skipped", "this device is not trusted for this workspace", "recallstack-com"} {
+	for _, expected := range []string{"WORKSPACE", "pulled", "recallstack-com"} {
 		if !strings.Contains(allOutput, expected) {
 			t.Fatalf("pull output missing %q: %s", expected, allOutput)
 		}
 	}
-	if !switchRecallSeen || switchAsiriSeen || restoreSeen {
+	if switchRecallSeen || switchAsiriSeen || restoreSeen {
 		t.Fatalf("unexpected switch behavior: recall=%v asiri=%v restore=%v", switchRecallSeen, switchAsiriSeen, restoreSeen)
 	}
 
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"pull", "--workspace", "asiri-dev"}); code != 0 {
-		t.Fatalf("explicit ineligible pull should exit zero, stderr=%s stdout=%s", errb.String(), out.String())
+	if code := app.Run([]string{"pull", "--workspace", "asiri-dev"}); code == 0 {
+		t.Fatalf("untrusted workspace pull should fail, stderr=%s stdout=%s", errb.String(), out.String())
 	}
-	if !strings.Contains(out.String(), "asiri-dev") || !strings.Contains(out.String(), "failed") {
-		t.Fatalf("explicit ineligible pull output unexpected: %s", out.String())
+	if !strings.Contains(errb.String(), "this device is not trusted for workspace asiri-dev") {
+		t.Fatalf("explicit ineligible pull error unexpected: %s", errb.String())
 	}
 }
 
@@ -7255,7 +8146,7 @@ func TestRunDirectAsiriRefUsesCommandBasenamePolicy(t *testing.T) {
 	}
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"audit", "tail", "--limit", "5"}); code != 0 {
+	if code := app.Run([]string{"audit", "tail", "--workspace", "qa", "--limit", "5"}); code != 0 {
 		t.Fatalf("audit failed: %s", errb.String())
 	}
 	if !strings.Contains(out.String(), "secret_unsafe_argv_injected") || !strings.Contains(out.String(), "unsafe argv materialization") {
@@ -7307,7 +8198,7 @@ func TestRunExplicitEnvMappingUsesCommandBasenamePolicy(t *testing.T) {
 	}
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"audit", "tail", "--limit", "5"}); code != 0 {
+	if code := app.Run([]string{"audit", "tail", "--workspace", "qa", "--limit", "5"}); code != 0 {
 		t.Fatalf("audit failed: %s", errb.String())
 	}
 	if !strings.Contains(out.String(), "wrangler") || !strings.Contains(out.String(), "secret_injected") {
@@ -7358,6 +8249,7 @@ func TestRuntimeAuditSyncReportsRuntimeLabelMetadata(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
 				t.Fatal(err)
 			}
+			assertAuditBatchWorkspace(t, batch, "org_runtime")
 			uploaded = append(uploaded, batch)
 			w.WriteHeader(http.StatusCreated)
 			acks := []runtimeAuditAck{}
@@ -7579,6 +8471,7 @@ func TestRuntimeAuditBestEffortSyncIsolatesWorkspaceFailures(t *testing.T) {
 				t.Fatal("empty audit batch")
 			}
 			orgID := batch.Events[0].OrgID
+			assertAuditBatchWorkspace(t, batch, orgID)
 			for _, event := range batch.Events {
 				if event.OrgID != orgID {
 					t.Fatalf("best-effort sync should upload one workspace per batch: %#v", batch.Events)
@@ -7705,6 +8598,7 @@ func TestStrictEnvelopeAuditAckGatesRuntimeRelease(t *testing.T) {
 					if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
 						t.Fatal(err)
 					}
+					assertAuditBatchWorkspace(t, batch, "org_runtime")
 					uploadedStrictEvents = append(uploadedStrictEvents, batch.Events...)
 					response := runtimeAuditBatchResponse{}
 					if tc.ack {
@@ -7855,6 +8749,7 @@ func TestStrictEnvelopeAuditAckRequiresCompleteBatchBeforeRuntimeRelease(t *test
 			if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
 				t.Fatal(err)
 			}
+			assertAuditBatchWorkspace(t, batch, "org_runtime")
 			batchSizes = append(batchSizes, len(batch.Events))
 			uploadedStrictEvents = append(uploadedStrictEvents, batch.Events...)
 			response := runtimeAuditBatchResponse{}
@@ -7981,6 +8876,7 @@ func TestStrictEnvelopeAuditAckFailureDoesNotAuditBufferedPeers(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
 				t.Fatal(err)
 			}
+			assertAuditBatchWorkspace(t, batch, "org_runtime")
 			uploadedStrictEvents = append(uploadedStrictEvents, batch.Events...)
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(runtimeAuditBatchResponse{})
@@ -8083,6 +8979,7 @@ func TestStrictEnvelopeAuditAckAllowsDirectHumanRead(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
 				t.Fatal(err)
 			}
+			assertAuditBatchWorkspace(t, batch, "org_runtime")
 			response := runtimeAuditBatchResponse{}
 			for index, event := range batch.Events {
 				if event.OrgID != "org_runtime" {
@@ -8311,7 +9208,7 @@ func TestRunExplicitEnvMappingDeniesMissingDerivedCommandGrant(t *testing.T) {
 	}
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"audit", "tail", "--limit", "5"}); code != 0 {
+	if code := app.Run([]string{"audit", "tail", "--workspace", "qa", "--limit", "5"}); code != 0 {
 		t.Fatalf("audit failed: %s", errb.String())
 	}
 	if !strings.Contains(out.String(), "wrangler") || !strings.Contains(out.String(), "secret_injected") || !strings.Contains(out.String(), "denied") {
@@ -8842,4 +9739,45 @@ func containsString(values []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func assertSecretMutationBody(t testing.TB, r *http.Request, orgID, deviceID string, version int) {
+	t.Helper()
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body["orgId"] != orgID || body["createdByDeviceId"] != deviceID || body["version"] != float64(version) {
+		t.Fatalf("secret mutation request used wrong body: %#v", body)
+	}
+}
+
+func assertWorkspaceOverviewTarget(t testing.TB, r *http.Request, workspace string) {
+	t.Helper()
+	if got := r.URL.Query().Get("workspace"); got != workspace {
+		t.Fatalf("workspace overview used wrong target: got %q want %q; query=%s", got, workspace, r.URL.RawQuery)
+	}
+}
+
+func assertAuditBatchWorkspace(t testing.TB, batch runtimeAuditBatchRequest, orgID string) {
+	t.Helper()
+	if batch.OrgID != orgID {
+		t.Fatalf("audit batch used wrong workspace: got %q want %q", batch.OrgID, orgID)
+	}
+	for _, event := range batch.Events {
+		if event.OrgID != orgID {
+			t.Fatalf("audit batch mixed workspaces: batch=%q event=%q", batch.OrgID, event.OrgID)
+		}
+	}
+}
+
+func assertRequestWorkspace(t testing.TB, r *http.Request, orgID string) {
+	t.Helper()
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body["orgId"] != orgID {
+		t.Fatalf("request used wrong workspace: got %#v want %q", body["orgId"], orgID)
+	}
 }

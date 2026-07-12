@@ -44,7 +44,7 @@ type App struct {
 	In  io.Reader
 }
 
-var Version = "0.1.32"
+var Version = "0.1.33"
 
 var defaultControlPlaneOrigin = "http://127.0.0.1:4173"
 
@@ -234,7 +234,7 @@ func (a App) helpFor(path []string) int {
 	case "setup":
 		fmt.Fprint(a.Out, "Usage: asiri setup <command>\n\nCommands:\n  doctor  Diagnose setup readiness and print next safe steps.\n")
 	case "setup doctor":
-		fmt.Fprint(a.Out, "Usage: asiri setup doctor [--workspace <slug>...]\n\nChecks local initialization, control-plane auth, current-device trust, key coverage, and recovery status. It does not create devices, change trust, rewrap keys, or write secrets.\n")
+		fmt.Fprint(a.Out, "Usage: asiri setup doctor --workspace <slug>\n\nChecks local initialization, account authentication, device trust, key coverage, and recovery status for one explicit workspace. It does not create devices, change trust, rewrap keys, or write secrets.\n")
 	case "version":
 		fmt.Fprint(a.Out, "Usage: asiri version\n       asiri --version\n\nPrints the CLI version.\n")
 	case "login":
@@ -242,7 +242,7 @@ func (a App) helpFor(path []string) int {
 	case "logout":
 		fmt.Fprint(a.Out, "Usage: asiri logout\n\nRevokes the local control-plane session and removes local session tokens.\n")
 	case "whoami":
-		fmt.Fprint(a.Out, "Usage: asiri whoami\n\nShows the signed-in control-plane user, active workspace session, and current local device.\n")
+		fmt.Fprint(a.Out, "Usage: asiri whoami\n\nShows the signed-in control-plane identity and authentication device. User sessions do not select a workspace.\n")
 	case "workspace":
 		fmt.Fprint(a.Out, "Usage: asiri workspace <command>\n\nCommands:\n  list   Show visible workspaces, role, device trust, account write access, and id.\n")
 	case "workspace list":
@@ -262,31 +262,31 @@ func (a App) helpFor(path []string) int {
 	case "push":
 		fmt.Fprint(a.Out, "Usage: asiri push --workspace <slug> [--scope <scope>...] [--secret <scope/name>...] [--version <n>] [--dry-run] [--yes]\n\nUploads new local encrypted versions for the specified workspace. Existing matching versions are skipped, older local versions are skipped with a warning, and same-version mismatches fail as conflicts. Use --scope for one envelope, --secret for one exact secret, and --version only with one --secret. Use short paths without the workspace prefix.\n")
 	case "pull":
-		fmt.Fprint(a.Out, "Usage: asiri pull [--force] [--workspace <slug>...]\n\nPulls encrypted remote secret versions into the local vault. Pull is import-only; it never uploads local-only secrets. Without --workspace, all eligible visible workspaces are pulled and ineligible workspaces are reported as skipped.\n")
+		fmt.Fprint(a.Out, "Usage: asiri pull --workspace <slug> [--force]\n\nPulls encrypted remote secret versions from one explicit workspace into the local vault. Pull is import-only; it never uploads local-only secrets.\n")
 	case "rewrap":
 		fmt.Fprint(a.Out, "Usage: asiri rewrap --workspace <slug>\n\nAdds missing wrapped-key recipients for trusted devices in the specified workspace.\n")
 	case "rekey":
 		fmt.Fprint(a.Out, "Usage: asiri rekey --workspace <slug> [--yes]\n\nRe-encrypts local secrets in the specified workspace with fresh scoped data keys, then pushes the new versions.\n")
 	case "recovery":
-		fmt.Fprint(a.Out, "Usage: asiri recovery <command>\n\nCommands:\n  setup    Create or replace a workspace recovery key.\n  restore  Restore recoverable workspace secrets to this trusted device.\n  status   Show recovery status for visible workspaces.\n")
+		fmt.Fprint(a.Out, "Usage: asiri recovery <command>\n\nCommands:\n  setup    Create or replace a workspace recovery key.\n  restore  Restore recoverable workspace secrets to this trusted device.\n  status   Show recovery status for one workspace.\n")
 	case "recovery setup":
 		fmt.Fprint(a.Out, "Usage: asiri recovery setup --workspace <slug> [--force] [--output-file <path>]\n\nCreates a recovery key for the specified workspace and stores recovery recipient metadata remotely.\n")
 	case "recovery restore":
 		fmt.Fprint(a.Out, "Usage: asiri recovery restore --workspace <slug> --stdin|--key-file <path> [--force]\n\nUses a recovery key to add this trusted device as a recipient for recoverable remote secrets in the specified workspace.\n")
 	case "recovery status":
-		fmt.Fprint(a.Out, "Usage: asiri recovery status [--workspace <slug>...]\n\nShows whether recovery is configured for visible workspaces.\n")
+		fmt.Fprint(a.Out, "Usage: asiri recovery status --workspace <slug>\n\nShows whether recovery is configured for one explicit workspace.\n")
 	case "device":
-		fmt.Fprint(a.Out, "Usage: asiri device <command>\n\nCommands:\n  name    Print the current local device name.\n  enroll  Add a local device record.\n  status  Show current-device trust and key coverage.\n  trust   Trust this device in one or more workspaces.\n  list    Show local or remote devices.\n  revoke  Revoke a local or remote device.\n")
+		fmt.Fprint(a.Out, "Usage: asiri device <command>\n\nCommands:\n  name    Print the current local device name.\n  enroll  Add a local device record.\n  status  Show current-device trust and key coverage.\n  trust   Trust this device in one workspace.\n  list    Show local or remote devices.\n  revoke  Revoke a local or remote device.\n")
 	case "device name":
 		fmt.Fprint(a.Out, "Usage: asiri device name\n\nPrints the current local device name.\n")
 	case "device enroll":
 		fmt.Fprint(a.Out, "Usage: asiri device enroll --name <device>\n\nCreates a new local device keypair and local trusted-device record.\n")
 	case "device list":
-		fmt.Fprint(a.Out, "Usage: asiri device list [--local|--remote] [--workspace <slug>...] [--include-revoked]\n\nLists remote devices in visible workspaces when linked to the control plane. Use --local to show only this machine's local device records. Revoked devices are hidden unless --include-revoked is set.\n")
+		fmt.Fprint(a.Out, "Usage: asiri device list --remote --workspace <slug> [--include-revoked]\n       asiri device list --local [--include-revoked]\n\nLists remote devices in one explicit workspace, or this machine's local device records. Revoked devices are hidden unless --include-revoked is set.\n")
 	case "device status":
-		fmt.Fprint(a.Out, "Usage: asiri device status [--workspace <slug>...]\n\nShows whether this device is trusted in visible workspaces and whether visible remote secrets are wrapped to it.\n")
+		fmt.Fprint(a.Out, "Usage: asiri device status --workspace <slug>\n\nShows whether this device is trusted in one explicit workspace and whether that workspace's remote secrets are wrapped to it.\n")
 	case "device trust":
-		fmt.Fprint(a.Out, "Usage: asiri device trust --workspace <slug> [--origin <url>]\n       asiri device trust --all\n\nStarts browser approval to trust this device in a workspace. --all walks every visible workspace where this account can approve devices.\n")
+		fmt.Fprint(a.Out, "Usage: asiri device trust --workspace <slug> [--origin <url>]\n\nStarts browser approval to trust this device in one explicit workspace without replacing the account session.\n")
 	case "device revoke":
 		fmt.Fprint(a.Out, "Usage: asiri device revoke <device>\n       asiri device revoke --remote --workspace <slug> <device>\n\nRevokes a local device record, or revokes a remote trusted device in the specified workspace.\n")
 	case "secret":
@@ -304,7 +304,7 @@ func (a App) helpFor(path []string) int {
 	case "get":
 		fmt.Fprint(a.Out, "Usage: asiri get --workspace <slug> <scope/name> [--agent <agent>]\n\nReads a local secret when policy allows raw read for the human user or named agent label. Use short paths without the workspace prefix.\n")
 	case "list":
-		fmt.Fprint(a.Out, "Usage: asiri list [filter] [--workspace <slug>...] [--local|--remote] [--status <status>] [--include-inactive]\n\nShows secret metadata only. Values are never printed by list. Without --workspace, visible workspaces are included. Inactive remote versions are hidden unless --include-inactive is set.\n")
+		fmt.Fprint(a.Out, "Usage: asiri list --workspace <slug> [filter] [--local|--remote] [--status <status>] [--include-inactive]\n\nShows secret metadata for one explicit workspace only. Values are never printed. Inactive remote versions are hidden unless --include-inactive is set.\n")
 	case "rotate":
 		fmt.Fprint(a.Out, "Usage: asiri rotate --workspace <slug> <scope/name> --stdin|--value-file <path>\n\nAdds a new local encrypted version for an existing secret. Use short paths without the workspace prefix.\n")
 	case "rm":
@@ -314,9 +314,9 @@ func (a App) helpFor(path []string) int {
 	case "deny":
 		fmt.Fprint(a.Out, "Usage: asiri deny --workspace <slug> <subject-label> <scope/*>\n\nAdds a local policy rule denying a subject label at a scope. Use short paths without the workspace prefix.\n")
 	case "policy":
-		fmt.Fprint(a.Out, "Usage: asiri policy list [--workspace <slug>...]\n\nLists local policy rules.\n")
+		fmt.Fprint(a.Out, "Usage: asiri policy list --workspace <slug>\n\nLists local policy rules for one explicit workspace.\n")
 	case "policy list":
-		fmt.Fprint(a.Out, "Usage: asiri policy list [--workspace <slug>...]\n\nLists local allow and deny policy rules.\n")
+		fmt.Fprint(a.Out, "Usage: asiri policy list --workspace <slug>\n\nLists local allow and deny policy rules for one explicit workspace.\n")
 	case "run":
 		fmt.Fprint(a.Out, "Usage: asiri run --workspace <slug> [--agent <subject-label>] --env NAME=<scope/name> -- <command...>\n       asiri run --workspace <slug> [--agent <subject-label>] --unsafe-argv <command... asiri://scope/name>\n\nRuns a command with secrets injected through environment variables or explicit unsafe argument substitution. Use short paths without the workspace prefix.\n")
 	case "env":
@@ -328,9 +328,9 @@ func (a App) helpFor(path []string) int {
 	case "broker start":
 		fmt.Fprint(a.Out, "Usage: asiri broker start --workspace <slug> --agent <subject-label> [--socket <path>|--listen <addr>] [--client-file <path>] [--token-ttl <duration>] [--idle-timeout <duration>] [--max-runtime <duration>] [--once]\n\nStarts the local broker. With --once, handles one request and exits.\n")
 	case "audit":
-		fmt.Fprint(a.Out, "Usage: asiri audit tail [--limit N] [--workspace <slug>...]\n\nShows recent local audit events.\n")
+		fmt.Fprint(a.Out, "Usage: asiri audit tail --workspace <slug> [--limit N]\n\nShows recent local audit events for one explicit workspace.\n")
 	case "audit tail":
-		fmt.Fprint(a.Out, "Usage: asiri audit tail [--limit N] [--workspace <slug>...]\n\nShows the most recent local audit events, newest first.\n")
+		fmt.Fprint(a.Out, "Usage: asiri audit tail --workspace <slug> [--limit N]\n\nShows the most recent local audit events for one explicit workspace, newest first.\n")
 	case "cache":
 		fmt.Fprint(a.Out, "Usage: asiri cache wipe\n\nAlias for local wipe. Deletes local state and Asiri key material for this machine.\n")
 	case "cache wipe":
@@ -419,21 +419,36 @@ func (a App) login(st *store.FileStore, args []string) int {
 	if err := st.RequireInitialized(); err != nil {
 		return a.fail(err)
 	}
+	if err := validateLoginArgs(args); err != nil {
+		return a.fail(err)
+	}
 	force := hasFlag(args, "--force")
 	origin := loginOrigin(args, st)
 	if err := validateControlPlaneOrigin(origin); err != nil {
 		return a.fail(err)
 	}
-	if st.State.ControlPlane != nil && !force {
-		if st.State.ControlPlane.Source == "service-account" {
-			return a.fail(errors.New("service account session active; run asiri logout first, or asiri login --force to replace it"))
+	if st.State.ControlPlane != nil && !force && st.State.ControlPlane.Source == "service-account" {
+		return a.fail(errors.New("service account session active; run asiri logout first, or asiri login --force to replace it"))
+	}
+	if st.State.ControlPlane != nil && !force && origin != st.State.ControlPlane.Origin {
+		return a.fail(errors.New("an existing control-plane session is linked to a different origin; use asiri login --force to replace it safely"))
+	}
+	if st.State.ControlPlane != nil && force {
+		refreshToken, err := st.ControlPlaneRefreshToken()
+		if err != nil {
+			return a.fail(fmt.Errorf("cannot replace the existing control-plane session safely: %w", err))
 		}
+		if err := logoutDeviceSession(st, st.State.ControlPlane.Origin, refreshToken); err != nil {
+			return a.fail(fmt.Errorf("cannot replace the existing control-plane session safely: %w", err))
+		}
+	}
+	if st.State.ControlPlane != nil && !force {
 		result, status, err := refreshDeviceSession(origin, st)
 		if err == nil && status == http.StatusOK {
 			if err := st.RefreshControlPlane(result.AccessToken, result.ExpiresIn, result.RefreshExpiresAt); err != nil {
 				return a.fail(err)
 			}
-			fmt.Fprintf(a.Out, "✓ Control-plane session refreshed for workspace %s\n", st.State.ControlPlane.WorkspaceSlug)
+			fmt.Fprintln(a.Out, "✓ Control-plane account session refreshed")
 			return 0
 		}
 		if err == nil && remoteDeviceNotTrusted(status, result.Error) {
@@ -442,7 +457,7 @@ func (a App) login(st *store.FileStore, args []string) int {
 			}
 			return a.fail(errors.New("remote device is no longer trusted; local key material was cleared"))
 		}
-		if err != nil || (status != http.StatusUnauthorized && status != http.StatusForbidden) {
+		if err != nil || status != http.StatusUnauthorized {
 			if err != nil {
 				return a.fail(err)
 			}
@@ -466,8 +481,26 @@ func (a App) login(st *store.FileStore, args []string) int {
 	if err := st.LinkControlPlaneForDevice(origin, result.OrgID, result.WorkspaceSlug, result.UserID, result.DeviceID, device.ID, result.AccessToken, result.RefreshToken, result.ExpiresIn, result.RefreshExpiresAt); err != nil {
 		return a.fail(err)
 	}
-	fmt.Fprintf(a.Out, "✓ Linked local device to workspace %s\n", result.WorkspaceSlug)
+	fmt.Fprintln(a.Out, "✓ Linked local device to control-plane account")
 	return 0
+}
+
+func validateLoginArgs(args []string) error {
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--force":
+		case "--origin":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return errors.New("--origin requires a URL")
+			}
+			i++
+		case "--workspace", "-w":
+			return errors.New("login does not accept --workspace; select a workspace on each scoped command")
+		default:
+			return fmt.Errorf("unknown login argument %q", args[i])
+		}
+	}
+	return nil
 }
 
 func loginOrigin(args []string, st *store.FileStore) string {
@@ -514,6 +547,9 @@ func parseServiceAccountCreateArgs(args []string) (serviceAccountCreateOptions, 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--workspace":
+			if options.Workspace != "" {
+				return options, errors.New("service-account create accepts one --workspace value")
+			}
 			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
 				return options, errors.New("--workspace requires a slug")
 			}
@@ -563,6 +599,9 @@ func parseServiceAccountSelectArgs(args []string, command string) (serviceAccoun
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--workspace":
+			if options.Workspace != "" {
+				return options, fmt.Errorf("service-account %s accepts one --workspace value", command)
+			}
 			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
 				return options, errors.New("--workspace requires a slug")
 			}
@@ -615,6 +654,9 @@ func parseServiceAccountGrantArgs(args []string) (serviceAccountGrantOptions, er
 		}
 		switch args[i] {
 		case "--workspace":
+			if options.Workspace != "" {
+				return options, errors.New("service-account grant accepts one --workspace value")
+			}
 			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
 				return options, errors.New("--workspace requires a slug")
 			}
@@ -785,7 +827,7 @@ func (a App) serviceAccountDisable(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	disabled, err := disableRemoteServiceAccount(st, st.State.ControlPlane.Origin, accessToken, account.ID)
+	disabled, err := disableRemoteServiceAccount(st, st.State.ControlPlane.Origin, accessToken, target.ID, account.ID)
 	if err != nil {
 		return a.fail(err)
 	}
@@ -843,6 +885,9 @@ func (a App) serviceAccountLogin(st *store.FileStore, args []string) int {
 	if err := st.RequireInitialized(); err != nil {
 		return a.fail(err)
 	}
+	if st.State.ControlPlane != nil {
+		return a.fail(errors.New("service-account login requires no existing control-plane session; run asiri logout first or use an isolated ASIRI_HOME"))
+	}
 	options, err := parseServiceAccountSelectArgs(args, "login")
 	if err != nil {
 		return a.fail(err)
@@ -867,6 +912,9 @@ func (a App) serviceAccountLogin(st *store.FileStore, args []string) int {
 	}
 	if result.ServiceAccountID == "" || result.ServiceAccountSlug == "" {
 		return a.fail(errors.New("control plane approved login without service account metadata"))
+	}
+	if result.WorkspaceSlug != options.Workspace || result.ServiceAccountSlug != options.ServiceAccount {
+		return a.fail(errors.New("control plane approved a different workspace or service account than requested"))
 	}
 	if err := st.LinkServiceAccountControlPlane(origin, result.OrgID, result.WorkspaceSlug, result.UserID, result.ServiceAccountID, result.ServiceAccountSlug, result.ServiceAccountName, result.DeviceID, device.ID, result.AccessToken, result.RefreshToken, result.ExpiresIn, result.RefreshExpiresAt); err != nil {
 		return a.fail(err)
@@ -910,7 +958,10 @@ func (a App) workspace(st *store.FileStore, args []string) int {
 	}
 	switch args[0] {
 	case "list":
-		workspaceResult, err := listRemoteWorkspaceOverview(st, st.State.ControlPlane.Origin, accessToken, true, false)
+		if err := rejectUnknownArgs(args[1:]); err != nil {
+			return a.fail(err)
+		}
+		workspaceResult, err := listRemoteWorkspaceOverview(st, st.State.ControlPlane.Origin, accessToken, "", true, false)
 		if err != nil {
 			return a.fail(err)
 		}
@@ -918,12 +969,12 @@ func (a App) workspace(st *store.FileStore, args []string) int {
 		if st.State.ControlPlane.Source != "service-account" && workspaceResult.Secrets == nil {
 			return a.fail(errors.New("control plane did not return workspace secret metadata"))
 		}
-		keySummaries := workspaceKeySummaries(st, workspaces, workspaceResult.Secrets, st.State.ControlPlane.WorkspaceID, st.State.ControlPlane.Source != "service-account")
+		keySummaries := workspaceKeySummaries(st, workspaces, workspaceResult.Secrets, st.State.ControlPlane.Source != "service-account")
 		tw := tabwriter.NewWriter(a.Out, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(tw, "WORKSPACE\tROLE\tTHIS DEVICE\tACCOUNT WRITE\tKEYS\tNEXT\tID")
 		hasUntrusted := false
 		for _, workspace := range workspaces {
-			if !workspaceDeviceTrusted(workspace, st.State.ControlPlane.WorkspaceID) {
+			if !workspaceDeviceTrusted(workspace) {
 				hasUntrusted = true
 			}
 			keySummary := keySummaries[workspace.Slug]
@@ -931,7 +982,7 @@ func (a App) workspace(st *store.FileStore, args []string) int {
 			if st.State.ControlPlane.Source == "service-account" {
 				accountWrite = "no"
 			}
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", workspace.Slug, workspaceRoleLabel(workspace, st.State.UserID), deviceTrustLabelForWorkspace(workspace, st.State.ControlPlane.WorkspaceID), accountWrite, keySummary.Keys, keySummary.Next, workspace.ID)
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", workspace.Slug, workspaceRoleLabel(workspace, st.State.UserID), deviceTrustLabelForWorkspace(workspace), accountWrite, keySummary.Keys, keySummary.Next, workspace.ID)
 		}
 		if err := tw.Flush(); err != nil {
 			return a.fail(err)
@@ -976,14 +1027,17 @@ type setupDoctorWorkspace struct {
 }
 
 func (a App) setupDoctor(st *store.FileStore, args []string) int {
-	workspaceFilters, remaining, err := splitWorkspaceFilters(args, "setup doctor")
+	workspaceArg, remaining, err := splitWorkspaceFlag(args, "setup doctor", true)
 	if err != nil {
 		return a.fail(err)
 	}
 	if err := rejectUnknownArgs(remaining); err != nil {
 		return a.fail(err)
 	}
-	if _, err := localWorkspaceFilterSet(workspaceFilters, "setup doctor"); err != nil {
+	if _, err := localWorkspaceSlug(workspaceArg); err != nil {
+		return a.fail(err)
+	}
+	if err := requireServiceAccountWorkspace(st, workspaceArg); err != nil {
 		return a.fail(err)
 	}
 
@@ -1009,7 +1063,7 @@ func (a App) setupDoctor(st *store.FileStore, args []string) int {
 	}
 	printNextSteps := func() {
 		if len(nextSteps) == 0 {
-			fmt.Fprintln(a.Out, "\nNext steps:\n- Setup looks ready for visible trusted workspaces.")
+			fmt.Fprintln(a.Out, "\nNext steps:\n- Setup looks ready for this workspace.")
 			return
 		}
 		fmt.Fprintln(a.Out, "\nNext steps:")
@@ -1058,10 +1112,10 @@ func (a App) setupDoctor(st *store.FileStore, args []string) int {
 		printNextSteps()
 		return 0
 	}
-	checks = append(checks, setupDoctorCheck{Name: "session", Status: "ok", Detail: st.State.ControlPlane.WorkspaceSlug, Next: "-"})
+	checks = append(checks, setupDoctorCheck{Name: "session", Status: "ok", Detail: "authenticated user session", Next: "-"})
 	printChecks(checks)
 
-	workspaceResult, err := listRemoteWorkspaceOverview(st, st.State.ControlPlane.Origin, accessToken, true, false)
+	workspaceResult, err := listRemoteWorkspaceOverview(st, st.State.ControlPlane.Origin, accessToken, workspaceArg, true, false)
 	if err != nil {
 		fmt.Fprintf(a.Out, "\nWorkspace checks unavailable: %s\n", err)
 		addStep("asiri login --force")
@@ -1069,32 +1123,18 @@ func (a App) setupDoctor(st *store.FileStore, args []string) int {
 		return 0
 	}
 	workspaces := workspaceResult.Organizations
-	filterSet := map[string]bool{}
-	for _, slug := range workspaceFilters {
-		filterSet[slug] = true
-	}
+	filterSet := map[string]bool{workspaceArg: true}
 	targets := make([]remoteWorkspaceResponse, 0, len(workspaces))
 	foundFilters := map[string]bool{}
 	for _, workspace := range workspaces {
-		if len(filterSet) > 0 && !filterSet[workspace.Slug] {
+		if !filterSet[workspace.Slug] {
 			continue
 		}
 		targets = append(targets, workspace)
-		if len(filterSet) > 0 {
-			foundFilters[workspace.Slug] = true
-		}
+		foundFilters[workspace.Slug] = true
 	}
-	if len(filterSet) > 0 {
-		missing := make([]string, 0)
-		for slug := range filterSet {
-			if !foundFilters[slug] {
-				missing = append(missing, slug)
-			}
-		}
-		if len(missing) > 0 {
-			sort.Strings(missing)
-			return a.fail(fmt.Errorf("workspace %s is not visible", strings.Join(missing, ", ")))
-		}
+	if !foundFilters[workspaceArg] {
+		return a.fail(fmt.Errorf("workspace %s is not visible", workspaceArg))
 	}
 
 	remoteSecrets := workspaceResult.Secrets
@@ -1102,16 +1142,16 @@ func (a App) setupDoctor(st *store.FileStore, args []string) int {
 	if !secretsKnown {
 		fmt.Fprintln(a.Err, "asiri: remote key coverage unavailable: control plane did not return workspace secret metadata")
 	}
-	keySummaries := workspaceKeySummaries(st, targets, remoteSecrets, st.State.ControlPlane.WorkspaceID, secretsKnown)
+	keySummaries := workspaceKeySummaries(st, targets, remoteSecrets, secretsKnown)
 	rows := make([]setupDoctorWorkspace, 0, len(targets))
 	for _, workspace := range targets {
 		keySummary := keySummaries[workspace.Slug]
 		recoveryStatus := a.setupDoctorRecoveryStatus(st, accessToken, workspace)
-		next := setupDoctorWorkspaceNext(st, workspace, st.State.ControlPlane.WorkspaceID, keySummary.Keys, recoveryStatus)
+		next := setupDoctorWorkspaceNext(st, workspace, keySummary.Keys, recoveryStatus)
 		rows = append(rows, setupDoctorWorkspace{
 			Workspace: workspace.Slug,
 			Role:      workspaceRoleLabel(workspace, st.State.UserID),
-			Device:    deviceTrustLabelForWorkspace(workspace, st.State.ControlPlane.WorkspaceID),
+			Device:    deviceTrustLabelForWorkspace(workspace),
 			Keys:      keySummary.Keys,
 			Recovery:  recoveryStatus,
 			Next:      next,
@@ -1119,7 +1159,7 @@ func (a App) setupDoctor(st *store.FileStore, args []string) int {
 		addStep(next)
 	}
 
-	fmt.Fprintln(a.Out, "\nWorkspaces:")
+	fmt.Fprintln(a.Out, "\nWorkspace:")
 	tw := tabwriter.NewWriter(a.Out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "WORKSPACE\tROLE\tTHIS DEVICE\tKEYS\tRECOVERY\tNEXT")
 	for _, row := range rows {
@@ -1133,16 +1173,13 @@ func (a App) setupDoctor(st *store.FileStore, args []string) int {
 }
 
 func (a App) setupDoctorRecoveryStatus(st *store.FileStore, accessToken string, workspace remoteWorkspaceResponse) string {
-	if !workspaceDeviceTrusted(workspace, st.State.ControlPlane.WorkspaceID) {
+	if !workspaceDeviceTrusted(workspace) {
 		return "skipped"
 	}
 	if st.State.Recoveries != nil {
 		if recovery, ok := st.State.Recoveries[workspace.ID]; ok && recovery.RecipientID != "" {
 			return "configured"
 		}
-	}
-	if workspace.ID != st.State.ControlPlane.WorkspaceID {
-		return "unknown"
 	}
 	recovery, err := getActiveRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, workspace.ID, accessToken)
 	if err != nil {
@@ -1154,11 +1191,11 @@ func (a App) setupDoctorRecoveryStatus(st *store.FileStore, accessToken string, 
 	return "configured"
 }
 
-func setupDoctorWorkspaceNext(st *store.FileStore, workspace remoteWorkspaceResponse, activeWorkspaceID, keys, recovery string) string {
+func setupDoctorWorkspaceNext(st *store.FileStore, workspace remoteWorkspaceResponse, keys, recovery string) string {
 	if st.State.ControlPlane != nil && st.State.ControlPlane.Source == "service-account" {
 		return "-"
 	}
-	if !workspaceDeviceTrusted(workspace, activeWorkspaceID) {
+	if !workspaceDeviceTrusted(workspace) {
 		if workspaceCanApproveDevice(workspace) {
 			return deviceTrustCommand(st, workspace.Slug)
 		}
@@ -1168,7 +1205,7 @@ func setupDoctorWorkspaceNext(st *store.FileStore, workspace remoteWorkspaceResp
 	case "unknown":
 		return fmt.Sprintf("asiri setup doctor --workspace %s", workspace.Slug)
 	case "needs rewrap", "needs cleanup":
-		return workspaceNextAction(st, workspace, activeWorkspaceID, keys)
+		return workspaceNextAction(st, workspace, keys)
 	case "unwrapped":
 		if recovery == "configured" {
 			return fmt.Sprintf("asiri recovery restore --workspace %s --key-file <path>", workspace.Slug)
@@ -1207,16 +1244,7 @@ func (a App) push(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	var target remoteWorkspaceResponse
-	var restoreDryRunState func()
-	if pushOptions.DryRun {
-		target, accessToken, restoreDryRunState, err = a.pushWorkspaceTargetDryRun(st, accessToken, pushOptions.Workspace)
-		if restoreDryRunState != nil {
-			defer restoreDryRunState()
-		}
-	} else {
-		target, accessToken, err = a.pushWorkspaceTarget(st, accessToken, pushOptions.Workspace)
-	}
+	target, accessToken, err := a.pushWorkspaceTarget(st, accessToken, pushOptions.Workspace)
 	if err != nil {
 		return a.fail(err)
 	}
@@ -1235,12 +1263,12 @@ func (a App) push(st *store.FileStore, args []string) int {
 	if binding, ok := st.RemoteBindingForPrefix(target.Slug); ok && binding.WorkspaceID != target.ID {
 		return a.fail(fmt.Errorf("workspace prefix %s is bound to another control-plane workspace", target.Slug))
 	}
-	options, err := remoteWriteOptions(st, st.State.ControlPlane.Origin, accessToken, selectedRefs)
+	options, err := remoteWriteOptions(st, st.State.ControlPlane.Origin, accessToken, target, selectedRefs)
 	if err != nil {
 		return a.fail(err)
 	}
-	if !options.ActiveWorkspace.CanWrite {
-		return a.fail(fmt.Errorf("workspace %s cannot write %s", target.Slug, fullPathList(options.ActiveWorkspace.Paths)))
+	if !options.Workspace.CanWrite {
+		return a.fail(fmt.Errorf("workspace %s cannot write %s", target.Slug, fullPathList(options.Workspace.Paths)))
 	}
 	if pushOptions.DryRun {
 		if st.State.RemoteBindings == nil {
@@ -1260,7 +1288,7 @@ func (a App) push(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	versions, err := st.RemoteSecretVersionsForRefsWithRecovery(target.Slug, selectedRefs, recovery)
+	versions, err := st.RemoteSecretVersionsForRefsWithRecovery(target.ID, target.Slug, target.CurrentDeviceID, selectedRefs, recovery)
 	if err != nil {
 		return a.fail(err)
 	}
@@ -1268,7 +1296,7 @@ func (a App) push(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(fmt.Errorf("trusted device discovery failed; refusing to push incomplete wrapped-key coverage: %w", err))
 	}
-	if err := addTrustedDeviceWrappedKeysToVersions(st, versions, devices); err != nil {
+	if err := addTrustedDeviceWrappedKeysToVersions(st, target.ID, versions, devices); err != nil {
 		return a.fail(err)
 	}
 	recoveryRecipientID := ""
@@ -1305,7 +1333,7 @@ func (a App) push(st *store.FileStore, args []string) int {
 	rewrappedKeys := 0
 	rewrappedSecrets := 0
 	for _, candidate := range reconciled.Rewrap {
-		if err := addRemoteWrappedKeys(st, st.State.ControlPlane.Origin, candidate.SecretID, accessToken, candidate.Missing, false); err != nil {
+		if err := addRemoteWrappedKeys(st, st.State.ControlPlane.Origin, target.ID, candidate.SecretID, accessToken, candidate.Missing, false); err != nil {
 			return a.fail(err)
 		}
 		rewrappedSecrets++
@@ -1326,11 +1354,11 @@ func (a App) push(st *store.FileStore, args []string) int {
 		}
 		st.State.Recoveries[target.ID] = nextRecovery
 		if !pushOptions.HasTargets() {
-			if err := st.MarkRecoveryWrapped(target.Slug, len(versions)); err != nil {
+			if err := st.MarkRecoveryWrapped(target.ID, target.Slug, len(versions)); err != nil {
 				return a.fail(err)
 			}
 		}
-	} else if st.ActiveRecovery() != nil {
+	} else if st.RecoveryForWorkspace(target.ID) != nil {
 		delete(st.State.Recoveries, target.ID)
 	}
 	st.Audit(st.State.UserID, "control_plane_push", "allowed", "", "", "pushed encrypted local secret versions", map[string]string{"count": fmt.Sprintf("%d", len(reconciled.Upload)), "workspace": target.Slug, "skipped": fmt.Sprintf("%d", reconciled.SkippedExisting+reconciled.SkippedOlder), "rewrappedKeys": fmt.Sprintf("%d", rewrappedKeys)})
@@ -1535,7 +1563,7 @@ func reconcilePushVersions(local []store.RemoteSecretVersion, remote []remoteSec
 	return result, nil
 }
 
-func addTrustedDeviceWrappedKeysToVersions(st *store.FileStore, versions []store.RemoteSecretVersion, devices []remoteDeviceResponse) error {
+func addTrustedDeviceWrappedKeysToVersions(st *store.FileStore, workspaceID string, versions []store.RemoteSecretVersion, devices []remoteDeviceResponse) error {
 	targets := make([]remoteDeviceResponse, 0)
 	for _, device := range devices {
 		if device.Status == "trusted" && device.ID != "" && device.EncryptionPublicKey != "" {
@@ -1550,7 +1578,7 @@ func addTrustedDeviceWrappedKeysToVersions(st *store.FileStore, versions []store
 			if remoteVersionHasRecipient(versions[i], device.ID) {
 				continue
 			}
-			wrapped, err := st.RemoteWrappedKeyForSecretVersionPublicKey(versions[i].Scope, versions[i].Name, versions[i].Version, device.ID, device.EncryptionPublicKey)
+			wrapped, err := st.RemoteWrappedKeyForSecretVersionPublicKey(workspaceID, versions[i].Scope, versions[i].Name, versions[i].Version, device.ID, device.EncryptionPublicKey)
 			if err != nil {
 				return err
 			}
@@ -1659,33 +1687,15 @@ func (a App) pull(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken)
+	target, accessToken, err := a.remoteWorkspaceTarget(st, accessToken, options.Workspace)
 	if err != nil {
 		return a.fail(err)
 	}
-	targets, results := pullTargets(st.State.ControlPlane, workspaces, options)
-	currentAccessToken := accessToken
-	activeWorkspaceID := st.State.ControlPlane.WorkspaceID
-	for _, target := range targets {
-		if !pullWorkspaceCanPull(target.Workspace, activeWorkspaceID) {
-			result := "skipped"
-			if target.Explicit {
-				result = "failed"
-			}
-			results = append(results, pullResult{Workspace: target.Workspace.Slug, Result: result, Note: "this device is not trusted for this workspace"})
-			continue
-		}
-		imported, remote, token, err := a.pullOneWorkspace(st, currentAccessToken, target.Workspace, options.Force)
-		if token != "" {
-			currentAccessToken = token
-		}
-		if err != nil {
-			results = append(results, pullResult{Workspace: target.Workspace.Slug, Result: "failed", Note: err.Error()})
-			continue
-		}
-		results = append(results, pullResult{Workspace: target.Workspace.Slug, Result: "pulled", Imported: imported, Remote: remote})
+	imported, remote, _, err := a.pullOneWorkspace(st, accessToken, target, options.Force)
+	if err != nil {
+		return a.fail(err)
 	}
-	writePullResults(a.Out, results)
+	writePullResults(a.Out, []pullResult{{Workspace: target.Slug, Result: "pulled", Imported: imported, Remote: remote}})
 	return 0
 }
 
@@ -1695,58 +1705,37 @@ func (a App) pullOneWorkspace(st *store.FileStore, accessToken string, workspace
 }
 
 func (a App) pullOneWorkspaceWithBundle(st *store.FileStore, accessToken string, workspace remoteWorkspaceResponse, force bool) (int, int, string, syncBundleResponse, error) {
-	nextToken := ""
-	if workspace.ID != st.State.ControlPlane.WorkspaceID {
-		if st.State.ControlPlane.Source == "service-account" {
-			return 0, 0, "", syncBundleResponse{}, errors.New("service account sessions cannot switch workspace")
-		}
-		device, err := st.ActiveDevice()
-		if err != nil {
-			return 0, 0, "", syncBundleResponse{}, err
-		}
-		result, err := switchRemoteWorkspace(st, st.State.ControlPlane.Origin, accessToken, workspace.ID, *device)
-		if err != nil {
-			return 0, 0, "", syncBundleResponse{}, err
-		}
-		if err := st.LinkControlPlaneForDevice(st.State.ControlPlane.Origin, result.OrgID, result.WorkspaceSlug, result.UserID, result.DeviceID, device.ID, result.AccessToken, result.RefreshToken, result.ExpiresIn, result.RefreshExpiresAt); err != nil {
-			return 0, 0, "", syncBundleResponse{}, err
-		}
-		nextToken = result.AccessToken
-		accessToken = result.AccessToken
+	if workspace.ID == "" || workspace.Slug == "" || workspace.CurrentDeviceID == "" {
+		return 0, 0, "", syncBundleResponse{}, errors.New("pull requires a trusted target workspace device")
 	}
 	var bundle syncBundleResponse
-	endpoint := fmt.Sprintf("%s/v1/sync?orgId=%s&deviceId=%s", strings.TrimRight(st.State.ControlPlane.Origin, "/"), url.QueryEscape(st.State.ControlPlane.WorkspaceID), url.QueryEscape(st.State.ControlPlane.DeviceID))
+	endpoint := fmt.Sprintf("%s/v1/sync?orgId=%s&deviceId=%s", strings.TrimRight(st.State.ControlPlane.Origin, "/"), url.QueryEscape(workspace.ID), url.QueryEscape(workspace.CurrentDeviceID))
 	if err := getJSONBearer(st, endpoint, accessToken, &bundle); err != nil {
-		return 0, 0, nextToken, bundle, err
+		return 0, 0, "", bundle, err
 	}
-	imported, err := a.importRemoteVersions(st, bundle.EncryptedSecrets, force)
+	imported, err := a.importRemoteVersions(st, workspace, bundle.EncryptedSecrets, force)
 	if err != nil {
 		var partial *store.RemoteImportPartialError
 		if !errors.As(err, &partial) {
-			return 0, 0, nextToken, bundle, err
+			return 0, 0, "", bundle, err
 		}
 		if imported == 0 {
-			return 0, 0, nextToken, bundle, err
+			return 0, 0, "", bundle, err
 		}
 		fmt.Fprintf(a.Err, "Warning: %s\n", partial.Error())
 	}
 	importServiceAccountSyncPolicies(st, bundle.Policies)
 	st.SetEnvelopeAuditModes(bundle.Scopes)
-	st.Audit(st.State.UserID, "control_plane_sync", "allowed", "", "", "fetched encrypted pull bundle", map[string]string{"secrets": fmt.Sprintf("%d", len(bundle.EncryptedSecrets)), "workspace": st.State.ControlPlane.WorkspaceSlug})
+	st.Audit(st.State.UserID, "control_plane_sync", "allowed", "", "", "fetched encrypted pull bundle", map[string]string{"secrets": fmt.Sprintf("%d", len(bundle.EncryptedSecrets)), "workspace": workspace.Slug})
 	if err := st.Save(); err != nil {
-		return 0, 0, nextToken, bundle, err
+		return 0, 0, "", bundle, err
 	}
-	return imported, len(bundle.EncryptedSecrets), nextToken, bundle, nil
+	return imported, len(bundle.EncryptedSecrets), "", bundle, nil
 }
 
 type pullOptions struct {
-	Force      bool
-	Workspaces []string
-}
-
-type pullTarget struct {
-	Workspace remoteWorkspaceResponse
-	Explicit  bool
+	Force     bool
+	Workspace string
 }
 
 type pullResult struct {
@@ -1758,78 +1747,14 @@ type pullResult struct {
 }
 
 func parsePullArgs(args []string) (pullOptions, error) {
-	var options pullOptions
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--force":
-			options.Force = true
-		case "--workspace", "-w":
-			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
-				return options, errors.New("pull --workspace requires a workspace slug")
-			}
-			options.Workspaces = append(options.Workspaces, args[i+1])
-			i++
-		default:
-			return options, fmt.Errorf("unknown pull option %q", args[i])
-		}
+	workspace, remaining, err := splitWorkspaceFlag(args, "pull", true)
+	if err != nil {
+		return pullOptions{}, err
 	}
-	return options, nil
-}
-
-func pullTargets(active *asiri.ControlPlaneLink, workspaces []remoteWorkspaceResponse, options pullOptions) ([]pullTarget, []pullResult) {
-	if active == nil {
-		return nil, []pullResult{{Workspace: "-", Result: "failed", Note: "asiri is not linked to a control plane"}}
+	if err := rejectUnknownArgs(remaining, "--force"); err != nil {
+		return pullOptions{}, err
 	}
-	if active.Source == "service-account" {
-		activeWorkspace := remoteWorkspaceResponse{ID: active.WorkspaceID, Slug: active.WorkspaceSlug, CurrentDeviceTrusted: boolPtr(true), CanPull: boolPtr(true)}
-		for _, workspace := range workspaces {
-			if workspace.ID == active.WorkspaceID || workspace.Slug == active.WorkspaceSlug {
-				activeWorkspace = workspace
-				break
-			}
-		}
-		if len(options.Workspaces) == 0 {
-			return []pullTarget{{Workspace: activeWorkspace}}, nil
-		}
-		targets := []pullTarget{}
-		results := []pullResult{}
-		for _, requested := range options.Workspaces {
-			if requested != active.WorkspaceSlug && requested != active.WorkspaceID {
-				results = append(results, pullResult{Workspace: requested, Result: "failed", Note: "service account sessions cannot switch workspace"})
-				continue
-			}
-			targets = append(targets, pullTarget{Workspace: activeWorkspace, Explicit: true})
-		}
-		return targets, results
-	}
-	if len(options.Workspaces) > 0 {
-		targets := make([]pullTarget, 0, len(options.Workspaces))
-		results := []pullResult{}
-		for _, requested := range options.Workspaces {
-			if active.Source == "service-account" && requested != active.WorkspaceSlug {
-				results = append(results, pullResult{Workspace: requested, Result: "failed", Note: "service account sessions cannot switch workspace"})
-				continue
-			}
-			workspace, ok := findWorkspace(workspaces, requested)
-			if !ok {
-				results = append(results, pullResult{Workspace: requested, Result: "failed", Note: "workspace is not visible"})
-				continue
-			}
-			targets = append(targets, pullTarget{Workspace: workspace, Explicit: true})
-		}
-		return targets, results
-	}
-	if active.Source == "service-account" {
-		if workspace, ok := findWorkspace(workspaces, active.WorkspaceSlug); ok {
-			return []pullTarget{{Workspace: workspace}}, nil
-		}
-		return []pullTarget{{Workspace: remoteWorkspaceResponse{ID: active.WorkspaceID, Slug: active.WorkspaceSlug, CanPull: boolPtr(true), CurrentDeviceTrusted: boolPtr(true)}}}, nil
-	}
-	targets := make([]pullTarget, 0, len(workspaces))
-	for _, workspace := range workspaces {
-		targets = append(targets, pullTarget{Workspace: workspace})
-	}
-	return targets, nil
+	return pullOptions{Force: hasFlag(remaining, "--force"), Workspace: workspace}, nil
 }
 
 func findWorkspace(workspaces []remoteWorkspaceResponse, value string) (remoteWorkspaceResponse, bool) {
@@ -1841,10 +1766,6 @@ func findWorkspace(workspaces []remoteWorkspaceResponse, value string) (remoteWo
 	return remoteWorkspaceResponse{}, false
 }
 
-func pullWorkspaceCanPull(workspace remoteWorkspaceResponse, activeWorkspaceID string) bool {
-	return workspaceDeviceTrusted(workspace, activeWorkspaceID)
-}
-
 func boolPtr(value bool) *bool {
 	return &value
 }
@@ -1854,7 +1775,7 @@ type workspaceKeySummary struct {
 	Next string
 }
 
-func workspaceKeySummaries(st *store.FileStore, workspaces []remoteWorkspaceResponse, secrets []visibleRemoteSecretRecord, activeWorkspaceID string, secretsKnown bool) map[string]workspaceKeySummary {
+func workspaceKeySummaries(st *store.FileStore, workspaces []remoteWorkspaceResponse, secrets []visibleRemoteSecretRecord, secretsKnown bool) map[string]workspaceKeySummary {
 	type counts struct {
 		Total              int
 		Missing            int
@@ -1881,7 +1802,7 @@ func workspaceKeySummaries(st *store.FileStore, workspaces []remoteWorkspaceResp
 	summaries := map[string]workspaceKeySummary{}
 	for _, workspace := range workspaces {
 		keys := "unknown"
-		if workspaceDeviceTrusted(workspace, activeWorkspaceID) && secretsKnown {
+		if workspaceDeviceTrusted(workspace) && secretsKnown {
 			item := byWorkspace[workspace.Slug]
 			switch {
 			case item.Total == 0:
@@ -1896,16 +1817,16 @@ func workspaceKeySummaries(st *store.FileStore, workspaces []remoteWorkspaceResp
 				keys = "ready"
 			}
 		}
-		summaries[workspace.Slug] = workspaceKeySummary{Keys: keys, Next: workspaceNextAction(st, workspace, activeWorkspaceID, keys)}
+		summaries[workspace.Slug] = workspaceKeySummary{Keys: keys, Next: workspaceNextAction(st, workspace, keys)}
 	}
 	return summaries
 }
 
-func workspaceNextAction(st *store.FileStore, workspace remoteWorkspaceResponse, activeWorkspaceID, keys string) string {
+func workspaceNextAction(st *store.FileStore, workspace remoteWorkspaceResponse, keys string) string {
 	if st.State.ControlPlane != nil && st.State.ControlPlane.Source == "service-account" {
 		return "-"
 	}
-	if !workspaceDeviceTrusted(workspace, activeWorkspaceID) {
+	if !workspaceDeviceTrusted(workspace) {
 		if workspaceCanApproveDevice(workspace) {
 			return deviceTrustCommand(st, workspace.Slug)
 		}
@@ -1920,14 +1841,14 @@ func workspaceNextAction(st *store.FileStore, workspace remoteWorkspaceResponse,
 	return "-"
 }
 
-func workspaceDeviceTrusted(workspace remoteWorkspaceResponse, activeWorkspaceID string) bool {
+func workspaceDeviceTrusted(workspace remoteWorkspaceResponse) bool {
 	if workspace.CurrentDeviceTrusted != nil {
 		return *workspace.CurrentDeviceTrusted
 	}
 	if workspace.CanPull != nil {
 		return *workspace.CanPull
 	}
-	return workspace.ID != "" && workspace.ID == activeWorkspaceID
+	return false
 }
 
 func workspaceCanApproveDevice(workspace remoteWorkspaceResponse) bool {
@@ -1937,8 +1858,8 @@ func workspaceCanApproveDevice(workspace remoteWorkspaceResponse) bool {
 	return workspace.Role == "owner"
 }
 
-func deviceTrustLabelForWorkspace(workspace remoteWorkspaceResponse, activeWorkspaceID string) string {
-	if workspaceDeviceTrusted(workspace, activeWorkspaceID) {
+func deviceTrustLabelForWorkspace(workspace remoteWorkspaceResponse) string {
+	if workspaceDeviceTrusted(workspace) {
 		return "trusted"
 	}
 	if workspace.CurrentDeviceTrusted == nil && workspace.CanPull == nil {
@@ -1972,26 +1893,30 @@ func writePullResults(out io.Writer, results []pullResult) {
 	_ = tw.Flush()
 }
 
-func (a App) importRemoteVersions(st *store.FileStore, versions []store.RemoteSecretVersion, force bool) (int, error) {
+func (a App) importRemoteVersions(st *store.FileStore, workspace remoteWorkspaceResponse, versions []store.RemoteSecretVersion, force bool) (int, error) {
 	if len(versions) == 0 {
 		return 0, nil
 	}
-	return st.ImportRemoteSecretVersions(versions, force)
+	return st.ImportRemoteSecretVersions(workspace.ID, workspace.Slug, workspace.CurrentDeviceID, versions, force)
 }
 
 func importServiceAccountSyncPolicies(st *store.FileStore, policies []syncPolicyResponse) {
 	if st == nil || st.State.ControlPlane == nil || st.State.ControlPlane.Source != "service-account" || st.State.ControlPlane.ServiceAccountSlug == "" {
 		return
 	}
-	serviceAccount := store.NormalizeSubjectLabel(st.State.ControlPlane.ServiceAccountSlug)
+	serviceAccountSlug := store.NormalizeSubjectLabel(st.State.ControlPlane.ServiceAccountSlug)
+	runtimeSubject := store.ServiceAccountRuntimeSubject(st.State.ControlPlane.ServiceAccountID)
+	if runtimeSubject == "" {
+		return
+	}
 	kept := make([]asiri.Policy, 0, len(st.State.Policies))
 	for _, policy := range st.State.Policies {
-		if store.NormalizeSubjectLabel(policy.Subject) != serviceAccount {
+		if store.NormalizeSubjectLabel(policy.Subject) != runtimeSubject {
 			kept = append(kept, policy)
 		}
 	}
 	for _, policy := range policies {
-		if policy.SubjectType != "service" || store.NormalizeSubjectLabel(policy.SubjectID) != serviceAccount || policy.ScopePattern == "" || policy.SecretPattern == "" || len(policy.Actions) == 0 || policy.ApprovalMode != "none" {
+		if policy.SubjectType != "service" || store.NormalizeSubjectLabel(policy.SubjectID) != serviceAccountSlug || policy.ScopePattern == "" || policy.SecretPattern == "" || len(policy.Actions) == 0 || policy.ApprovalMode != "none" {
 			continue
 		}
 		createdAt := policy.CreatedAt
@@ -2004,7 +1929,7 @@ func importServiceAccountSyncPolicies(st *store.FileStore, policies []syncPolicy
 		}
 		kept = append(kept, asiri.Policy{
 			ID:            id,
-			Subject:       serviceAccount,
+			Subject:       runtimeSubject,
 			ScopePattern:  policy.ScopePattern,
 			SecretPattern: policy.SecretPattern,
 			Actions:       policy.Actions,
@@ -2055,12 +1980,12 @@ func (a App) rekey(st *store.FileStore, args []string) int {
 		fmt.Fprintln(a.Out, "No local active secrets to rekey")
 		return 0
 	}
-	options, err := remoteWriteOptions(st, st.State.ControlPlane.Origin, accessToken, selectedRefs)
+	options, err := remoteWriteOptions(st, st.State.ControlPlane.Origin, accessToken, target, selectedRefs)
 	if err != nil {
 		return a.fail(err)
 	}
-	if !options.ActiveWorkspace.CanWrite {
-		return a.fail(fmt.Errorf("workspace %s cannot write %s", target.Slug, fullPathList(options.ActiveWorkspace.Paths)))
+	if !options.Workspace.CanWrite {
+		return a.fail(fmt.Errorf("workspace %s cannot write %s", target.Slug, fullPathList(options.Workspace.Paths)))
 	}
 	if _, err := getActiveRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, target.ID, accessToken); err != nil {
 		return a.fail(err)
@@ -2168,7 +2093,7 @@ func (a App) rewrapWorkspace(st *store.FileStore, accessToken string, target rem
 			if remoteSecretHasRecipient(secret, device.ID) {
 				continue
 			}
-			wrapped, err := st.RemoteWrappedKeyForSecretVersionPublicKey(secret.Scope, secret.Name, secret.Version, device.ID, device.EncryptionPublicKey)
+			wrapped, err := st.RemoteWrappedKeyForSecretVersionPublicKey(target.ID, secret.Scope, secret.Name, secret.Version, device.ID, device.EncryptionPublicKey)
 			if err != nil {
 				return rewrapStats{}, err
 			}
@@ -2177,7 +2102,7 @@ func (a App) rewrapWorkspace(st *store.FileStore, accessToken string, target rem
 		if len(missing) == 0 {
 			continue
 		}
-		if err := addRemoteWrappedKeys(st, st.State.ControlPlane.Origin, secret.ID, accessToken, missing, true); err != nil {
+		if err := addRemoteWrappedKeys(st, st.State.ControlPlane.Origin, target.ID, secret.ID, accessToken, missing, true); err != nil {
 			return rewrapStats{}, err
 		}
 		stats.Updated++
@@ -2198,7 +2123,7 @@ func (a App) recovery(st *store.FileStore, args []string) int {
 		if st.State.ControlPlane == nil {
 			return a.fail(errors.New("asiri is not linked to a control plane"))
 		}
-		workspaceFilters, remaining, err := splitWorkspaceFilters(args[1:], "recovery status")
+		workspaceArg, remaining, err := splitWorkspaceFlag(args[1:], "recovery status", true)
 		if err != nil {
 			return a.fail(err)
 		}
@@ -2209,21 +2134,9 @@ func (a App) recovery(st *store.FileStore, args []string) int {
 		if err != nil {
 			return a.fail(err)
 		}
-		workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken)
+		target, accessToken, err := a.remoteWorkspaceTarget(st, accessToken, workspaceArg)
 		if err != nil {
 			return a.fail(err)
-		}
-		targets := make([]remoteWorkspaceResponse, 0, len(workspaces))
-		if len(workspaceFilters) == 0 {
-			targets = append(targets, workspaces...)
-		} else {
-			for _, requested := range workspaceFilters {
-				target, err := requireRemoteWorkspace(workspaces, requested)
-				if err != nil {
-					return a.fail(err)
-				}
-				targets = append(targets, target)
-			}
 		}
 		type recoveryStatusRow struct {
 			Workspace   string
@@ -2232,60 +2145,34 @@ func (a App) recovery(st *store.FileStore, args []string) int {
 			Wrapped     int
 			Note        string
 		}
-		rows := []recoveryStatusRow{}
-		currentToken := accessToken
-		saveNeeded := false
+		row := recoveryStatusRow{Workspace: target.Slug}
 		if st.State.Recoveries == nil {
 			st.State.Recoveries = map[string]asiri.RecoveryConfig{}
 		}
-		activeWorkspaceID := st.State.ControlPlane.WorkspaceID
-		for _, target := range targets {
-			if !pullWorkspaceCanPull(target, activeWorkspaceID) {
-				rows = append(rows, recoveryStatusRow{Workspace: target.Slug, Status: "skipped", Note: "this device is not trusted for this workspace"})
-				continue
-			}
-			token, err := a.ensureWorkspaceSession(st, currentToken, target)
-			if err != nil {
-				rows = append(rows, recoveryStatusRow{Workspace: target.Slug, Status: "failed", Note: err.Error()})
-				continue
-			}
-			currentToken = token
-			if st.State.ControlPlane != nil {
-				target.ID = st.State.ControlPlane.WorkspaceID
-				target.Slug = st.State.ControlPlane.WorkspaceSlug
-			}
-			recovery, err := getActiveRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, target.ID, currentToken)
-			if err != nil {
-				rows = append(rows, recoveryStatusRow{Workspace: target.Slug, Status: "failed", Note: err.Error()})
-				continue
-			}
-			if recovery == nil {
-				if _, ok := st.State.Recoveries[target.ID]; ok {
-					delete(st.State.Recoveries, target.ID)
-					saveNeeded = true
-				}
-				rows = append(rows, recoveryStatusRow{Workspace: target.Slug, Status: "not-configured"})
-				continue
-			}
+		recovery, err := getActiveRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, target.ID, accessToken)
+		if err != nil {
+			return a.fail(err)
+		}
+		if recovery == nil {
+			delete(st.State.Recoveries, target.ID)
+			row.Status = "not-configured"
+		} else {
 			if existing, ok := st.State.Recoveries[target.ID]; ok && existing.RecipientID == recovery.RecipientID {
 				recovery.CreatedAt = existing.CreatedAt
 				recovery.LastWrappedAt = existing.LastWrappedAt
 				recovery.WrappedSecretCount = existing.WrappedSecretCount
 			}
 			st.State.Recoveries[target.ID] = *recovery
-			saveNeeded = true
-			rows = append(rows, recoveryStatusRow{Workspace: target.Slug, Status: "configured", Fingerprint: recovery.PublicKeyFingerprint, Wrapped: st.RecoveryWrappedCountForPrefix(target.Slug)})
+			row.Status = "configured"
+			row.Fingerprint = recovery.PublicKeyFingerprint
+			row.Wrapped = st.RecoveryWrappedCount(target.ID)
 		}
-		if saveNeeded {
-			if err := st.Save(); err != nil {
-				return a.fail(err)
-			}
+		if err := st.Save(); err != nil {
+			return a.fail(err)
 		}
 		tw := tabwriter.NewWriter(a.Out, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(tw, "WORKSPACE\tSTATUS\tFINGERPRINT\tWRAPPED\tNOTE")
-		for _, row := range rows {
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\n", row.Workspace, row.Status, row.Fingerprint, row.Wrapped, row.Note)
-		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\n", row.Workspace, row.Status, row.Fingerprint, row.Wrapped, row.Note)
 		if err := tw.Flush(); err != nil {
 			return a.fail(err)
 		}
@@ -2351,7 +2238,7 @@ func (a App) recovery(st *store.FileStore, args []string) int {
 		if remoteRecovery != nil {
 			previousRecipientID = remoteRecovery.RecipientID
 		}
-		replacements, covered, err := a.prepareRemoteRecoveryReplacementKeys(st, accessToken, setup.Config, previousRecipientID)
+		replacements, covered, err := a.prepareRemoteRecoveryReplacementKeys(st, accessToken, target, setup.Config, previousRecipientID)
 		if err != nil {
 			return a.fail(err)
 		}
@@ -2367,15 +2254,15 @@ func (a App) recovery(st *store.FileStore, args []string) int {
 			fmt.Fprintln(a.Out, "Copy this key to a secure place, for example a password app or a printed copy. Asiri will not show it again.")
 		}
 		if remoteRecovery != nil {
-			if err := replaceRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, accessToken, setup, replacements); err != nil {
+			if err := replaceRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, target.ID, target.CurrentDeviceID, accessToken, setup, replacements); err != nil {
 				return a.fail(fmt.Errorf("recovery key delivered, but remote replacement failed: %w", err))
 			}
-		} else if err := registerRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, accessToken, setup, replacements); err != nil {
+		} else if err := registerRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, target.ID, target.CurrentDeviceID, accessToken, setup, replacements); err != nil {
 			return a.fail(fmt.Errorf("recovery key delivered, but remote registration failed: %w", err))
 		}
-		st.CommitRecoverySetup(setup)
+		st.CommitRecoverySetup(target.ID, target.Slug, setup)
 		if covered > 0 {
-			if err := st.MarkRecoveryWrapped(st.State.ControlPlane.WorkspaceSlug, covered); err != nil {
+			if err := st.MarkRecoveryWrapped(target.ID, target.Slug, covered); err != nil {
 				return a.fail(err)
 			}
 		} else if err := st.Save(); err != nil {
@@ -2428,33 +2315,33 @@ func (a App) recoveryRestore(st *store.FileStore, args []string) int {
 	}
 	activeVersions := remoteRecordsToVersions(secrets)
 	if len(activeVersions) == 0 {
-		if err := commitRecoveryIdentity(st, identity, 0); err != nil {
+		if err := commitRecoveryIdentity(st, target.ID, identity, 0); err != nil {
 			return a.fail(err)
 		}
 		fmt.Fprintln(a.Out, "No remote active secrets to restore")
 		return 0
 	}
-	imported, identity, err := st.ImportRecoveryRemoteSecretVersions(activeVersions, recoveryKey, hasFlag(remaining, "--force"))
+	imported, identity, err := st.ImportRecoveryRemoteSecretVersions(target.ID, target.Slug, activeVersions, recoveryKey, hasFlag(remaining, "--force"))
 	if err != nil {
 		return a.fail(err)
 	}
-	rewrapped, err := a.addRecoveredDeviceWrappedKeys(st, accessToken, secrets, identity.RecipientID)
+	rewrapped, err := a.addRecoveredDeviceWrappedKeys(st, accessToken, target, secrets, identity.RecipientID)
 	if err != nil {
 		return a.fail(err)
 	}
-	if err := commitRecoveryIdentity(st, identity, imported); err != nil {
+	if err := commitRecoveryIdentity(st, target.ID, identity, imported); err != nil {
 		return a.fail(err)
 	}
 	fmt.Fprintf(a.Out, "✓ Restored %d remote secret(s) and registered this device on %d secret(s)\n", imported, rewrapped)
 	return 0
 }
 
-func commitRecoveryIdentity(st *store.FileStore, identity store.RecoveryKeyIdentity, wrappedCount int) error {
+func commitRecoveryIdentity(st *store.FileStore, workspaceID string, identity store.RecoveryKeyIdentity, wrappedCount int) error {
 	if st.State.Recoveries == nil {
 		st.State.Recoveries = map[string]asiri.RecoveryConfig{}
 	}
 	now := time.Now().UTC()
-	st.State.Recoveries[st.State.ControlPlane.WorkspaceID] = asiri.RecoveryConfig{
+	st.State.Recoveries[workspaceID] = asiri.RecoveryConfig{
 		RecipientID:          identity.RecipientID,
 		PublicKey:            identity.PublicKey,
 		PublicKeyFingerprint: identity.Fingerprint,
@@ -2465,7 +2352,7 @@ func commitRecoveryIdentity(st *store.FileStore, identity store.RecoveryKeyIdent
 	return st.Save()
 }
 
-func (a App) addRecoveredDeviceWrappedKeys(st *store.FileStore, accessToken string, secrets []remoteSecretRecord, recoveryRecipientID string) (int, error) {
+func (a App) addRecoveredDeviceWrappedKeys(st *store.FileStore, accessToken string, target remoteWorkspaceResponse, secrets []remoteSecretRecord, recoveryRecipientID string) (int, error) {
 	device, err := st.ActiveDevice()
 	if err != nil {
 		return 0, err
@@ -2475,17 +2362,17 @@ func (a App) addRecoveredDeviceWrappedKeys(st *store.FileStore, accessToken stri
 		if secret.Status != "active" {
 			continue
 		}
-		if !remoteSecretHasRecoveryRecipient(secret, recoveryRecipientID) || remoteSecretHasRecipient(secret, st.State.ControlPlane.DeviceID) {
+		if !remoteSecretHasRecoveryRecipient(secret, recoveryRecipientID) || remoteSecretHasRecipient(secret, target.CurrentDeviceID) {
 			continue
 		}
 		if !localSecretVersionExists(st, secret.Scope, secret.Name, secret.Version) {
 			continue
 		}
-		wrapped, err := st.RemoteWrappedKeyForSecretVersionPublicKey(secret.Scope, secret.Name, secret.Version, st.State.ControlPlane.DeviceID, device.EncryptionPublicKey)
+		wrapped, err := st.RemoteWrappedKeyForSecretVersionPublicKey(target.ID, secret.Scope, secret.Name, secret.Version, target.CurrentDeviceID, device.EncryptionPublicKey)
 		if err != nil {
 			return updated, err
 		}
-		if err := addRecoveryRestoredWrappedKeys(st, st.State.ControlPlane.Origin, secret.ID, accessToken, recoveryRecipientID, []store.RemoteWrappedKey{wrapped}); err != nil {
+		if err := addRecoveryRestoredWrappedKeys(st, st.State.ControlPlane.Origin, target.ID, secret.ID, accessToken, recoveryRecipientID, []store.RemoteWrappedKey{wrapped}); err != nil {
 			return updated, err
 		}
 		updated += 1
@@ -2493,17 +2380,17 @@ func (a App) addRecoveredDeviceWrappedKeys(st *store.FileStore, accessToken stri
 	return updated, nil
 }
 
-func (a App) prepareRemoteRecoveryReplacementKeys(st *store.FileStore, accessToken string, recovery asiri.RecoveryConfig, previousRecoveryRecipientID string) ([]recoveryRecipientReplacement, int, error) {
+func (a App) prepareRemoteRecoveryReplacementKeys(st *store.FileStore, accessToken string, target remoteWorkspaceResponse, recovery asiri.RecoveryConfig, previousRecoveryRecipientID string) ([]recoveryRecipientReplacement, int, error) {
 	if st.State.ControlPlane == nil {
 		return nil, 0, nil
 	}
-	if binding, ok := st.RemoteBindingForPrefix(st.State.ControlPlane.WorkspaceSlug); !ok || binding.WorkspaceID != st.State.ControlPlane.WorkspaceID {
+	if binding, ok := st.RemoteBindingForPrefix(target.Slug); !ok || binding.WorkspaceID != target.ID {
 		return nil, 0, nil
 	}
-	secrets, err := listRemoteSecrets(st, st.State.ControlPlane.Origin, st.State.ControlPlane.WorkspaceID, accessToken, previousRecoveryRecipientID, false)
+	secrets, err := listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, previousRecoveryRecipientID, false)
 	if err != nil {
 		if previousRecoveryRecipientID != "" && strings.Contains(err.Error(), "HTTP 403") {
-			secrets, err = listRemoteSecrets(st, st.State.ControlPlane.Origin, st.State.ControlPlane.WorkspaceID, accessToken, "", false)
+			secrets, err = listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, "", false)
 		}
 		if err != nil {
 			return nil, 0, err
@@ -2519,7 +2406,7 @@ func (a App) prepareRemoteRecoveryReplacementKeys(st *store.FileStore, accessTok
 			covered += 1
 			continue
 		}
-		key, err := st.RecoveryWrappedKeyForSecretVersionWithConfig(secret.Scope, secret.Name, secret.Version, recovery)
+		key, err := st.RecoveryWrappedKeyForSecretVersionWithConfig(target.Slug, secret.Scope, secret.Name, secret.Version, recovery)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -2531,7 +2418,6 @@ func (a App) prepareRemoteRecoveryReplacementKeys(st *store.FileStore, accessTok
 
 type deviceTrustOptions struct {
 	Workspace string
-	All       bool
 	Origin    string
 }
 
@@ -2540,6 +2426,9 @@ func parseDeviceTrustArgs(args []string) (deviceTrustOptions, error) {
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--workspace":
+			if options.Workspace != "" {
+				return options, errors.New("device trust accepts one --workspace value")
+			}
 			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
 				return options, errors.New("--workspace requires a slug")
 			}
@@ -2550,7 +2439,7 @@ func parseDeviceTrustArgs(args []string) (deviceTrustOptions, error) {
 			options.Workspace = slug
 			i++
 		case "--all":
-			options.All = true
+			return options, errors.New("device trust requires one --workspace <slug>; --all is not supported")
 		case "--origin":
 			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
 				return options, errors.New("--origin requires a URL")
@@ -2561,11 +2450,8 @@ func parseDeviceTrustArgs(args []string) (deviceTrustOptions, error) {
 			return options, fmt.Errorf("unknown device trust argument %q", args[i])
 		}
 	}
-	if options.All && options.Workspace != "" {
-		return options, errors.New("use either --workspace or --all, not both")
-	}
-	if !options.All && options.Workspace == "" {
-		return options, errors.New("device trust requires --workspace or --all")
+	if options.Workspace == "" {
+		return options, errors.New("device trust requires --workspace <slug>")
 	}
 	return options, nil
 }
@@ -2606,7 +2492,6 @@ func (a App) whoami(st *store.FileStore, args []string) int {
 	if device, err := st.ActiveDevice(); err == nil && device.Name != "" {
 		localDeviceName = device.Name
 	}
-	workspaceSlug := firstNonEmpty(result.Workspace.Slug, st.State.ControlPlane.WorkspaceSlug)
 	remoteDeviceID := firstNonEmpty(result.Device.ID, result.Session.DeviceID, st.State.ControlPlane.DeviceID)
 	tw := tabwriter.NewWriter(a.Out, 0, 0, 2, ' ', 0)
 	fmt.Fprintf(tw, "USER ID\t%s\n", printable(firstNonEmpty(result.User.ID, st.State.ControlPlane.UserID)))
@@ -2614,9 +2499,9 @@ func (a App) whoami(st *store.FileStore, args []string) int {
 	fmt.Fprintf(tw, "NAME\t%s\n", printable(result.User.DisplayName))
 	fmt.Fprintf(tw, "ROLE\t%s\n", printable(result.User.Role))
 	fmt.Fprintf(tw, "STATUS\t%s\n", printable(result.User.Status))
-	fmt.Fprintf(tw, "WORKSPACE\t%s\n", printable(workspaceSlug))
 	if result.Session.ServiceAccountSlug != "" || st.State.ControlPlane.ServiceAccountSlug != "" {
 		fmt.Fprintf(tw, "IDENTITY\tservice account\n")
+		fmt.Fprintf(tw, "WORKSPACE\t%s\n", printable(firstNonEmpty(result.Workspace.Slug, st.State.ControlPlane.WorkspaceSlug)))
 		fmt.Fprintf(tw, "SERVICE ACCOUNT\t%s\n", printable(firstNonEmpty(result.Session.ServiceAccountSlug, st.State.ControlPlane.ServiceAccountSlug)))
 		if firstNonEmpty(result.Session.ServiceAccountName, st.State.ControlPlane.ServiceAccountName) != "" {
 			fmt.Fprintf(tw, "SERVICE ACCOUNT NAME\t%s\n", printable(firstNonEmpty(result.Session.ServiceAccountName, st.State.ControlPlane.ServiceAccountName)))
@@ -2626,7 +2511,7 @@ func (a App) whoami(st *store.FileStore, args []string) int {
 		}
 	}
 	fmt.Fprintf(tw, "LOCAL DEVICE\t%s\n", printable(localDeviceName))
-	fmt.Fprintf(tw, "REMOTE DEVICE\t%s\n", printable(remoteDeviceID))
+	fmt.Fprintf(tw, "AUTH DEVICE\t%s\n", printable(remoteDeviceID))
 	fmt.Fprintf(tw, "ORIGIN\t%s\n", printable(st.State.ControlPlane.Origin))
 	if err := tw.Flush(); err != nil {
 		return a.fail(err)
@@ -2641,11 +2526,14 @@ func (a App) deviceStatus(st *store.FileStore, args []string) int {
 	if st.State.ControlPlane == nil {
 		return a.fail(errors.New("asiri is not linked to a control plane"))
 	}
-	workspaceFilters, remaining, err := splitWorkspaceFilters(args, "device status")
+	workspaceArg, remaining, err := splitWorkspaceFlag(args, "device status", true)
 	if err != nil {
 		return a.fail(err)
 	}
 	if err := rejectUnknownArgs(remaining); err != nil {
+		return a.fail(err)
+	}
+	if err := requireServiceAccountWorkspace(st, workspaceArg); err != nil {
 		return a.fail(err)
 	}
 	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
@@ -2653,22 +2541,13 @@ func (a App) deviceStatus(st *store.FileStore, args []string) int {
 		return a.fail(err)
 	}
 	includeSecrets := st.State.ControlPlane.Source != "service-account"
-	workspaceResult, err := listRemoteWorkspaceOverview(st, st.State.ControlPlane.Origin, accessToken, includeSecrets, false)
+	workspaceResult, err := listRemoteWorkspaceOverview(st, st.State.ControlPlane.Origin, accessToken, workspaceArg, includeSecrets, false)
 	if err != nil {
 		return a.fail(err)
 	}
-	workspaces := workspaceResult.Organizations
-	targets := make([]remoteWorkspaceResponse, 0, len(workspaces))
-	if len(workspaceFilters) == 0 {
-		targets = append(targets, workspaces...)
-	} else {
-		for _, requested := range workspaceFilters {
-			target, err := requireRemoteWorkspace(workspaces, requested)
-			if err != nil {
-				return a.fail(err)
-			}
-			targets = append(targets, target)
-		}
+	target, err := requireRemoteWorkspace(workspaceResult.Organizations, workspaceArg)
+	if err != nil {
+		return a.fail(err)
 	}
 	remoteSecrets := workspaceResult.Secrets
 	var secretsErr error
@@ -2679,18 +2558,16 @@ func (a App) deviceStatus(st *store.FileStore, args []string) int {
 			secretsErr = errors.New("control plane did not return workspace secret metadata")
 		}
 	}
-	keySummaries := workspaceKeySummaries(st, targets, remoteSecrets, st.State.ControlPlane.WorkspaceID, secretsKnown)
+	keySummaries := workspaceKeySummaries(st, []remoteWorkspaceResponse{target}, remoteSecrets, secretsKnown)
 	fmt.Fprintf(a.Out, "This device: %s\n", currentDeviceDescription(st))
 	tw := tabwriter.NewWriter(a.Out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "WORKSPACE\tROLE\tTHIS DEVICE\tACCOUNT WRITE\tKEYS\tNEXT\tREMOTE DEVICE")
-	for _, workspace := range targets {
-		keySummary := keySummaries[workspace.Slug]
-		remoteDevice := workspace.CurrentDeviceID
-		if remoteDevice == "" {
-			remoteDevice = "-"
-		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", workspace.Slug, workspaceRoleLabel(workspace, st.State.UserID), deviceTrustLabelForWorkspace(workspace, st.State.ControlPlane.WorkspaceID), boolPointerLabel(workspace.CanWrite), keySummary.Keys, keySummary.Next, remoteDevice)
+	keySummary := keySummaries[target.Slug]
+	remoteDevice := target.CurrentDeviceID
+	if remoteDevice == "" {
+		remoteDevice = "-"
 	}
+	fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", target.Slug, workspaceRoleLabel(target, st.State.UserID), deviceTrustLabelForWorkspace(target), boolPointerLabel(target.CanWrite), keySummary.Keys, keySummary.Next, remoteDevice)
 	if err := tw.Flush(); err != nil {
 		return a.fail(err)
 	}
@@ -2719,81 +2596,33 @@ func (a App) deviceTrust(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	if options.All {
-		if st.State.ControlPlane == nil {
-			return a.fail(errors.New("device trust --all requires an existing control-plane session"))
-		}
-		accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
-		if err != nil {
-			return a.fail(err)
-		}
-		workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken)
-		if err != nil {
-			return a.fail(err)
-		}
-		original := remoteWorkspaceResponse{ID: st.State.ControlPlane.WorkspaceID, Slug: st.State.ControlPlane.WorkspaceSlug, CurrentDeviceTrusted: boolPtr(true), CanPull: boolPtr(true)}
-		eligible := make([]remoteWorkspaceResponse, 0)
-		tw := tabwriter.NewWriter(a.Out, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "WORKSPACE\tTHIS DEVICE\tAPPROVAL\tNEXT")
-		for _, workspace := range workspaces {
-			switch {
-			case workspaceDeviceTrusted(workspace, st.State.ControlPlane.WorkspaceID):
-				fmt.Fprintf(tw, "%s\ttrusted\tskipped\t-\n", workspace.Slug)
-			case !workspaceCanApproveDevice(workspace):
-				fmt.Fprintf(tw, "%s\tnot trusted\tskipped\task owner to approve\n", workspace.Slug)
-			default:
-				eligible = append(eligible, workspace)
-				fmt.Fprintf(tw, "%s\tnot trusted\teligible\tbrowser approval\n", workspace.Slug)
-			}
-		}
-		if err := tw.Flush(); err != nil {
-			return a.fail(err)
-		}
-		if len(eligible) == 0 {
-			fmt.Fprintln(a.Out, "No eligible workspaces need this device.")
+	if st.State.ControlPlane == nil {
+		return a.fail(errors.New("device trust requires an existing control-plane session"))
+	}
+	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	if err != nil {
+		return a.fail(err)
+	}
+	workspaceResult, err := listRemoteWorkspaceOverview(st, st.State.ControlPlane.Origin, accessToken, options.Workspace, false, false)
+	if err != nil {
+		return a.fail(err)
+	}
+	if target, ok := findWorkspace(workspaceResult.Organizations, options.Workspace); ok {
+		if workspaceDeviceTrusted(target) {
+			fmt.Fprintf(a.Out, "This device is already trusted for workspace %s\n", options.Workspace)
 			return 0
 		}
-		currentToken := accessToken
-		for _, workspace := range eligible {
-			result, err := a.trustDeviceInWorkspace(st, origin, workspace.Slug, *device)
-			if err != nil {
-				return a.fail(err)
-			}
-			currentToken = result.AccessToken
-		}
-		if original.ID != "" && st.State.ControlPlane != nil && st.State.ControlPlane.WorkspaceID != original.ID {
-			if _, err := a.ensureWorkspaceSession(st, currentToken, original); err != nil {
-				fmt.Fprintf(a.Err, "asiri: could not restore original workspace session: %s\n", err)
-			}
-		}
-		return 0
-	}
-	if st.State.ControlPlane != nil {
-		accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
-		if err != nil {
-			return a.fail(err)
-		}
-		workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken)
-		if err != nil {
-			return a.fail(err)
-		}
-		if target, ok := findWorkspace(workspaces, options.Workspace); ok {
-			if workspaceDeviceTrusted(target, st.State.ControlPlane.WorkspaceID) {
-				fmt.Fprintf(a.Out, "This device is already trusted for workspace %s\n", options.Workspace)
-				return 0
-			}
-			if !workspaceCanApproveDevice(target) {
-				return a.fail(fmt.Errorf("this account cannot approve devices for workspace %s", options.Workspace))
-			}
+		if !workspaceCanApproveDevice(target) {
+			return a.fail(fmt.Errorf("this account cannot approve devices for workspace %s", options.Workspace))
 		}
 	}
-	if _, err := a.trustDeviceInWorkspace(st, origin, options.Workspace, *device); err != nil {
+	if _, err := a.trustDeviceInWorkspace(st, origin, accessToken, options.Workspace, *device); err != nil {
 		return a.fail(err)
 	}
 	return 0
 }
 
-func (a App) trustDeviceInWorkspace(st *store.FileStore, origin, workspaceSlug string, device asiri.Device) (deviceCodeTokenResponse, error) {
+func (a App) trustDeviceInWorkspace(st *store.FileStore, origin, accessToken, workspaceSlug string, device asiri.Device) (deviceCodeTokenResponse, error) {
 	start, err := startDeviceCodeLogin(origin, workspaceSlug, device)
 	if err != nil {
 		return deviceCodeTokenResponse{}, err
@@ -2801,19 +2630,19 @@ func (a App) trustDeviceInWorkspace(st *store.FileStore, origin, workspaceSlug s
 	fmt.Fprintf(a.Out, "\nTrust this device for workspace %s\n", workspaceSlug)
 	fmt.Fprintf(a.Out, "Open %s\n", start.VerificationURIComplete)
 	fmt.Fprintf(a.Out, "Code: %s\n", start.UserCode)
-	result, err := pollDeviceCodeLogin(st, origin, start)
+	result, err := pollDeviceCodeTrust(st, origin, start)
 	if err != nil {
 		return result, err
+	}
+	if st.State.ControlPlane == nil || result.UserID != st.State.ControlPlane.UserID {
+		return result, errors.New("control plane approved device trust for a different account")
 	}
 	if result.WorkspaceSlug != workspaceSlug {
 		return result, fmt.Errorf("control plane approved workspace %s, expected %s", result.WorkspaceSlug, workspaceSlug)
 	}
-	if err := st.LinkControlPlaneForDevice(origin, result.OrgID, result.WorkspaceSlug, result.UserID, result.DeviceID, device.ID, result.AccessToken, result.RefreshToken, result.ExpiresIn, result.RefreshExpiresAt); err != nil {
-		return result, err
-	}
 	fmt.Fprintf(a.Out, "✓ This device is trusted for workspace %s\n", result.WorkspaceSlug)
 	target := remoteWorkspaceResponse{ID: result.OrgID, Slug: result.WorkspaceSlug, CurrentDeviceTrusted: boolPtr(true), CanPull: boolPtr(true), CurrentDeviceID: result.DeviceID}
-	stats, err := a.rewrapWorkspace(st, result.AccessToken, target)
+	stats, err := a.rewrapWorkspace(st, accessToken, target)
 	if err != nil {
 		fmt.Fprintf(a.Err, "asiri: trusted device, but automatic rewrap could not run: %s\n", err)
 		return result, nil
@@ -2885,7 +2714,7 @@ func (a App) device(st *store.FileStore, args []string) int {
 		if err := st.RequireInitialized(); err != nil {
 			return a.fail(err)
 		}
-		workspaceFilters, remaining, err := splitWorkspaceFilters(args[1:], "device list")
+		workspaceArg, remaining, err := splitWorkspaceFlag(args[1:], "device list", false)
 		if err != nil {
 			return a.fail(err)
 		}
@@ -2898,29 +2727,26 @@ func (a App) device(st *store.FileStore, args []string) int {
 		if local && remote {
 			return a.fail(errors.New("use either --local or --remote, not both"))
 		}
-		if remote || (!local && st.State.ControlPlane != nil) {
+		if !local && !remote {
+			return a.fail(errors.New("device list requires --local or --remote"))
+		}
+		if local && workspaceArg != "" {
+			return a.fail(errors.New("device list --local does not accept --workspace"))
+		}
+		if remote {
 			if st.State.ControlPlane == nil {
 				return a.fail(errors.New("asiri is not linked to a control plane"))
+			}
+			if workspaceArg == "" {
+				return a.fail(errors.New("device list --remote requires --workspace <slug>"))
 			}
 			accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
 			if err != nil {
 				return a.fail(err)
 			}
-			workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken)
+			target, accessToken, err := a.remoteWorkspaceTarget(st, accessToken, workspaceArg)
 			if err != nil {
 				return a.fail(err)
-			}
-			targets := make([]remoteWorkspaceResponse, 0, len(workspaces))
-			if len(workspaceFilters) == 0 {
-				targets = append(targets, workspaces...)
-			} else {
-				for _, requested := range workspaceFilters {
-					target, err := requireRemoteWorkspace(workspaces, requested)
-					if err != nil {
-						return a.fail(err)
-					}
-					targets = append(targets, target)
-				}
 			}
 			type deviceListRow struct {
 				Workspace string
@@ -2931,34 +2757,15 @@ func (a App) device(st *store.FileStore, args []string) int {
 				Note      string
 			}
 			rows := []deviceListRow{}
-			currentToken := accessToken
-			activeWorkspaceID := st.State.ControlPlane.WorkspaceID
-			for _, target := range targets {
-				if !pullWorkspaceCanPull(target, activeWorkspaceID) {
-					rows = append(rows, deviceListRow{Workspace: target.Slug, Status: "skipped", Note: "this device is not trusted for this workspace"})
+			devices, err := listRemoteDevices(st, st.State.ControlPlane.Origin, target.ID, accessToken, includeRevoked)
+			if err != nil {
+				return a.fail(err)
+			}
+			for _, device := range devices {
+				if !includeRevoked && device.Status == "revoked" {
 					continue
 				}
-				token, err := a.ensureWorkspaceSession(st, currentToken, target)
-				if err != nil {
-					rows = append(rows, deviceListRow{Workspace: target.Slug, Status: "failed", Note: err.Error()})
-					continue
-				}
-				currentToken = token
-				if st.State.ControlPlane != nil {
-					target.ID = st.State.ControlPlane.WorkspaceID
-					target.Slug = st.State.ControlPlane.WorkspaceSlug
-				}
-				devices, err := listRemoteDevices(st, st.State.ControlPlane.Origin, target.ID, currentToken, includeRevoked)
-				if err != nil {
-					rows = append(rows, deviceListRow{Workspace: target.Slug, Status: "failed", Note: err.Error()})
-					continue
-				}
-				for _, device := range devices {
-					if !includeRevoked && device.Status == "revoked" {
-						continue
-					}
-					rows = append(rows, deviceListRow{Workspace: target.Slug, ID: device.ID, Name: device.Name, Kind: device.Kind, Status: device.Status})
-				}
+				rows = append(rows, deviceListRow{Workspace: target.Slug, ID: device.ID, Name: device.Name, Kind: device.Kind, Status: device.Status})
 			}
 			tw := tabwriter.NewWriter(a.Out, 0, 0, 2, ' ', 0)
 			fmt.Fprintln(tw, "WORKSPACE\tID\tNAME\tKIND\tSTATUS\tNOTE")
@@ -2969,9 +2776,6 @@ func (a App) device(st *store.FileStore, args []string) int {
 				return a.fail(err)
 			}
 			return 0
-		}
-		if len(workspaceFilters) > 0 {
-			return a.fail(errors.New("device list --workspace requires a control-plane session or --remote"))
 		}
 		if len(st.State.Devices) == 0 {
 			fmt.Fprintln(a.Out, "No devices enrolled")
@@ -3016,19 +2820,21 @@ func (a App) device(st *store.FileStore, args []string) int {
 			if err != nil {
 				return a.fail(err)
 			}
-			device, err := revokeRemoteDevice(st, st.State.ControlPlane.Origin, deviceRef, accessToken)
+			devices, err := listRemoteDevices(st, st.State.ControlPlane.Origin, target.ID, accessToken, false)
 			if err != nil {
 				return a.fail(err)
 			}
-			revokedActive := device.ID == st.State.ControlPlane.DeviceID
+			selected, err := requireRemoteDeviceInWorkspace(devices, deviceRef, target.Slug)
+			if err != nil {
+				return a.fail(err)
+			}
+			device, err := revokeRemoteDevice(st, st.State.ControlPlane.Origin, target.ID, selected.ID, accessToken)
+			if err != nil {
+				return a.fail(err)
+			}
 			label := device.Name
 			if label == "" {
 				label = device.ID
-			}
-			if revokedActive {
-				if err := st.QuarantineLocalKeys("remote device revoked; local key material cleared"); err != nil {
-					return a.fail(fmt.Errorf("remote device revoked, but local key cleanup failed: %w", err))
-				}
 			}
 			fmt.Fprintf(a.Out, "✓ Remote device %s revoked in workspace %s; rotate affected secrets after suspected compromise\n", label, target.Slug)
 			return 0
@@ -3175,7 +2981,7 @@ func (a App) list(st *store.FileStore, args []string) int {
 	if err := st.RequireInitialized(); err != nil {
 		return a.fail(err)
 	}
-	workspaceFilters, remaining, err := splitWorkspaceFilters(args, "list")
+	workspaceArg, remaining, err := splitWorkspaceFlag(args, "list", true)
 	if err != nil {
 		return a.fail(err)
 	}
@@ -3195,17 +3001,20 @@ func (a App) list(st *store.FileStore, args []string) int {
 	if localOnly && remoteOnly {
 		return a.fail(errors.New("use either --local or --remote, not both"))
 	}
+	if err := requireServiceAccountWorkspace(st, workspaceArg); err != nil {
+		return a.fail(err)
+	}
 	filter := strings.Trim(firstPositionalSkippingFlagValues(remaining, "--status"), "/")
 	var workspaceSet map[string]bool
 	if localOnly {
-		workspaceSet, err = localWorkspaceFilterSet(workspaceFilters, "list")
+		workspaceSet, err = localWorkspaceFilterSet([]string{workspaceArg}, "list")
 	} else {
-		workspaceSet, err = a.workspaceFilterSet(st, workspaceFilters, "list")
+		workspaceSet, err = a.workspaceFilterSet(st, []string{workspaceArg}, "list")
 	}
 	if err != nil {
 		return a.fail(err)
 	}
-	if err := a.rejectWorkspacePrefixedFilter(st, filter, workspaceSet, "list", !localOnly); err != nil {
+	if err := a.rejectWorkspacePrefixedFilter(st, filter, workspaceSet, "list"); err != nil {
 		return a.fail(err)
 	}
 	rows := make(map[string]listRow)
@@ -3238,7 +3047,7 @@ func (a App) list(st *store.FileStore, args []string) int {
 			}
 			fmt.Fprintf(a.Err, "asiri: remote list unavailable: %s\n", err)
 		} else {
-			remoteSecrets, err := listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken, includeInactive)
+			remoteSecrets, err := listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken, workspaceArg, includeInactive)
 			if err != nil {
 				if remoteOnly || len(rows) == 0 {
 					return a.fail(err)
@@ -3466,12 +3275,12 @@ func (a App) remoteSecretDeleteForWorkspace(st *store.FileStore, workspaceArg st
 		return a.fail(err)
 	}
 	plan := newRemoteDeletePlan(target, []visibleRemoteSecretRecord{remoteSecret})
-	deviceID := st.State.ControlPlane.DeviceID
+	deviceID := target.CurrentDeviceID
 	if deviceID == "" {
 		return a.fail(errors.New("control-plane session is missing current device id"))
 	}
 	if hasFlag(remaining, "--dry-run") {
-		if err := preflightRemoteSecretDelete(st, st.State.ControlPlane.Origin, remoteSecret.ID, remoteSecret.Version, deviceID, accessToken); err != nil {
+		if err := preflightRemoteSecretDelete(st, st.State.ControlPlane.Origin, target.ID, remoteSecret.ID, remoteSecret.Version, deviceID, accessToken); err != nil {
 			return a.fail(err)
 		}
 		printRemoteDeletePlan(a.Out, plan)
@@ -3488,7 +3297,7 @@ func (a App) remoteSecretDeleteForWorkspace(st *store.FileStore, workspaceArg st
 			return a.fail(err)
 		}
 	}
-	deleted, err := deleteRemoteSecret(st, st.State.ControlPlane.Origin, remoteSecret.ID, remoteSecret.Version, deviceID, accessToken)
+	deleted, err := deleteRemoteSecret(st, st.State.ControlPlane.Origin, target.ID, remoteSecret.ID, remoteSecret.Version, deviceID, accessToken)
 	if err != nil {
 		return a.fail(err)
 	}
@@ -3545,11 +3354,11 @@ func (a App) remoteSecretRestore(st *store.FileStore, args []string) int {
 			return a.fail(err)
 		}
 	}
-	deviceID := st.State.ControlPlane.DeviceID
+	deviceID := target.CurrentDeviceID
 	if deviceID == "" {
 		return a.fail(errors.New("control-plane session is missing current device id"))
 	}
-	restored, err := restoreRemoteSecret(st, st.State.ControlPlane.Origin, remoteSecret.ID, remoteSecret.Version, deviceID, accessToken)
+	restored, err := restoreRemoteSecret(st, st.State.ControlPlane.Origin, target.ID, remoteSecret.ID, remoteSecret.Version, deviceID, accessToken)
 	if err != nil {
 		return a.fail(err)
 	}
@@ -3569,11 +3378,11 @@ type remoteDeleteConfirmationOptions struct {
 }
 
 func (a App) remoteSecretDeleteRemoteOnly(st *store.FileStore, accessToken string, target remoteWorkspaceResponse, mode remoteDeleteBulkMode, confirm remoteDeleteConfirmationOptions) int {
-	deviceID := st.State.ControlPlane.DeviceID
+	deviceID := target.CurrentDeviceID
 	if deviceID == "" {
 		return a.fail(errors.New("control-plane session is missing current device id"))
 	}
-	secrets, err := listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken, false)
+	secrets, err := listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken, target.Slug, false)
 	if err != nil {
 		return a.fail(err)
 	}
@@ -3585,7 +3394,7 @@ func (a App) remoteSecretDeleteRemoteOnly(st *store.FileStore, accessToken strin
 	plan := newRemoteDeletePlan(target, candidates)
 	if confirm.DryRun {
 		for _, secret := range candidates {
-			if err := preflightRemoteSecretDelete(st, st.State.ControlPlane.Origin, secret.ID, secret.Version, deviceID, accessToken); err != nil {
+			if err := preflightRemoteSecretDelete(st, st.State.ControlPlane.Origin, target.ID, secret.ID, secret.Version, deviceID, accessToken); err != nil {
 				return a.fail(fmt.Errorf("failed to preflight delete %s: %w", shortSecretPath(secret.Scope, secret.Name), err))
 			}
 		}
@@ -3612,15 +3421,15 @@ func (a App) remoteSecretDeleteRemoteOnly(st *store.FileStore, accessToken strin
 		}
 	}
 	for _, secret := range candidates {
-		if err := preflightRemoteSecretDelete(st, st.State.ControlPlane.Origin, secret.ID, secret.Version, deviceID, accessToken); err != nil {
+		if err := preflightRemoteSecretDelete(st, st.State.ControlPlane.Origin, target.ID, secret.ID, secret.Version, deviceID, accessToken); err != nil {
 			return a.fail(fmt.Errorf("failed to preflight delete %s: %w", shortSecretPath(secret.Scope, secret.Name), err))
 		}
 	}
 	deletedRecords := []visibleRemoteSecretRecord{}
 	for _, secret := range candidates {
-		deletedSecret, err := deleteRemoteSecret(st, st.State.ControlPlane.Origin, secret.ID, secret.Version, deviceID, accessToken)
+		deletedSecret, err := deleteRemoteSecret(st, st.State.ControlPlane.Origin, target.ID, secret.ID, secret.Version, deviceID, accessToken)
 		if err != nil {
-			if rollbackErr := rollbackRemoteSecretDeletes(st, st.State.ControlPlane.Origin, deletedRecords, &secret, deviceID, accessToken); rollbackErr != nil {
+			if rollbackErr := rollbackRemoteSecretDeletes(st, st.State.ControlPlane.Origin, target.ID, deletedRecords, &secret, deviceID, accessToken); rollbackErr != nil {
 				return a.fail(fmt.Errorf("failed to delete %s: %w; rollback failed: %v", shortSecretPath(secret.Scope, secret.Name), err, rollbackErr))
 			}
 			return a.fail(fmt.Errorf("failed to delete %s after preflight; restored %d earlier delete(s) and checked failed target: %w", shortSecretPath(secret.Scope, secret.Name), len(deletedRecords), err))
@@ -3635,13 +3444,14 @@ func (a App) remoteSecretDeleteRemoteOnly(st *store.FileStore, accessToken strin
 	return 0
 }
 
-func rollbackRemoteSecretDeletes(st *store.FileStore, origin string, deleted []visibleRemoteSecretRecord, maybeDeleted *visibleRemoteSecretRecord, deviceID, accessToken string) error {
+func rollbackRemoteSecretDeletes(st *store.FileStore, origin, orgID string, deleted []visibleRemoteSecretRecord, maybeDeleted *visibleRemoteSecretRecord, deviceID, accessToken string) error {
 	var failures []string
 	if maybeDeleted != nil {
 		secret := *maybeDeleted
-		if _, err := restoreRemoteSecret(st, origin, secret.ID, secret.Version, deviceID, accessToken); err != nil {
+		if _, err := restoreRemoteSecret(st, origin, orgID, secret.ID, secret.Version, deviceID, accessToken); err != nil {
 			if remoteRestoreAlreadyActive(err) {
-				active, activeErr := remoteSecretRecordActive(st, origin, accessToken, secret.ID)
+				workspace := firstNonEmpty(secret.WorkspaceSlug, store.WorkspacePrefix(secret.Scope), orgID)
+				active, activeErr := remoteSecretRecordActive(st, origin, workspace, accessToken, secret.ID)
 				if activeErr != nil {
 					failures = append(failures, fmt.Sprintf("%s: %v; active check failed: %v", shortSecretPath(secret.Scope, secret.Name), err, activeErr))
 				} else if !active {
@@ -3654,7 +3464,7 @@ func rollbackRemoteSecretDeletes(st *store.FileStore, origin string, deleted []v
 	}
 	for i := len(deleted) - 1; i >= 0; i-- {
 		secret := deleted[i]
-		if _, err := restoreRemoteSecret(st, origin, secret.ID, secret.Version, deviceID, accessToken); err != nil {
+		if _, err := restoreRemoteSecret(st, origin, orgID, secret.ID, secret.Version, deviceID, accessToken); err != nil {
 			failures = append(failures, fmt.Sprintf("%s: %v", shortSecretPath(secret.Scope, secret.Name), err))
 		}
 	}
@@ -3668,8 +3478,8 @@ func remoteRestoreAlreadyActive(err error) bool {
 	return strings.Contains(err.Error(), "HTTP 409")
 }
 
-func remoteSecretRecordActive(st *store.FileStore, origin, accessToken, secretID string) (bool, error) {
-	secrets, err := listVisibleRemoteSecrets(st, origin, accessToken, true)
+func remoteSecretRecordActive(st *store.FileStore, origin, workspace, accessToken, secretID string) (bool, error) {
+	secrets, err := listVisibleRemoteSecrets(st, origin, workspace, accessToken, true)
 	if err != nil {
 		return false, err
 	}
@@ -3891,14 +3701,14 @@ func (a App) policy(st *store.FileStore, args []string) int {
 	if err := st.RequireInitialized(); err != nil {
 		return a.fail(err)
 	}
-	workspaceFilters, remaining, err := splitWorkspaceFilters(args[1:], "policy list")
+	workspaceArg, remaining, err := splitWorkspaceFlag(args[1:], "policy list", true)
 	if err != nil {
 		return a.fail(err)
 	}
 	if err := rejectUnknownArgs(remaining); err != nil {
 		return a.fail(err)
 	}
-	workspaceSet, err := a.workspaceFilterSet(st, workspaceFilters, "policy list")
+	workspaceSet, err := a.workspaceFilterSet(st, []string{workspaceArg}, "policy list")
 	if err != nil {
 		return a.fail(err)
 	}
@@ -4824,7 +4634,11 @@ func (a App) remoteSelectionHint(st *store.FileStore, pathSpec, agent, action st
 	if err != nil {
 		return ""
 	}
-	secrets, err := listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken, false)
+	requestedWorkspace := store.WorkspacePrefix(pathSpec)
+	if requestedWorkspace == "" {
+		return ""
+	}
+	secrets, err := listVisibleRemoteSecrets(st, st.State.ControlPlane.Origin, accessToken, requestedWorkspace, false)
 	if err != nil {
 		return ""
 	}
@@ -5095,7 +4909,7 @@ func (a App) syncRuntimeAuditBestEffortFromPath(path string, mu *sync.Mutex) {
 	acks := []store.RemoteAuditAck{}
 	for _, batch := range batches {
 		var response runtimeAuditBatchResponse
-		if err := postJSONBearerTimeout(st, endpoint, accessToken, runtimeAuditBatchRequest{Events: batch}, &response, runtimeAuditSyncTimeout); err != nil {
+		if err := postJSONBearerTimeout(st, endpoint, accessToken, runtimeAuditBatchRequest{OrgID: batch[0].OrgID, Events: batch}, &response, runtimeAuditSyncTimeout); err != nil {
 			continue
 		}
 		acks = append(acks, runtimeAuditRemoteAcks(batch, response.Acks)...)
@@ -5131,6 +4945,9 @@ func parseBrokerStartArgs(args []string) (brokerStartOptions, error) {
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--workspace", "-w":
+			if options.Workspace != "" {
+				return options, errors.New("broker start accepts one --workspace value")
+			}
 			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
 				return options, errors.New("--workspace requires a slug")
 			}
@@ -5299,8 +5116,6 @@ func brokerRuntimeAuditMetadata(st *store.FileStore, workspaceSlug, label, label
 		if st != nil {
 			if binding, ok := st.RemoteBindingForPrefix(workspaceSlug); ok && binding.WorkspaceID != "" {
 				metadata["workspaceId"] = binding.WorkspaceID
-			} else if st.State.ControlPlane != nil && st.State.ControlPlane.WorkspaceSlug == workspaceSlug {
-				metadata["workspaceId"] = st.State.ControlPlane.WorkspaceID
 			}
 		}
 	}
@@ -5317,14 +5132,14 @@ func (a App) audit(st *store.FileStore, args []string) int {
 	if err := st.RequireInitialized(); err != nil {
 		return a.fail(err)
 	}
-	workspaceFilters, remaining, err := splitWorkspaceFilters(args[1:], "audit tail")
+	workspaceArg, remaining, err := splitWorkspaceFlag(args[1:], "audit tail", true)
 	if err != nil {
 		return a.fail(err)
 	}
 	if err := rejectUnknownArgs(remaining, "--limit"); err != nil {
 		return a.fail(err)
 	}
-	workspaceSet, err := a.workspaceFilterSet(st, workspaceFilters, "audit tail")
+	workspaceSet, err := a.workspaceFilterSet(st, []string{workspaceArg}, "audit tail")
 	if err != nil {
 		return a.fail(err)
 	}
@@ -5389,7 +5204,7 @@ func (a App) syncRuntimeAuditBestEffort(st *store.FileStore) {
 	updated := false
 	for _, batch := range runtimeAuditBatchesByWorkspace(events) {
 		var response runtimeAuditBatchResponse
-		if err := postJSONBearerTimeout(st, endpoint, accessToken, runtimeAuditBatchRequest{Events: batch}, &response, runtimeAuditSyncTimeout); err != nil {
+		if err := postJSONBearerTimeout(st, endpoint, accessToken, runtimeAuditBatchRequest{OrgID: batch[0].OrgID, Events: batch}, &response, runtimeAuditSyncTimeout); err != nil {
 			continue
 		}
 		// A 2xx without matching acks stays pending; the ack is the durable sync boundary.
@@ -5422,6 +5237,7 @@ func runtimeAuditAccessToken(st *store.FileStore) (string, bool) {
 }
 
 type runtimeAuditBatchRequest struct {
+	OrgID  string                    `json:"orgId"`
 	Events []runtimeAuditUploadEvent `json:"events"`
 }
 
@@ -5581,7 +5397,7 @@ func (a App) syncRuntimeAuditStrictBatch(st *store.FileStore, events []asiri.Aud
 	if st.State.ControlPlane == nil {
 		return errors.New("control plane is not linked")
 	}
-	// The active session is only the authentication credential here. The
+	// The account session is only the authentication credential here. The
 	// requested secret workspace travels in the audit event orgId, so strict
 	// ack must never switch or overwrite the user's active CLI workspace.
 	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
@@ -5600,7 +5416,7 @@ func (a App) syncRuntimeAuditStrictBatch(st *store.FileStore, events []asiri.Aud
 	allAcks := []store.RemoteAuditAck{}
 	for _, batch := range runtimeAuditBatchesByWorkspace(uploads) {
 		var response runtimeAuditBatchResponse
-		if err := postJSONBearerTimeout(st, endpoint, accessToken, runtimeAuditBatchRequest{Events: batch}, &response, runtimeAuditSyncTimeout); err != nil {
+		if err := postJSONBearerTimeout(st, endpoint, accessToken, runtimeAuditBatchRequest{OrgID: batch[0].OrgID, Events: batch}, &response, runtimeAuditSyncTimeout); err != nil {
 			return err
 		}
 		acks := runtimeAuditRemoteAcks(batch, response.Acks)
@@ -5641,7 +5457,7 @@ func runtimeLabelType(agentExplicit bool) string {
 
 func runtimeSubject(st *store.FileStore, current, fallback string, agentExplicit bool) (string, string, error) {
 	if st != nil && st.State.ControlPlane != nil && st.State.ControlPlane.Source == "service-account" {
-		serviceAccount := store.NormalizeSubjectLabel(st.State.ControlPlane.ServiceAccountSlug)
+		serviceAccount := store.ServiceAccountRuntimeSubject(st.State.ControlPlane.ServiceAccountID)
 		if serviceAccount == "" {
 			return "", "", errors.New("service account session is missing service account identity")
 		}
@@ -5793,6 +5609,7 @@ type deviceCodeTokenResponse struct {
 	Status             string `json:"status"`
 	Error              string `json:"error"`
 	Message            string `json:"message"`
+	SessionIssued      *bool  `json:"sessionIssued"`
 	OrgID              string `json:"orgId"`
 	WorkspaceSlug      string `json:"workspaceSlug"`
 	UserID             string `json:"userId"`
@@ -5874,7 +5691,6 @@ type remoteWorkspaceResponse struct {
 
 type remoteWorkspacesResponse struct {
 	Organizations []remoteWorkspaceResponse   `json:"organizations"`
-	ActiveOrgID   string                      `json:"activeOrgId"`
 	Secrets       []visibleRemoteSecretRecord `json:"secrets,omitempty"`
 }
 
@@ -5908,10 +5724,8 @@ type remotePoliciesResponse struct {
 }
 
 type writeOptionsResponse struct {
-	RequestedWorkspaceSlug string                 `json:"requestedWorkspaceSlug"`
-	SourceWorkspace        *writeWorkspaceOption  `json:"sourceWorkspace"`
-	ActiveWorkspace        writeWorkspaceOption   `json:"activeWorkspace"`
-	WritableWorkspaces     []writeWorkspaceOption `json:"writableWorkspaces"`
+	RequestedWorkspaceSlug string               `json:"requestedWorkspaceSlug"`
+	Workspace              writeWorkspaceOption `json:"workspace"`
 }
 
 type writeWorkspaceOption struct {
@@ -6110,6 +5924,60 @@ func pollDeviceCodeLogin(st *store.FileStore, origin string, start deviceCodeSta
 	}
 }
 
+func pollDeviceCodeTrust(st *store.FileStore, origin string, start deviceCodeStartResponse) (deviceCodeTokenResponse, error) {
+	deadline := time.Now().Add(time.Duration(start.ExpiresIn) * time.Second)
+	if start.ExpiresIn <= 0 {
+		deadline = time.Now().Add(10 * time.Minute)
+	}
+	interval := time.Duration(start.Interval) * time.Second
+	if interval <= 0 {
+		interval = 250 * time.Millisecond
+	}
+	for {
+		var result deviceCodeTokenResponse
+		status, err := postJSONDeviceCodeClaimStatus(st, origin+"/v1/auth/device-code/token", map[string]any{"deviceCode": start.DeviceCode, "trustOnly": true}, credentialHash(start.DeviceCode), &result)
+		if err != nil {
+			return result, err
+		}
+		if status == http.StatusOK && result.Status == "approved" {
+			hasAccessToken := result.AccessToken != ""
+			hasRefreshToken := result.RefreshToken != ""
+			if hasRefreshToken {
+				if result.DeviceID == "" {
+					return result, errors.New("control plane issued a device-trust session without a device id; session cleanup could not run")
+				}
+				cleanupErr := logoutDeviceSessionForDevice(st, origin, result.RefreshToken, result.DeviceID)
+				result.AccessToken = ""
+				result.RefreshToken = ""
+				if cleanupErr != nil {
+					return result, fmt.Errorf("device trust succeeded, but the temporary server session could not be revoked: %w", cleanupErr)
+				}
+				if !hasAccessToken {
+					return result, errors.New("control plane returned incomplete device-trust session credentials")
+				}
+				if result.SessionIssued != nil && !*result.SessionIssued {
+					return result, errors.New("control plane returned session credentials for a trust-only claim")
+				}
+			} else if hasAccessToken {
+				return result, errors.New("control plane issued a device-trust access token without a refresh token; session cleanup could not run")
+			} else if result.SessionIssued == nil || *result.SessionIssued {
+				return result, errors.New("control plane did not confirm a trust-only device-code claim")
+			}
+			if result.OrgID == "" || result.WorkspaceSlug == "" || result.UserID == "" || result.DeviceID == "" {
+				return result, errors.New("control plane approved device trust without link metadata")
+			}
+			return result, nil
+		}
+		if result.Error != "" && result.Error != "authorization_pending" {
+			return result, fmt.Errorf("device-code trust failed: %s", result.Error)
+		}
+		if time.Now().After(deadline) {
+			return result, errors.New("device-code trust timed out")
+		}
+		time.Sleep(interval)
+	}
+}
+
 func refreshDeviceSession(origin string, st *store.FileStore) (sessionRefreshResponse, int, error) {
 	var result sessionRefreshResponse
 	refreshToken, err := st.ControlPlaneRefreshToken()
@@ -6129,22 +5997,37 @@ func refreshDeviceSession(origin string, st *store.FileStore) (sessionRefreshRes
 }
 
 func logoutDeviceSession(st *store.FileStore, origin, refreshToken string) error {
-	_, err := postJSONDeviceSignedStatus(st, origin+"/v1/auth/session/logout", map[string]string{"refreshToken": refreshToken}, credentialHash(refreshToken), nil)
-	return err
-}
-
-func listRemoteWorkspaces(st *store.FileStore, origin, accessToken string) ([]remoteWorkspaceResponse, error) {
-	result, err := listRemoteWorkspaceOverview(st, origin, accessToken, false, false)
-	if err != nil {
-		return nil, err
+	if st.State.ControlPlane == nil || st.State.ControlPlane.DeviceID == "" {
+		return errors.New("control plane device is not linked")
 	}
-	return result.Organizations, nil
+	return logoutDeviceSessionForDevice(st, origin, refreshToken, st.State.ControlPlane.DeviceID)
 }
 
-func listRemoteWorkspaceOverview(st *store.FileStore, origin, accessToken string, includeSecrets, includeInactive bool) (remoteWorkspacesResponse, error) {
+func logoutDeviceSessionForDevice(st *store.FileStore, origin, refreshToken, remoteDeviceID string) error {
+	var failure controlPlaneFailureResponse
+	status, err := postJSONDeviceSignedForDeviceStatus(st, origin+"/v1/auth/session/logout", map[string]string{"refreshToken": refreshToken}, credentialHash(refreshToken), remoteDeviceID, &failure)
+	if err != nil {
+		return err
+	}
+	if status < http.StatusOK || status >= http.StatusMultipleChoices {
+		if failure.Message != "" {
+			return fmt.Errorf("control plane returned HTTP %d: %s", status, failure.Message)
+		}
+		if failure.Error != "" {
+			return fmt.Errorf("control plane returned HTTP %d: %s", status, failure.Error)
+		}
+		return fmt.Errorf("control plane returned HTTP %d", status)
+	}
+	return nil
+}
+
+func listRemoteWorkspaceOverview(st *store.FileStore, origin, accessToken, workspace string, includeSecrets, includeInactive bool) (remoteWorkspacesResponse, error) {
 	var result remoteWorkspacesResponse
 	endpoint := strings.TrimRight(origin, "/") + "/v1/orgs"
 	params := url.Values{}
+	if workspace != "" {
+		params.Set("workspace", workspace)
+	}
 	if includeSecrets {
 		params.Set("includeSecrets", "1")
 	}
@@ -6206,10 +6089,10 @@ func requireRemoteServiceAccount(st *store.FileStore, origin, orgID, accessToken
 	return account, nil
 }
 
-func disableRemoteServiceAccount(st *store.FileStore, origin, accessToken, accountID string) (remoteServiceAccountResponse, error) {
+func disableRemoteServiceAccount(st *store.FileStore, origin, accessToken, orgID, accountID string) (remoteServiceAccountResponse, error) {
 	var result remoteServiceAccountResponse
 	endpoint := fmt.Sprintf("%s/v1/service-accounts/%s/disable", strings.TrimRight(origin, "/"), url.PathEscape(accountID))
-	if err := postJSONBearer(st, endpoint, accessToken, map[string]string{}, &result); err != nil {
+	if err := postJSONBearer(st, endpoint, accessToken, map[string]string{"orgId": orgID}, &result); err != nil {
 		return result, err
 	}
 	if result.ID == "" || result.Slug == "" {
@@ -6334,58 +6217,29 @@ func requireRemoteWorkspace(workspaces []remoteWorkspaceResponse, requested stri
 	return workspace, nil
 }
 
-func (a App) ensureWorkspaceSession(st *store.FileStore, accessToken string, workspace remoteWorkspaceResponse) (string, error) {
-	if st.State.ControlPlane == nil {
-		return "", errors.New("asiri is not linked to a control plane")
-	}
-	if workspace.ID == "" {
-		return "", errors.New("workspace id is required")
-	}
-	if workspace.ID == st.State.ControlPlane.WorkspaceID {
-		return accessToken, nil
-	}
-	device, err := st.ActiveDevice()
-	if err != nil {
-		return "", err
-	}
-	result, err := switchRemoteWorkspace(st, st.State.ControlPlane.Origin, accessToken, workspace.ID, *device)
-	if err != nil {
-		return "", err
-	}
-	if err := st.LinkControlPlaneForDevice(st.State.ControlPlane.Origin, result.OrgID, result.WorkspaceSlug, result.UserID, result.DeviceID, device.ID, result.AccessToken, result.RefreshToken, result.ExpiresIn, result.RefreshExpiresAt); err != nil {
-		return "", err
-	}
-	return result.AccessToken, nil
-}
-
 func (a App) remoteWorkspaceTarget(st *store.FileStore, accessToken, requested string) (remoteWorkspaceResponse, string, error) {
 	requested = strings.TrimSpace(requested)
+	if err := requireServiceAccountWorkspace(st, requested); err != nil {
+		return remoteWorkspaceResponse{}, "", err
+	}
 	if _, err := localWorkspaceSlug(requested); err != nil {
 		return remoteWorkspaceResponse{}, "", errors.New("--workspace requires a workspace slug")
 	}
-	if st.State.ControlPlane != nil && requested == st.State.ControlPlane.WorkspaceSlug {
-		return remoteWorkspaceResponse{ID: st.State.ControlPlane.WorkspaceID, Slug: st.State.ControlPlane.WorkspaceSlug, CanPull: boolPtr(true), CanWrite: boolPtr(true), CurrentDeviceTrusted: boolPtr(true), CurrentDeviceID: st.State.ControlPlane.DeviceID}, accessToken, nil
-	}
-	workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken)
+	workspaceResult, err := listRemoteWorkspaceOverview(st, st.State.ControlPlane.Origin, accessToken, requested, false, false)
 	if err != nil {
 		return remoteWorkspaceResponse{}, "", err
 	}
-	workspace, err := requireRemoteWorkspace(workspaces, requested)
+	workspace, err := requireRemoteWorkspace(workspaceResult.Organizations, requested)
 	if err != nil {
 		return remoteWorkspaceResponse{}, "", err
 	}
-	token, err := a.ensureWorkspaceSession(st, accessToken, workspace)
-	if err != nil {
-		if workspaceNeedsDeviceTrust(err) {
-			return remoteWorkspaceResponse{}, "", fmt.Errorf("this device is not trusted for workspace %s; device %s; next: %s", requested, currentDeviceDescription(st), deviceTrustCommand(st, requested))
-		}
-		return remoteWorkspaceResponse{}, "", err
+	if st.State.ControlPlane.Source == "service-account" && workspace.ID != st.State.ControlPlane.WorkspaceID {
+		return remoteWorkspaceResponse{}, "", fmt.Errorf("service account session is scoped to workspace %s", st.State.ControlPlane.WorkspaceSlug)
 	}
-	if st.State.ControlPlane != nil {
-		workspace.ID = st.State.ControlPlane.WorkspaceID
-		workspace.Slug = st.State.ControlPlane.WorkspaceSlug
+	if !workspaceDeviceTrusted(workspace) || workspace.CurrentDeviceID == "" {
+		return remoteWorkspaceResponse{}, "", fmt.Errorf("this device is not trusted for workspace %s; device %s; next: %s", requested, currentDeviceDescription(st), deviceTrustCommand(st, requested))
 	}
-	return workspace, token, nil
+	return workspace, latestControlPlaneBearer(st, accessToken), nil
 }
 
 func (a App) pushWorkspaceTarget(st *store.FileStore, accessToken, requested string) (remoteWorkspaceResponse, string, error) {
@@ -6393,165 +6247,17 @@ func (a App) pushWorkspaceTarget(st *store.FileStore, accessToken, requested str
 	if _, err := localWorkspaceSlug(requested); err != nil {
 		return remoteWorkspaceResponse{}, "", errors.New("--workspace requires a workspace slug")
 	}
-	if st.State.ControlPlane != nil && requested == st.State.ControlPlane.WorkspaceSlug {
-		return remoteWorkspaceResponse{ID: st.State.ControlPlane.WorkspaceID, Slug: st.State.ControlPlane.WorkspaceSlug, CanPull: boolPtr(true), CanWrite: boolPtr(true), CurrentDeviceTrusted: boolPtr(true), CurrentDeviceID: st.State.ControlPlane.DeviceID}, accessToken, nil
-	}
-	workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken)
-	if err != nil {
-		return remoteWorkspaceResponse{}, "", err
-	}
-	workspace, err := requireRemoteWorkspace(workspaces, requested)
+	workspace, token, err := a.remoteWorkspaceTarget(st, accessToken, requested)
 	if err != nil {
 		return remoteWorkspaceResponse{}, "", err
 	}
 	if workspace.CanWrite != nil && !*workspace.CanWrite {
 		return remoteWorkspaceResponse{}, "", fmt.Errorf("this account cannot write secrets in workspace %s", requested)
 	}
-	if !workspaceDeviceTrusted(workspace, st.State.ControlPlane.WorkspaceID) {
-		return remoteWorkspaceResponse{}, "", fmt.Errorf("this device is not trusted for workspace %s; device %s; next: %s", requested, currentDeviceDescription(st), deviceTrustCommand(st, requested))
-	}
-	token, err := a.ensureWorkspaceSession(st, accessToken, workspace)
-	if err != nil {
-		if workspaceNeedsDeviceTrust(err) {
-			return remoteWorkspaceResponse{}, "", fmt.Errorf("this device is not trusted for workspace %s; device %s; next: %s", requested, currentDeviceDescription(st), deviceTrustCommand(st, requested))
-		}
-		return remoteWorkspaceResponse{}, "", err
-	}
-	if st.State.ControlPlane != nil {
-		workspace.ID = st.State.ControlPlane.WorkspaceID
-		workspace.Slug = st.State.ControlPlane.WorkspaceSlug
-		workspace.CurrentDeviceTrusted = boolPtr(true)
-		workspace.CanPull = boolPtr(true)
-	}
 	return workspace, token, nil
 }
 
-func (a App) pushWorkspaceTargetDryRun(st *store.FileStore, accessToken, requested string) (remoteWorkspaceResponse, string, func(), error) {
-	restore := snapshotPushDryRunState(st)
-	requested = strings.TrimSpace(requested)
-	if _, err := localWorkspaceSlug(requested); err != nil {
-		restore()
-		return remoteWorkspaceResponse{}, "", nil, errors.New("--workspace requires a workspace slug")
-	}
-	if st.State.ControlPlane != nil && requested == st.State.ControlPlane.WorkspaceSlug {
-		return remoteWorkspaceResponse{ID: st.State.ControlPlane.WorkspaceID, Slug: st.State.ControlPlane.WorkspaceSlug, CanPull: boolPtr(true), CanWrite: boolPtr(true), CurrentDeviceTrusted: boolPtr(true), CurrentDeviceID: st.State.ControlPlane.DeviceID}, accessToken, restore, nil
-	}
-	workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken)
-	if err != nil {
-		restore()
-		return remoteWorkspaceResponse{}, "", nil, err
-	}
-	workspace, err := requireRemoteWorkspace(workspaces, requested)
-	if err != nil {
-		restore()
-		return remoteWorkspaceResponse{}, "", nil, err
-	}
-	if workspace.CanWrite != nil && !*workspace.CanWrite {
-		restore()
-		return remoteWorkspaceResponse{}, "", nil, fmt.Errorf("this account cannot write secrets in workspace %s", requested)
-	}
-	if !workspaceDeviceTrusted(workspace, st.State.ControlPlane.WorkspaceID) {
-		restore()
-		return remoteWorkspaceResponse{}, "", nil, fmt.Errorf("this device is not trusted for workspace %s; device %s; next: %s", requested, currentDeviceDescription(st), deviceTrustCommand(st, requested))
-	}
-	device, err := st.ActiveDevice()
-	if err != nil {
-		restore()
-		return remoteWorkspaceResponse{}, "", nil, err
-	}
-	result, err := switchRemoteWorkspace(st, st.State.ControlPlane.Origin, accessToken, workspace.ID, *device)
-	if err != nil {
-		restore()
-		if workspaceNeedsDeviceTrust(err) {
-			return remoteWorkspaceResponse{}, "", nil, fmt.Errorf("this device is not trusted for workspace %s; device %s; next: %s", requested, currentDeviceDescription(st), deviceTrustCommand(st, requested))
-		}
-		return remoteWorkspaceResponse{}, "", nil, err
-	}
-	st.State.ControlPlane = transientControlPlaneLink(st.State.ControlPlane, result, device.ID)
-	workspace.ID = result.OrgID
-	workspace.Slug = result.WorkspaceSlug
-	workspace.CurrentDeviceTrusted = boolPtr(true)
-	workspace.CanPull = boolPtr(true)
-	workspace.CanWrite = boolPtr(true)
-	return workspace, result.AccessToken, restore, nil
-}
-
-func snapshotPushDryRunState(st *store.FileStore) func() {
-	var controlPlane *asiri.ControlPlaneLink
-	if st.State.ControlPlane != nil {
-		copy := *st.State.ControlPlane
-		controlPlane = &copy
-	}
-	remoteBindings := map[string]asiri.RemoteWorkspaceBinding{}
-	for key, value := range st.State.RemoteBindings {
-		remoteBindings[key] = value
-	}
-	return func() {
-		st.State.ControlPlane = controlPlane
-		st.State.RemoteBindings = remoteBindings
-	}
-}
-
-func transientControlPlaneLink(current *asiri.ControlPlaneLink, result deviceCodeTokenResponse, localDeviceID string) *asiri.ControlPlaneLink {
-	origin := ""
-	if current != nil {
-		origin = current.Origin
-	}
-	expiresAt := time.Now().UTC().Add(time.Duration(result.ExpiresIn) * time.Second)
-	if result.ExpiresIn <= 0 {
-		expiresAt = time.Now().UTC().Add(time.Hour)
-	}
-	return &asiri.ControlPlaneLink{
-		Origin:               origin,
-		WorkspaceID:          result.OrgID,
-		WorkspaceSlug:        result.WorkspaceSlug,
-		UserID:               result.UserID,
-		DeviceID:             result.DeviceID,
-		LocalDeviceID:        localDeviceID,
-		Source:               "device-code",
-		AccessTokenExpiresAt: expiresAt,
-		RefreshExpiresAt:     expiresAt,
-		LinkedAt:             time.Now().UTC(),
-	}
-}
-
-func workspaceNeedsDeviceTrust(err error) bool {
-	if err == nil {
-		return false
-	}
-	message := err.Error()
-	return strings.Contains(message, "trusted matching device required") || strings.Contains(message, "control plane returned HTTP 403")
-}
-
-func switchRemoteWorkspace(st *store.FileStore, origin, accessToken, workspace string, device asiri.Device) (deviceCodeTokenResponse, error) {
-	body := map[string]string{
-		"workspace":           workspace,
-		"deviceName":          device.Name,
-		"kind":                string(device.Kind),
-		"encryptionPublicKey": device.EncryptionPublicKey,
-		"signingPublicKey":    device.SigningPublicKey,
-	}
-	var result deviceCodeTokenResponse
-	status, err := postJSONBearerStatus(st, strings.TrimRight(origin, "/")+"/v1/auth/session/switch", accessToken, body, &result)
-	if err != nil {
-		return result, err
-	}
-	if status < 200 || status >= 300 {
-		if result.Message != "" {
-			return result, fmt.Errorf("control plane returned HTTP %d: %s", status, result.Message)
-		}
-		if result.Error != "" {
-			return result, fmt.Errorf("control plane returned HTTP %d: %s", status, result.Error)
-		}
-		return result, fmt.Errorf("control plane returned HTTP %d", status)
-	}
-	if result.Status != "approved" || result.OrgID == "" || result.WorkspaceSlug == "" || result.UserID == "" || result.DeviceID == "" || result.AccessToken == "" || result.RefreshToken == "" {
-		return result, errors.New("control plane switched workspace without link metadata")
-	}
-	return result, nil
-}
-
-func remoteWriteOptions(st *store.FileStore, origin, accessToken string, refs []store.LocalSecretRef) (writeOptionsResponse, error) {
+func remoteWriteOptions(st *store.FileStore, origin, accessToken string, target remoteWorkspaceResponse, refs []store.LocalSecretRef) (writeOptionsResponse, error) {
 	entries := make([]map[string]string, 0, len(refs))
 	seen := map[string]bool{}
 	for _, ref := range refs {
@@ -6563,11 +6269,14 @@ func remoteWriteOptions(st *store.FileStore, origin, accessToken string, refs []
 		entries = append(entries, map[string]string{"scope": ref.Scope, "name": ref.Name})
 	}
 	var result writeOptionsResponse
-	if err := postJSONBearer(st, strings.TrimRight(origin, "/")+"/v1/sync/write-options", accessToken, map[string]any{"entries": entries}, &result); err != nil {
+	if err := postJSONBearer(st, strings.TrimRight(origin, "/")+"/v1/sync/write-options", accessToken, map[string]any{"orgId": target.ID, "entries": entries}, &result); err != nil {
 		return result, err
 	}
-	if result.RequestedWorkspaceSlug == "" || result.ActiveWorkspace.Slug == "" {
+	if result.RequestedWorkspaceSlug == "" || result.Workspace.Slug == "" {
 		return result, errors.New("control plane returned incomplete write options")
+	}
+	if result.Workspace.ID != target.ID || result.Workspace.Slug != target.Slug || result.RequestedWorkspaceSlug != target.Slug {
+		return result, errors.New("control plane returned write options for a different workspace")
 	}
 	return result, nil
 }
@@ -6736,26 +6445,37 @@ func parseControlPlaneFailure(responseBody []byte) controlPlaneFailureResponse {
 	return failure
 }
 
-func cleanupRemoteDeviceNotTrusted(st *store.FileStore, status int, errorCode, message string) error {
-	if !remoteDeviceNotTrusted(status, errorCode, message) {
-		return nil
-	}
-	if err := st.QuarantineLocalKeys("remote device is no longer trusted"); err != nil {
-		return fmt.Errorf("remote device is no longer trusted, but local key cleanup failed: %w", err)
-	}
-	return errors.New("remote device is no longer trusted; local key material was cleared")
-}
-
-func revokeRemoteDevice(st *store.FileStore, origin, deviceID, accessToken string) (remoteDeviceResponse, error) {
+func revokeRemoteDevice(st *store.FileStore, origin, orgID, deviceID, accessToken string) (remoteDeviceResponse, error) {
 	var result remoteDeviceResponse
 	endpoint := strings.TrimRight(origin, "/") + "/v1/devices/" + url.PathEscape(deviceID) + "/revoke"
-	if err := postJSONBearer(st, endpoint, accessToken, map[string]string{}, &result); err != nil {
+	if err := postJSONBearer(st, endpoint, accessToken, map[string]string{"orgId": orgID}, &result); err != nil {
 		return result, err
 	}
 	if result.Status != "revoked" {
 		return result, errors.New("control plane did not revoke the device")
 	}
 	return result, nil
+}
+
+func requireRemoteDeviceInWorkspace(devices []remoteDeviceResponse, requested, workspaceSlug string) (remoteDeviceResponse, error) {
+	for _, device := range devices {
+		if device.ID == requested {
+			return device, nil
+		}
+	}
+	matches := []remoteDeviceResponse{}
+	for _, device := range devices {
+		if device.Name == requested {
+			matches = append(matches, device)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	if len(matches) > 1 {
+		return remoteDeviceResponse{}, fmt.Errorf("multiple devices named %s exist in workspace %s; use a device id", requested, workspaceSlug)
+	}
+	return remoteDeviceResponse{}, fmt.Errorf("device %s was not found in workspace %s", requested, workspaceSlug)
 }
 
 func listRemoteDevices(st *store.FileStore, origin, orgID, accessToken string, includeRevoked bool) ([]remoteDeviceResponse, error) {
@@ -6848,8 +6568,8 @@ func getActiveRemoteRecoveryRecipient(st *store.FileStore, origin, orgID, access
 	}, nil
 }
 
-func listVisibleRemoteSecrets(st *store.FileStore, origin, accessToken string, includeInactive bool) ([]visibleRemoteSecretRecord, error) {
-	result, err := listRemoteWorkspaceOverview(st, origin, accessToken, true, includeInactive)
+func listVisibleRemoteSecrets(st *store.FileStore, origin, accessToken, workspace string, includeInactive bool) ([]visibleRemoteSecretRecord, error) {
+	result, err := listRemoteWorkspaceOverview(st, origin, accessToken, workspace, true, includeInactive)
 	if err != nil {
 		return nil, err
 	}
@@ -6860,7 +6580,7 @@ func listVisibleRemoteSecrets(st *store.FileStore, origin, accessToken string, i
 }
 
 func resolveActiveRemoteSecret(st *store.FileStore, origin, accessToken string, target remoteWorkspaceResponse, scope, name string) (visibleRemoteSecretRecord, error) {
-	secrets, err := listVisibleRemoteSecrets(st, origin, accessToken, false)
+	secrets, err := listVisibleRemoteSecrets(st, origin, accessToken, target.Slug, false)
 	if err != nil {
 		return visibleRemoteSecretRecord{}, err
 	}
@@ -6885,7 +6605,7 @@ func resolveActiveRemoteSecret(st *store.FileStore, origin, accessToken string, 
 }
 
 func resolveDeletedRemoteSecret(st *store.FileStore, origin, accessToken string, target remoteWorkspaceResponse, scope, name string) (visibleRemoteSecretRecord, error) {
-	secrets, err := listVisibleRemoteSecrets(st, origin, accessToken, true)
+	secrets, err := listVisibleRemoteSecrets(st, origin, accessToken, target.Slug, true)
 	if err != nil {
 		return visibleRemoteSecretRecord{}, err
 	}
@@ -6947,8 +6667,8 @@ func remoteOnlyDeleteCandidates(st *store.FileStore, target remoteWorkspaceRespo
 	return candidates
 }
 
-func deleteRemoteSecret(st *store.FileStore, origin, secretID string, version int, deviceID, accessToken string) (visibleRemoteSecretRecord, error) {
-	result, err := requestRemoteSecretDelete(st, origin, secretID, version, deviceID, accessToken)
+func deleteRemoteSecret(st *store.FileStore, origin, orgID, secretID string, version int, deviceID, accessToken string) (visibleRemoteSecretRecord, error) {
+	result, err := requestRemoteSecretDelete(st, origin, orgID, secretID, version, deviceID, accessToken)
 	if err != nil {
 		return result, err
 	}
@@ -6958,8 +6678,8 @@ func deleteRemoteSecret(st *store.FileStore, origin, secretID string, version in
 	return result, nil
 }
 
-func preflightRemoteSecretDelete(st *store.FileStore, origin, secretID string, version int, deviceID, accessToken string) error {
-	result, err := requestRemoteSecretDeletePreflight(st, origin, secretID, version, deviceID, accessToken)
+func preflightRemoteSecretDelete(st *store.FileStore, origin, orgID, secretID string, version int, deviceID, accessToken string) error {
+	result, err := requestRemoteSecretDeletePreflight(st, origin, orgID, secretID, version, deviceID, accessToken)
 	if err != nil {
 		return err
 	}
@@ -6969,30 +6689,30 @@ func preflightRemoteSecretDelete(st *store.FileStore, origin, secretID string, v
 	return nil
 }
 
-func requestRemoteSecretDelete(st *store.FileStore, origin, secretID string, version int, deviceID, accessToken string) (visibleRemoteSecretRecord, error) {
+func requestRemoteSecretDelete(st *store.FileStore, origin, orgID, secretID string, version int, deviceID, accessToken string) (visibleRemoteSecretRecord, error) {
 	var result visibleRemoteSecretRecord
 	endpoint := strings.TrimRight(origin, "/") + "/v1/secrets/" + url.PathEscape(secretID) + "/delete"
-	body := map[string]any{"createdByDeviceId": deviceID, "version": version}
+	body := map[string]any{"orgId": orgID, "createdByDeviceId": deviceID, "version": version}
 	if err := postJSONBearer(st, endpoint, accessToken, body, &result); err != nil {
 		return result, err
 	}
 	return result, nil
 }
 
-func requestRemoteSecretDeletePreflight(st *store.FileStore, origin, secretID string, version int, deviceID, accessToken string) (visibleRemoteSecretRecord, error) {
+func requestRemoteSecretDeletePreflight(st *store.FileStore, origin, orgID, secretID string, version int, deviceID, accessToken string) (visibleRemoteSecretRecord, error) {
 	var result visibleRemoteSecretRecord
 	endpoint := strings.TrimRight(origin, "/") + "/v1/secrets/" + url.PathEscape(secretID) + "/delete-preflight"
-	body := map[string]any{"createdByDeviceId": deviceID, "version": version}
+	body := map[string]any{"orgId": orgID, "createdByDeviceId": deviceID, "version": version}
 	if err := postJSONBearer(st, endpoint, accessToken, body, &result); err != nil {
 		return result, err
 	}
 	return result, nil
 }
 
-func restoreRemoteSecret(st *store.FileStore, origin, secretID string, version int, deviceID, accessToken string) (visibleRemoteSecretRecord, error) {
+func restoreRemoteSecret(st *store.FileStore, origin, orgID, secretID string, version int, deviceID, accessToken string) (visibleRemoteSecretRecord, error) {
 	var result visibleRemoteSecretRecord
 	endpoint := strings.TrimRight(origin, "/") + "/v1/secrets/" + url.PathEscape(secretID) + "/restore"
-	body := map[string]any{"createdByDeviceId": deviceID, "version": version}
+	body := map[string]any{"orgId": orgID, "createdByDeviceId": deviceID, "version": version}
 	if err := postJSONBearer(st, endpoint, accessToken, body, &result); err != nil {
 		return result, err
 	}
@@ -7002,22 +6722,23 @@ func restoreRemoteSecret(st *store.FileStore, origin, secretID string, version i
 	return result, nil
 }
 
-func addRemoteWrappedKeys(st *store.FileStore, origin, secretID, accessToken string, wrappedKeys []store.RemoteWrappedKey, localRepair bool) error {
+func addRemoteWrappedKeys(st *store.FileStore, origin, orgID, secretID, accessToken string, wrappedKeys []store.RemoteWrappedKey, localRepair bool) error {
 	endpoint := strings.TrimRight(origin, "/") + "/v1/secrets/" + url.PathEscape(secretID) + "/wrapped-keys"
-	body := map[string]any{"wrappedKeys": wrappedKeys}
+	body := map[string]any{"orgId": orgID, "wrappedKeys": wrappedKeys}
 	if localRepair {
 		body["localRepair"] = true
 	}
 	return postJSONBearer(st, endpoint, accessToken, body, nil)
 }
 
-func registerRemoteRecoveryRecipient(st *store.FileStore, origin, accessToken string, setup store.RecoverySetup, replacements []recoveryRecipientReplacement) error {
+func registerRemoteRecoveryRecipient(st *store.FileStore, origin, orgID, deviceID, accessToken string, setup store.RecoverySetup, replacements []recoveryRecipientReplacement) error {
 	if replacements == nil {
 		replacements = []recoveryRecipientReplacement{}
 	}
 	endpoint := strings.TrimRight(origin, "/") + "/v1/recovery-recipient"
 	return postJSONBearer(st, endpoint, accessToken, map[string]any{
-		"orgId":                st.State.ControlPlane.WorkspaceID,
+		"orgId":                orgID,
+		"createdByDeviceId":    deviceID,
 		"recipientId":          setup.RecipientID,
 		"publicKey":            setup.PublicKey,
 		"publicKeyFingerprint": setup.Fingerprint,
@@ -7025,13 +6746,14 @@ func registerRemoteRecoveryRecipient(st *store.FileStore, origin, accessToken st
 	}, nil)
 }
 
-func replaceRemoteRecoveryRecipient(st *store.FileStore, origin, accessToken string, setup store.RecoverySetup, replacements []recoveryRecipientReplacement) error {
+func replaceRemoteRecoveryRecipient(st *store.FileStore, origin, orgID, deviceID, accessToken string, setup store.RecoverySetup, replacements []recoveryRecipientReplacement) error {
 	if replacements == nil {
 		replacements = []recoveryRecipientReplacement{}
 	}
 	endpoint := strings.TrimRight(origin, "/") + "/v1/recovery-recipient/replace"
 	return postJSONBearer(st, endpoint, accessToken, map[string]any{
-		"orgId":                st.State.ControlPlane.WorkspaceID,
+		"orgId":                orgID,
+		"createdByDeviceId":    deviceID,
 		"recipientId":          setup.RecipientID,
 		"publicKey":            setup.PublicKey,
 		"publicKeyFingerprint": setup.Fingerprint,
@@ -7039,9 +6761,9 @@ func replaceRemoteRecoveryRecipient(st *store.FileStore, origin, accessToken str
 	}, nil)
 }
 
-func addRecoveryRestoredWrappedKeys(st *store.FileStore, origin, secretID, accessToken, recoveryRecipientID string, wrappedKeys []store.RemoteWrappedKey) error {
+func addRecoveryRestoredWrappedKeys(st *store.FileStore, origin, orgID, secretID, accessToken, recoveryRecipientID string, wrappedKeys []store.RemoteWrappedKey) error {
 	endpoint := strings.TrimRight(origin, "/") + "/v1/secrets/" + url.PathEscape(secretID) + "/recovery-wrapped-keys"
-	return postJSONBearer(st, endpoint, accessToken, map[string]any{"recoveryRecipientId": recoveryRecipientID, "wrappedKeys": wrappedKeys}, nil)
+	return postJSONBearer(st, endpoint, accessToken, map[string]any{"orgId": orgID, "recoveryRecipientId": recoveryRecipientID, "wrappedKeys": wrappedKeys}, nil)
 }
 
 func remoteRecordsToVersions(records []remoteSecretRecord) []store.RemoteSecretVersion {
@@ -7260,9 +6982,6 @@ func boundWorkspaceID(st *store.FileStore, workspaceSlug string) string {
 	if binding, ok := st.RemoteBindingForPrefix(workspaceSlug); ok {
 		return binding.WorkspaceID
 	}
-	if st.State.ControlPlane != nil && st.State.ControlPlane.WorkspaceSlug == workspaceSlug {
-		return st.State.ControlPlane.WorkspaceID
-	}
 	return ""
 }
 
@@ -7308,6 +7027,7 @@ func postJSONBearerStatusWithClient(st *store.FileStore, client *http.Client, ur
 	if err != nil {
 		return 0, err
 	}
+	bearer = latestControlPlaneBearer(st, bearer)
 	status, responseBody, err := sendPostJSONBearer(st, client, url, bearer, encoded)
 	if err != nil {
 		return status, err
@@ -7360,6 +7080,7 @@ func getJSONBearer(st *store.FileStore, url, bearer string, out any) error {
 }
 
 func getJSONBearerStatus(st *store.FileStore, url, bearer string, out any) (int, error) {
+	bearer = latestControlPlaneBearer(st, bearer)
 	status, responseBody, err := sendGetJSONBearer(st, http.DefaultClient, url, bearer)
 	if err != nil {
 		return status, err
@@ -7401,9 +7122,6 @@ func sendGetJSONBearer(st *store.FileStore, client *http.Client, url, bearer str
 func decodeBearerResponse(status int, responseBody []byte, out any, st *store.FileStore) (int, error) {
 	if status < 200 || status >= 300 {
 		failure := parseControlPlaneFailure(responseBody)
-		if err := cleanupRemoteDeviceNotTrusted(st, status, failure.Error, failure.Message); err != nil {
-			return status, err
-		}
 		if status == http.StatusNotFound {
 			return status, nil
 		}
@@ -7438,6 +7156,17 @@ func refreshBearerAfterUnauthorized(st *store.FileStore, bearer string) (string,
 	return refreshed, true, nil
 }
 
+func latestControlPlaneBearer(st *store.FileStore, fallback string) string {
+	if st == nil || st.State.ControlPlane == nil {
+		return fallback
+	}
+	current, err := st.ControlPlaneAccessToken()
+	if err != nil || current == "" {
+		return fallback
+	}
+	return current
+}
+
 func signBearerRequest(st *store.FileStore, request *http.Request, body []byte, bearer string) error {
 	return signDeviceRequest(st, request, body, credentialHash(bearer))
 }
@@ -7445,6 +7174,13 @@ func signBearerRequest(st *store.FileStore, request *http.Request, body []byte, 
 func signDeviceRequest(st *store.FileStore, request *http.Request, body []byte, credentialHash string) error {
 	if st.State.ControlPlane == nil || st.State.ControlPlane.DeviceID == "" {
 		return errors.New("control plane device is not linked")
+	}
+	return signDeviceRequestForDevice(st, request, body, credentialHash, st.State.ControlPlane.DeviceID)
+}
+
+func signDeviceRequestForDevice(st *store.FileStore, request *http.Request, body []byte, credentialHash, remoteDeviceID string) error {
+	if remoteDeviceID == "" {
+		return errors.New("remote control plane device is required")
 	}
 	if credentialHash == "" {
 		return errors.New("device request credential binding is required")
@@ -7467,7 +7203,7 @@ func signDeviceRequest(st *store.FileStore, request *http.Request, body []byte, 
 		hex.EncodeToString(bodyDigest[:]),
 		timestamp,
 		nonce,
-		st.State.ControlPlane.DeviceID,
+		remoteDeviceID,
 		credentialHash,
 	}, "\n")
 	canonicalDigest := sha256.Sum256([]byte(canonical))
@@ -7478,7 +7214,7 @@ func signDeviceRequest(st *store.FileStore, request *http.Request, body []byte, 
 	signature := make([]byte, 64)
 	r.FillBytes(signature[:32])
 	s.FillBytes(signature[32:])
-	request.Header.Set("x-asiri-device", st.State.ControlPlane.DeviceID)
+	request.Header.Set("x-asiri-device", remoteDeviceID)
 	request.Header.Set("x-asiri-timestamp", timestamp)
 	request.Header.Set("x-asiri-nonce", nonce)
 	request.Header.Set("x-asiri-signature", base64.RawURLEncoding.EncodeToString(signature))
@@ -7554,6 +7290,13 @@ func postJSONDeviceCodeClaimStatus(st *store.FileStore, url string, body any, cr
 }
 
 func postJSONDeviceSignedStatus(st *store.FileStore, url string, body any, credentialHash string, out any) (int, error) {
+	if st.State.ControlPlane == nil || st.State.ControlPlane.DeviceID == "" {
+		return 0, errors.New("control plane device is not linked")
+	}
+	return postJSONDeviceSignedForDeviceStatus(st, url, body, credentialHash, st.State.ControlPlane.DeviceID, out)
+}
+
+func postJSONDeviceSignedForDeviceStatus(st *store.FileStore, url string, body any, credentialHash, remoteDeviceID string, out any) (int, error) {
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		return 0, err
@@ -7564,7 +7307,7 @@ func postJSONDeviceSignedStatus(st *store.FileStore, url string, body any, crede
 	}
 	request.Header.Set("content-type", "application/json")
 	request.Header.Set("accept", "application/json")
-	if err := signDeviceRequest(st, request, encoded, credentialHash); err != nil {
+	if err := signDeviceRequestForDevice(st, request, encoded, credentialHash, remoteDeviceID); err != nil {
 		return 0, err
 	}
 	response, err := http.DefaultClient.Do(request)
@@ -7814,28 +7557,6 @@ func splitWorkspaceFlag(args []string, command string, required bool) (string, [
 	return workspace, remaining, nil
 }
 
-func splitWorkspaceFilters(args []string, command string) ([]string, []string, error) {
-	workspaces := []string{}
-	remaining := []string{}
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		if arg == "--" {
-			remaining = append(remaining, args[i:]...)
-			break
-		}
-		if arg == "--workspace" || arg == "-w" {
-			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
-				return nil, nil, fmt.Errorf("%s --workspace requires a slug", command)
-			}
-			workspaces = append(workspaces, args[i+1])
-			i++
-			continue
-		}
-		remaining = append(remaining, arg)
-	}
-	return workspaces, remaining, nil
-}
-
 func rejectUnknownArgs(args []string, allowedFlags ...string) error {
 	allowed := map[string]bool{}
 	for _, flag := range allowedFlags {
@@ -7861,6 +7582,9 @@ func rejectUnknownArgs(args []string, allowedFlags ...string) error {
 }
 
 func (a App) workspaceSlugTarget(st *store.FileStore, value, command string) (string, error) {
+	if err := requireServiceAccountWorkspace(st, strings.TrimSpace(value)); err != nil {
+		return "", err
+	}
 	slug, err := localWorkspaceSlug(value)
 	if err == nil {
 		return slug, nil
@@ -7872,14 +7596,14 @@ func (a App) workspaceSlugTarget(st *store.FileStore, value, command string) (st
 	if accessErr != nil {
 		return "", accessErr
 	}
-	workspaces, listErr := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken)
+	workspaceResult, listErr := listRemoteWorkspaceOverview(st, st.State.ControlPlane.Origin, accessToken, strings.TrimSpace(value), false, false)
 	if listErr != nil {
 		return "", listErr
 	}
-	workspace, ok := findWorkspace(workspaces, strings.TrimSpace(value))
-	if !ok {
+	if len(workspaceResult.Organizations) == 0 {
 		return "", fmt.Errorf("workspace %s is not visible", value)
 	}
+	workspace := workspaceResult.Organizations[0]
 	if workspace.Slug == "" {
 		return "", fmt.Errorf("workspace %s does not have a slug", value)
 	}
@@ -7916,7 +7640,7 @@ func localWorkspaceFilterSet(values []string, command string) (map[string]bool, 
 	return filters, nil
 }
 
-func (a App) rejectWorkspacePrefixedFilter(st *store.FileStore, filter string, workspaceSet map[string]bool, command string, includeRemoteKnown bool) error {
+func (a App) rejectWorkspacePrefixedFilter(st *store.FileStore, filter string, workspaceSet map[string]bool, command string) error {
 	trimmed := strings.Trim(filter, "/")
 	if trimmed == "" {
 		return nil
@@ -7924,17 +7648,6 @@ func (a App) rejectWorkspacePrefixedFilter(st *store.FileStore, filter string, w
 	known := knownWorkspaceSlugs(st)
 	for slug := range workspaceSet {
 		known[slug] = true
-	}
-	if includeRemoteKnown && st != nil && st.State.ControlPlane != nil {
-		if accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st); err == nil {
-			if workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken); err == nil {
-				for _, workspace := range workspaces {
-					if workspace.Slug != "" {
-						known[workspace.Slug] = true
-					}
-				}
-			}
-		}
 	}
 	prefix := store.WorkspacePrefix(trimmed)
 	if !known[prefix] {
@@ -7961,16 +7674,20 @@ func (a App) workspacePathTarget(st *store.FileStore, value, command string) (wo
 	if trimmed == "" {
 		return workspacePathTarget{}, errors.New("--workspace requires a slug")
 	}
+	if err := requireServiceAccountWorkspace(st, trimmed); err != nil {
+		return workspacePathTarget{}, err
+	}
 	known := knownWorkspaceSlugs(st)
 	if st != nil && st.State.ControlPlane != nil && time.Until(st.State.ControlPlane.AccessTokenExpiresAt) > 30*time.Second {
 		if accessToken, err := st.ControlPlaneAccessToken(); err == nil && accessToken != "" {
-			if workspaces, err := listRemoteWorkspaces(st, st.State.ControlPlane.Origin, accessToken); err == nil {
-				for _, workspace := range workspaces {
+			if workspaceResult, err := listRemoteWorkspaceOverview(st, st.State.ControlPlane.Origin, accessToken, trimmed, false, false); err == nil {
+				for _, workspace := range workspaceResult.Organizations {
 					if workspace.Slug != "" {
 						known[workspace.Slug] = true
 					}
 				}
-				if workspace, ok := findWorkspace(workspaces, trimmed); ok {
+				if len(workspaceResult.Organizations) == 1 {
+					workspace := workspaceResult.Organizations[0]
 					if workspace.Slug == "" {
 						return workspacePathTarget{}, fmt.Errorf("workspace %s does not have a slug", value)
 					}
@@ -7989,6 +7706,16 @@ func (a App) workspacePathTarget(st *store.FileStore, value, command string) (wo
 	}
 	known[slug] = true
 	return workspacePathTarget{Slug: slug, KnownSlugs: known}, nil
+}
+
+func requireServiceAccountWorkspace(st *store.FileStore, requested string) error {
+	if st == nil || st.State.ControlPlane == nil || st.State.ControlPlane.Source != "service-account" {
+		return nil
+	}
+	if requested == st.State.ControlPlane.WorkspaceSlug {
+		return nil
+	}
+	return fmt.Errorf("service account session is scoped to workspace %s", st.State.ControlPlane.WorkspaceSlug)
 }
 
 func knownWorkspaceSlugs(st *store.FileStore) map[string]bool {

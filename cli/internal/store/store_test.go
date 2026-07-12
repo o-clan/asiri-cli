@@ -407,7 +407,7 @@ func TestAgentRawReadRequiresExplicitPolicy(t *testing.T) {
 }
 
 func TestReservedHumanSubjectCannotImpersonateHuman(t *testing.T) {
-	st := testInitializedStore(t, "oclan-co")
+	st := testInitializedStore(t)
 	device := testDevice(t, "test")
 	st.State.Devices = append(st.State.Devices, device)
 	st.State.LocalDeviceID = device.ID
@@ -444,8 +444,33 @@ func TestReservedHumanSubjectCannotImpersonateHuman(t *testing.T) {
 	}
 }
 
+func TestServiceAccountLinkUsesIsolatedRuntimeSubject(t *testing.T) {
+	st := testInitializedStore(t)
+	device := testDevice(t, "service-host")
+	st.State.Devices = append(st.State.Devices, device)
+	st.State.LocalDeviceID = device.ID
+	runtimeSubject := ServiceAccountRuntimeSubject("svc_prod")
+	st.State.Policies = []asiri.Policy{
+		{ID: "pol_slug", Subject: "prod-api", ScopePattern: "prod/api", SecretPattern: "DATABASE_URL", Actions: []string{"read"}, ApprovalMode: "none"},
+		{ID: "pol_runtime", Subject: runtimeSubject, ScopePattern: "prod/api", SecretPattern: "DATABASE_URL", Actions: []string{"read"}, ApprovalMode: "none"},
+	}
+	expires := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
+	if err := st.LinkServiceAccountControlPlane("http://control.test", "org_prod", "prod", "usr_owner", "svc_prod", "prod-api", "Production API", "dev_remote", device.ID, "at", "rt", 3600, expires); err != nil {
+		t.Fatal(err)
+	}
+	if runtimeSubject == "prod-api" || runtimeSubject == "" {
+		t.Fatalf("service account runtime subject must be ID-derived, got %q", runtimeSubject)
+	}
+	if len(st.State.Policies) != 1 || st.State.Policies[0].ID != "pol_slug" {
+		t.Fatalf("link should clear only previously synced runtime policies: %#v", st.State.Policies)
+	}
+	if allowed, _ := st.CheckPolicy(runtimeSubject, "prod/api/DATABASE_URL", "read"); allowed {
+		t.Fatal("same-slug local policy must not authorize the service account runtime identity")
+	}
+}
+
 func TestRevokingCurrentLocalDeviceClearsKeyMaterialAndBlocksDecryption(t *testing.T) {
-	st := testInitializedStore(t, "oclan-co")
+	st := testInitializedStore(t)
 	current := testDevice(t, "current")
 	other := testDevice(t, "other")
 	st.State.Devices = append(st.State.Devices, current, other)
@@ -482,7 +507,7 @@ func TestRevokingCurrentLocalDeviceClearsKeyMaterialAndBlocksDecryption(t *testi
 }
 
 func TestRevokeLastTrustedLocalDeviceWithActiveSecretsFails(t *testing.T) {
-	st := testInitializedStore(t, "oclan-co")
+	st := testInitializedStore(t)
 	st.State.Devices = append(st.State.Devices, testDevice(t, "current"))
 	if err := st.Save(); err != nil {
 		t.Fatal(err)
@@ -504,7 +529,7 @@ func TestRevokeLastTrustedLocalDeviceWithActiveSecretsFails(t *testing.T) {
 }
 
 func TestUnboundMultiDeviceStateFailsClosedAfterLocalRevoke(t *testing.T) {
-	st := testInitializedStore(t, "oclan-co")
+	st := testInitializedStore(t)
 	current := testDevice(t, "current")
 	st.State.Devices = append(st.State.Devices, current)
 	if err := st.Save(); err != nil {
@@ -618,7 +643,7 @@ func TestWorkspacePrefixBindingRejectsDifferentWorkspaceID(t *testing.T) {
 }
 
 func TestDeviceSigningPrivateKeyUsesBoundLocalDevice(t *testing.T) {
-	st := testInitializedStore(t, "oclan-co")
+	st := testInitializedStore(t)
 	first := testDevice(t, "first")
 	second := testDevice(t, "second")
 	st.State.Devices = append(st.State.Devices, first, second)
@@ -648,7 +673,7 @@ func TestDeviceSigningPrivateKeyUsesBoundLocalDevice(t *testing.T) {
 }
 
 func TestBindWorkspacePrefixReencryptsLocalSecretsToRemoteWorkspaceID(t *testing.T) {
-	st := testInitializedStore(t, "oclan-co")
+	st := testInitializedStore(t)
 	device := testDevice(t, "source")
 	st.State.Devices = append(st.State.Devices, device)
 	if err := st.Save(); err != nil {
@@ -680,7 +705,7 @@ func TestBindWorkspacePrefixReencryptsLocalSecretsToRemoteWorkspaceID(t *testing
 	if version.DataKeyAccount == oldVersion.DataKeyAccount || strings.Contains(version.DataKeyAccount, oldVaultID) {
 		t.Fatalf("data key account was not rebound: old=%q new=%q", oldVersion.DataKeyAccount, version.DataKeyAccount)
 	}
-	versions, err := st.RemoteSecretVersionsForPrefix("oclan-co")
+	versions, err := st.RemoteSecretVersionsForPrefix("org_oclan", "oclan-co", "dev_remote", "oclan-co")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -704,6 +729,49 @@ func TestBindWorkspacePrefixReencryptsLocalSecretsToRemoteWorkspaceID(t *testing
 	rotatedVersion := st.State.Secrets[SecretKey("oclan-co/local/asiri", "API_KEY")].Versions[1]
 	if !strings.HasPrefix(rotatedVersion.AAD, "org_oclan:") || !strings.HasPrefix(rotatedVersion.DataKeyAccount, "workspace:org_oclan:") {
 		t.Fatalf("rotated bound-prefix secret should use remote workspace id: %#v", rotatedVersion)
+	}
+}
+
+func TestRemoteSecretVersionsUseRequestedWorkspaceAndDeviceInsteadOfSessionProvenance(t *testing.T) {
+	st := testInitializedStore(t)
+	device := testDevice(t, "source")
+	st.State.Devices = append(st.State.Devices, device)
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddSecret("target-co/local/asiri/API_KEY", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	expires := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
+	if err := st.LinkControlPlaneForDevice("http://control.test", "org_login", "login-co", "usr_owner", "dev_login", device.ID, "at", "rt", 3600, expires); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.BindWorkspacePrefix("target-co", "org_target", "target-co"); err != nil {
+		t.Fatal(err)
+	}
+
+	versions, err := st.RemoteSecretVersionsForPrefix("org_target", "target-co", "dev_target", "target-co")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State.ControlPlane.WorkspaceID != "org_login" || st.State.ControlPlane.DeviceID != "dev_login" {
+		t.Fatalf("test session provenance changed unexpectedly: %#v", st.State.ControlPlane)
+	}
+	if len(versions) != 1 {
+		t.Fatalf("expected one remote version, got %#v", versions)
+	}
+	version := versions[0]
+	if version.OrgID != "org_target" || version.CreatedByDeviceID != "dev_target" {
+		t.Fatalf("remote version used session provenance instead of requested target: %#v", version)
+	}
+	if len(version.WrappedKeys) != 1 || version.WrappedKeys[0].RecipientID != "dev_target" {
+		t.Fatalf("remote version was not wrapped to the requested device: %#v", version.WrappedKeys)
+	}
+	if _, err := st.UnwrapDeviceDataKey("dev_target", version.WrappedKeys); err != nil {
+		t.Fatalf("requested target device could not unwrap its data key: %v", err)
+	}
+	if _, err := st.UnwrapDeviceDataKey("dev_login", version.WrappedKeys); err == nil {
+		t.Fatal("session-provenance device unexpectedly unwrapped the target device key")
 	}
 }
 
@@ -747,7 +815,7 @@ func TestRenameWorkspacePrefixReencryptsLocalSecrets(t *testing.T) {
 }
 
 func TestRemoveSecretKeepsDataKeyWhenSaveFails(t *testing.T) {
-	st := testInitializedStore(t, "oclan-co")
+	st := testInitializedStore(t)
 	st.State.Devices = append(st.State.Devices, asiri.Device{ID: "dev_test", Name: "test", Kind: "laptop", Status: asiri.DeviceTrusted})
 	if err := st.Save(); err != nil {
 		t.Fatal(err)
@@ -773,7 +841,7 @@ func TestRemoveSecretKeepsDataKeyWhenSaveFails(t *testing.T) {
 }
 
 func TestAddSecretDeletesNewDataKeyWhenSaveFails(t *testing.T) {
-	st := testInitializedStore(t, "oclan-co")
+	st := testInitializedStore(t)
 	st.State.Devices = append(st.State.Devices, asiri.Device{ID: "dev_test", Name: "test", Kind: "laptop", Status: asiri.DeviceTrusted})
 	if err := st.Save(); err != nil {
 		t.Fatal(err)
@@ -797,7 +865,7 @@ func TestAddSecretDeletesNewDataKeyWhenSaveFails(t *testing.T) {
 }
 
 func TestRenameWorkspacePrefixKeepsOldDataKeyWhenSaveFails(t *testing.T) {
-	st := testInitializedStore(t, "google-com")
+	st := testInitializedStore(t)
 	st.State.Devices = append(st.State.Devices, asiri.Device{ID: "dev_test", Name: "test", Kind: "laptop", Status: asiri.DeviceTrusted})
 	if err := st.Save(); err != nil {
 		t.Fatal(err)
@@ -833,7 +901,7 @@ func TestRenameWorkspacePrefixKeepsOldDataKeyWhenSaveFails(t *testing.T) {
 }
 
 func TestRenameWorkspacePrefixRejectsCollisionBeforeCreatingDataKeys(t *testing.T) {
-	st := testInitializedStore(t, "google-com")
+	st := testInitializedStore(t)
 	st.State.Devices = append(st.State.Devices, asiri.Device{ID: "dev_test", Name: "test", Kind: "laptop", Status: asiri.DeviceTrusted})
 	if err := st.Save(); err != nil {
 		t.Fatal(err)
@@ -890,7 +958,7 @@ func TestRecoverySetupDoesNotPersistRecoveryKeyAndWrapsRemoteVersions(t *testing
 		t.Fatal(err)
 	}
 	bindPrefixForTest(t, st, "oclan-co", "org_oclan")
-	setup, err := st.SetupRecovery(false)
+	setup, err := st.SetupRecovery("org_oclan", "oclan-co", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -907,11 +975,11 @@ func TestRecoverySetupDoesNotPersistRecoveryKeyAndWrapsRemoteVersions(t *testing
 	if strings.Contains(string(bytes), setup.Key) {
 		t.Fatal("local state persisted raw recovery key")
 	}
-	recovery := st.ActiveRecovery()
+	recovery := st.RecoveryForWorkspace("org_oclan")
 	if recovery == nil || recovery.PublicKey == "" || recovery.RecipientID == "" {
 		t.Fatalf("recovery metadata missing: %#v", st.State.Recoveries)
 	}
-	versions, err := st.RemoteSecretVersionsForPrefix("oclan-co")
+	versions, err := st.RemoteSecretVersionsForPrefix("org_oclan", "oclan-co", "dev_remote", "oclan-co")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -924,38 +992,39 @@ func TestRecoverySetupDoesNotPersistRecoveryKeyAndWrapsRemoteVersions(t *testing
 	if versions[0].WrappedKeys[1].RecipientType != "recovery" || versions[0].WrappedKeys[1].RecipientID != recovery.RecipientID || versions[0].WrappedKeys[1].WrapAlgorithm != "recovery-hkdf-aes256gcm" {
 		t.Fatalf("expected recovery wrapped key, got %#v", versions[0].WrappedKeys[1])
 	}
-	if err := st.LinkControlPlane("http://control.test", "org_peter", "peter-dev", "usr_owner", "dev_remote", "at2", "rt2", 3600, expires); err != nil {
-		t.Fatal(err)
-	}
-	if st.ActiveRecovery() != nil {
-		t.Fatalf("second workspace should not inherit recovery metadata: %#v", st.State.Recoveries)
+	if st.RecoveryForWorkspace("org_peter") != nil {
+		t.Fatalf("unrelated workspace should not inherit recovery metadata: %#v", st.State.Recoveries)
 	}
 }
 
-func TestRecoveryWrappedCountsAreTrackedPerActiveWorkspace(t *testing.T) {
-	st := testInitializedStore(t, "oclan-co")
+func TestRecoveryWrappedCountsAreTrackedPerWorkspace(t *testing.T) {
+	st := testInitializedStore(t)
 	st.State.Devices = append(st.State.Devices, testDevice(t, "source"))
 	if err := st.Save(); err != nil {
 		t.Fatal(err)
 	}
-	expires := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
-	if err := st.LinkControlPlane("http://control.test", "org_oclan", "oclan-co", "usr_owner", "dev_remote", "at", "rt", 3600, expires); err != nil {
+	st.State.Recoveries = map[string]asiri.RecoveryConfig{
+		"org_oclan": {
+			RecipientID:          "rec_oclan",
+			PublicKey:            "public-oclan",
+			PublicKeyFingerprint: "fingerprint-oclan",
+			CreatedAt:            time.Now().UTC(),
+		},
+		"org_peter": {
+			RecipientID:          "rec_peter",
+			PublicKey:            "public-peter",
+			PublicKeyFingerprint: "fingerprint-peter",
+			CreatedAt:            time.Now().UTC(),
+		},
+	}
+	if err := st.MarkRecoveryWrapped("org_oclan", "oclan-co", 2); err != nil {
 		t.Fatal(err)
 	}
-	st.State.Recoveries = map[string]asiri.RecoveryConfig{"org_oclan": {
-		RecipientID:          "rec_test",
-		PublicKey:            "public",
-		PublicKeyFingerprint: "fingerprint",
-		CreatedAt:            time.Now().UTC(),
-	}}
-	if err := st.MarkRecoveryWrapped("oclan-co", 2); err != nil {
-		t.Fatal(err)
+	if st.RecoveryWrappedCount("org_oclan") != 2 {
+		t.Fatalf("target workspace recovery count was not tracked: %#v", st.State.Recoveries)
 	}
-	if st.RecoveryWrappedCountForPrefix("oclan-co") != 2 {
-		t.Fatalf("active workspace recovery count was not tracked: %#v", st.State.Recoveries)
-	}
-	if st.RecoveryWrappedCountForPrefix("peter-dev") != 0 {
-		t.Fatalf("inactive workspace should not share recovery count: %#v", st.State.Recoveries)
+	if st.RecoveryWrappedCount("org_peter") != 0 {
+		t.Fatalf("unrelated workspace should not share recovery count: %#v", st.State.Recoveries)
 	}
 	if st.State.Recoveries["org_oclan"].WrappedSecretCount != 2 {
 		t.Fatalf("expected workspace-local count, got %#v", st.State.Recoveries)
@@ -963,7 +1032,7 @@ func TestRecoveryWrappedCountsAreTrackedPerActiveWorkspace(t *testing.T) {
 }
 
 func TestRemoteSecretVersionsUseDistinctDataKeys(t *testing.T) {
-	st := testInitializedStore(t, "oclan-co")
+	st := testInitializedStore(t)
 	st.State.Devices = append(st.State.Devices, testDevice(t, "source"))
 	if err := st.Save(); err != nil {
 		t.Fatal(err)
@@ -979,18 +1048,18 @@ func TestRemoteSecretVersionsUseDistinctDataKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	bindPrefixForTest(t, st, "oclan-co", "org_oclan")
-	versions, err := st.RemoteSecretVersionsForPrefix("oclan-co")
+	versions, err := st.RemoteSecretVersionsForPrefix("org_oclan", "oclan-co", "dev_source", "oclan-co")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(versions) != 2 {
 		t.Fatalf("expected two remote versions, got %d", len(versions))
 	}
-	firstKey, err := st.UnwrapDeviceDataKey(versions[0].WrappedKeys)
+	firstKey, err := st.UnwrapDeviceDataKey("dev_source", versions[0].WrappedKeys)
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondKey, err := st.UnwrapDeviceDataKey(versions[1].WrappedKeys)
+	secondKey, err := st.UnwrapDeviceDataKey("dev_source", versions[1].WrappedKeys)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1003,7 +1072,7 @@ func TestRemoteSecretVersionsUseDistinctDataKeys(t *testing.T) {
 }
 
 func TestRewrapCanUseStoredStaleVersionDataKey(t *testing.T) {
-	source := testInitializedStore(t, "oclan-co")
+	source := testInitializedStore(t)
 	sourceDevice := testDevice(t, "source")
 	source.State.Devices = append(source.State.Devices, sourceDevice)
 	if err := source.Save(); err != nil {
@@ -1017,7 +1086,7 @@ func TestRewrapCanUseStoredStaleVersionDataKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	bindPrefixForTest(t, source, "oclan-co", "org_oclan")
-	remoteVersions, err := source.RemoteSecretVersionsForPrefix("oclan-co")
+	remoteVersions, err := source.RemoteSecretVersionsForPrefix("org_oclan", "oclan-co", "dev_source", "oclan-co")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1027,7 +1096,7 @@ func TestRewrapCanUseStoredStaleVersionDataKey(t *testing.T) {
 	if _, err := source.AddSecret("oclan-co/local/asiri/API_KEY", "second-secret"); err != nil {
 		t.Fatal(err)
 	}
-	target := testInitializedStore(t, "oclan-co")
+	target := testInitializedStore(t)
 	targetDevice := testDevice(t, "target")
 	target.State.Devices = append(target.State.Devices, targetDevice)
 	if err := target.Save(); err != nil {
@@ -1037,11 +1106,11 @@ func TestRewrapCanUseStoredStaleVersionDataKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	bindPrefixForTest(t, target, "oclan-co", "org_oclan")
-	wrapped, err := source.RemoteWrappedKeyForSecretVersionPublicKey("oclan-co/local/asiri", "API_KEY", 1, "dev_target", targetDevice.EncryptionPublicKey)
+	wrapped, err := source.RemoteWrappedKeyForSecretVersionPublicKey("org_oclan", "oclan-co/local/asiri", "API_KEY", 1, "dev_target", targetDevice.EncryptionPublicKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rewrappedKey, err := target.UnwrapDeviceDataKey([]RemoteWrappedKey{wrapped})
+	rewrappedKey, err := target.UnwrapDeviceDataKey("dev_target", []RemoteWrappedKey{wrapped})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1083,11 +1152,11 @@ func TestRecoveryKeyRestoresRemoteSecretsOnAnotherDevice(t *testing.T) {
 		t.Fatal(err)
 	}
 	bindPrefixForTest(t, source, "oclan-co", "org_oclan")
-	setup, err := source.SetupRecovery(false)
+	setup, err := source.SetupRecovery("org_oclan", "oclan-co", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	versions, err := source.RemoteSecretVersionsForPrefix("oclan-co")
+	versions, err := source.RemoteSecretVersionsForPrefix("org_oclan", "oclan-co", "dev_source", "oclan-co")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1109,11 +1178,11 @@ func TestRecoveryKeyRestoresRemoteSecretsOnAnotherDevice(t *testing.T) {
 		t.Fatal(err)
 	}
 	bindPrefixForTest(t, target, "oclan-co", "org_oclan")
-	imported, identity, err := target.ImportRecoveryRemoteSecretVersions(versions, setup.Key, false)
+	imported, identity, err := target.ImportRecoveryRemoteSecretVersions("org_oclan", "oclan-co", versions, setup.Key, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sourceRecovery := source.ActiveRecovery()
+	sourceRecovery := source.RecoveryForWorkspace("org_oclan")
 	if sourceRecovery == nil {
 		t.Fatal("source recovery metadata missing")
 	}
@@ -1130,7 +1199,7 @@ func TestRecoveryKeyRestoresRemoteSecretsOnAnotherDevice(t *testing.T) {
 	if value != "restored-secret" {
 		t.Fatalf("restored secret mismatch: %q", value)
 	}
-	wrapped, err := target.RemoteWrappedKeyForSecretVersionPublicKey("oclan-co/local/asiri", "API_KEY", versions[0].Version, "dev_target", targetDevice.EncryptionPublicKey)
+	wrapped, err := target.RemoteWrappedKeyForSecretVersionPublicKey("org_oclan", "oclan-co/local/asiri", "API_KEY", versions[0].Version, "dev_target", targetDevice.EncryptionPublicKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1140,7 +1209,7 @@ func TestRecoveryKeyRestoresRemoteSecretsOnAnotherDevice(t *testing.T) {
 }
 
 func TestImportRemoteSecretRejectsRelabeledAAD(t *testing.T) {
-	source := testInitializedStore(t, "oclan-co")
+	source := testInitializedStore(t)
 	source.State.Devices = append(source.State.Devices, testDevice(t, "source"))
 	if err := source.Save(); err != nil {
 		t.Fatal(err)
@@ -1153,18 +1222,18 @@ func TestImportRemoteSecretRejectsRelabeledAAD(t *testing.T) {
 		t.Fatal(err)
 	}
 	bindPrefixForTest(t, source, "oclan-co", "org_oclan")
-	versions, err := source.RemoteSecretVersionsForPrefix("oclan-co")
+	versions, err := source.RemoteSecretVersionsForPrefix("org_oclan", "oclan-co", "dev_source", "oclan-co")
 	if err != nil {
 		t.Fatal(err)
 	}
 	versions[0].Scope = "oclan-co/local/other"
-	if _, err := source.ImportRemoteSecretVersions(versions, true); err == nil || !strings.Contains(err.Error(), "encryption metadata") {
+	if _, err := source.ImportRemoteSecretVersions("org_oclan", "oclan-co", "dev_source", versions, true); err == nil || !strings.Contains(err.Error(), "encryption metadata") {
 		t.Fatalf("expected AAD mismatch rejection, got %v", err)
 	}
 }
 
 func TestImportRemoteSecretSkipsMalformedEnvelopeAndImportsValidSecret(t *testing.T) {
-	source := testInitializedStore(t, "oclan-co")
+	source := testInitializedStore(t)
 	sourceDevice := testDevice(t, "source")
 	source.State.Devices = append(source.State.Devices, sourceDevice)
 	if err := source.Save(); err != nil {
@@ -1181,7 +1250,7 @@ func TestImportRemoteSecretSkipsMalformedEnvelopeAndImportsValidSecret(t *testin
 		t.Fatal(err)
 	}
 	bindPrefixForTest(t, source, "oclan-co", "org_oclan")
-	versions, err := source.RemoteSecretVersionsForPrefix("oclan-co")
+	versions, err := source.RemoteSecretVersionsForPrefix("org_oclan", "oclan-co", "dev_source", "oclan-co")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1189,7 +1258,7 @@ func TestImportRemoteSecretSkipsMalformedEnvelopeAndImportsValidSecret(t *testin
 		t.Fatalf("expected two remote versions, got %d", len(versions))
 	}
 
-	target := testInitializedStore(t, "oclan-co")
+	target := testInitializedStore(t)
 	targetDevice := testDevice(t, "target")
 	target.State.Devices = append(target.State.Devices, targetDevice)
 	if err := target.Save(); err != nil {
@@ -1200,7 +1269,7 @@ func TestImportRemoteSecretSkipsMalformedEnvelopeAndImportsValidSecret(t *testin
 	}
 	bindPrefixForTest(t, target, "oclan-co", "org_oclan")
 	for i := range versions {
-		wrapped, err := source.RemoteWrappedKeyForSecretVersionPublicKey(versions[i].Scope, versions[i].Name, versions[i].Version, "dev_target", targetDevice.EncryptionPublicKey)
+		wrapped, err := source.RemoteWrappedKeyForSecretVersionPublicKey("org_oclan", versions[i].Scope, versions[i].Name, versions[i].Version, "dev_target", targetDevice.EncryptionPublicKey)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1208,7 +1277,7 @@ func TestImportRemoteSecretSkipsMalformedEnvelopeAndImportsValidSecret(t *testin
 	}
 	versions[0].AAD = strings.Replace(versions[0].AAD, ":BAD:", ":OTHER:", 1)
 
-	imported, err := target.ImportRemoteSecretVersions(versions, true)
+	imported, err := target.ImportRemoteSecretVersions("org_oclan", "oclan-co", "dev_target", versions, true)
 	if imported != 1 {
 		t.Fatalf("expected valid remote secret to import despite malformed neighbor, got %d imports and err %v", imported, err)
 	}
@@ -1231,7 +1300,7 @@ func TestImportRemoteSecretSkipsMalformedEnvelopeAndImportsValidSecret(t *testin
 }
 
 func TestImportRemoteSecretRejectsForeignWorkspacePrefix(t *testing.T) {
-	source := testInitializedStore(t, "oclan-co")
+	source := testInitializedStore(t)
 	source.State.Devices = append(source.State.Devices, testDevice(t, "source"))
 	if err := source.Save(); err != nil {
 		t.Fatal(err)
@@ -1246,17 +1315,41 @@ func TestImportRemoteSecretRejectsForeignWorkspacePrefix(t *testing.T) {
 	if err := source.BindWorkspacePrefix("google-com", "org_oclan", "oclan-co"); err != nil {
 		t.Fatal(err)
 	}
-	versions, err := source.RemoteSecretVersionsForPrefix("google-com")
+	versions, err := source.RemoteSecretVersionsForPrefix("org_oclan", "google-com", "dev_source", "google-com")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := source.ImportRemoteSecretVersions(versions, true); err == nil || !strings.Contains(err.Error(), "path prefix is google-com") {
+	if _, err := source.ImportRemoteSecretVersions("org_oclan", "oclan-co", "dev_source", versions, true); err == nil || !strings.Contains(err.Error(), "path prefix is google-com") {
 		t.Fatalf("expected foreign prefix rejection, got %v", err)
 	}
 }
 
+func TestImportRemoteSecretRequiresWorkspaceID(t *testing.T) {
+	st := testInitializedStore(t)
+	st.State.Devices = append(st.State.Devices, testDevice(t, "source"))
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddSecret("oclan-co/local/asiri/API_KEY", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	expires := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
+	if err := st.LinkControlPlane("http://control.test", "org_oclan", "oclan-co", "usr_owner", "dev_source", "at_source", "rt_source", 3600, expires); err != nil {
+		t.Fatal(err)
+	}
+	bindPrefixForTest(t, st, "oclan-co", "org_oclan")
+	versions, err := st.RemoteSecretVersionsForPrefix("org_oclan", "oclan-co", "dev_source", "oclan-co")
+	if err != nil {
+		t.Fatal(err)
+	}
+	versions[0].OrgID = ""
+	if _, err := st.ImportRemoteSecretVersions("org_oclan", "oclan-co", "dev_source", versions, true); err == nil || !strings.Contains(err.Error(), "missing workspace id") {
+		t.Fatalf("expected missing workspace id rejection, got %v", err)
+	}
+}
+
 func TestImportRemoteSecretRejectsLocalConflictWithoutForce(t *testing.T) {
-	st := testInitializedStore(t, "oclan-co")
+	st := testInitializedStore(t)
 	st.State.Devices = append(st.State.Devices, testDevice(t, "source"))
 	if err := st.Save(); err != nil {
 		t.Fatal(err)
@@ -1269,17 +1362,17 @@ func TestImportRemoteSecretRejectsLocalConflictWithoutForce(t *testing.T) {
 		t.Fatal(err)
 	}
 	bindPrefixForTest(t, st, "oclan-co", "org_oclan")
-	versions, err := st.RemoteSecretVersionsForPrefix("oclan-co")
+	versions, err := st.RemoteSecretVersionsForPrefix("org_oclan", "oclan-co", "dev_source", "oclan-co")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.AddSecret("oclan-co/local/asiri/API_KEY", "changed-local-secret"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ImportRemoteSecretVersions(versions, false); err == nil || !strings.Contains(err.Error(), "conflicts with a local active version") {
+	if _, err := st.ImportRemoteSecretVersions("org_oclan", "oclan-co", "dev_source", versions, false); err == nil || !strings.Contains(err.Error(), "conflicts with a local active version") {
 		t.Fatalf("expected conflict rejection, got %v", err)
 	}
-	if _, err := st.ImportRemoteSecretVersions(versions, true); err != nil {
+	if _, err := st.ImportRemoteSecretVersions("org_oclan", "oclan-co", "dev_source", versions, true); err != nil {
 		t.Fatalf("force import should replace local active version: %v", err)
 	}
 }
@@ -1354,7 +1447,7 @@ func TestRemoteSecretVersionsRejectsStaleSelectedVersion(t *testing.T) {
 	if _, err := st.RotateDataKeysForPrefix("oclan-co"); err != nil {
 		t.Fatal(err)
 	}
-	_, err = st.RemoteSecretVersionsForRefsWithRecovery("oclan-co", []LocalSecretRef{{
+	_, err = st.RemoteSecretVersionsForRefsWithRecovery("org_oclan", "oclan-co", "dev_remote", []LocalSecretRef{{
 		Scope:   "oclan-co/prod/asiri",
 		Name:    "API_KEY",
 		Version: 1,
@@ -1424,7 +1517,7 @@ func testDevice(t *testing.T, name string) asiri.Device {
 	}
 }
 
-func testInitializedStore(t *testing.T, workspace string) *FileStore {
+func testInitializedStore(t *testing.T) *FileStore {
 	t.Helper()
 	st, err := Load(filepath.Join(t.TempDir(), "state.json"))
 	if err != nil {

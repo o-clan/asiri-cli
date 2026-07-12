@@ -11,7 +11,7 @@ Asiri is a secrets access layer. Treat it as the source of operational secrets a
 
 - Never print, paste, log, summarize, or store secret values.
 - Prefer metadata-only checks: list workspaces, list secret names, check status, inspect audit.
-- Use `--workspace <slug>` on every command that reads, writes, grants, pushes, pulls, or runs with secrets.
+- Use exactly one `--workspace <slug>` on every workspace-scoped command. Human account/device sessions never select or switch an active CLI workspace.
 - Use exact workspace slugs and secret paths from the user or from `asiri workspace list` / `asiri list`.
 - Prefer `asiri env` or `asiri mount` over raw reads.
 - Use raw reads only when the user explicitly asks and policy allows it; redirect verification reads to `/dev/null`.
@@ -25,7 +25,7 @@ Run these before using or changing secrets:
 
 ```sh
 asiri --version
-asiri setup doctor
+asiri setup doctor --workspace <workspace>
 asiri workspace list
 ```
 
@@ -36,7 +36,8 @@ asiri workspace list
 asiri list --workspace <workspace>
 ```
 
-`asiri list` is safe for normal inspection. It shows names, hashes, sync state, and write status. It does not print plaintext.
+`asiri list --workspace <workspace>` is safe for normal inspection. It shows
+names, hashes, sync state, and write status. It does not print plaintext.
 
 ## Use A Secret
 
@@ -117,7 +118,8 @@ Avoid `--read` for agents unless the user explicitly wants plaintext returned to
 Check recent activity without values:
 
 ```sh
-asiri audit tail --limit 20
+asiri audit tail --workspace <workspace> --limit 20
+asiri policy list --workspace <workspace>
 ```
 
 Audit mode is an envelope policy set by the workspace owner or a delegated admin. Do not change it unless the user explicitly asked for an audit-mode change.
@@ -153,7 +155,7 @@ asiri service-account create --workspace <workspace> --slug <service-account> --
 asiri service-account grant --workspace <workspace> --service-account <service-account> --scope <scope> --secret <pattern> --inject-only
 ```
 
-These are remote control-plane mutations. Run them only when the user explicitly asked to create, disable, or update service-account access. Service-account sessions cannot change control-plane state, add or rotate local secrets, remove local state, or edit local policy directly. They can pull encrypted records and allowed service policies for their active workspace, then use those secrets through the local runtime.
+These are remote control-plane mutations. Run them only when the user explicitly asked to create, disable, or update service-account access. Service-account sessions cannot change control-plane state, add or rotate local secrets, remove local state, or edit local policy directly. They can pull encrypted records and allowed service policies for their granted workspace, then use those secrets through the local runtime.
 
 For service-account login, start a browser approval flow from the runtime device. A workspace owner or delegated service-account admin must approve it:
 
@@ -187,11 +189,11 @@ Stop before running any of these unless the user directly requested that exact o
 
 - `asiri init` on an existing install.
 - `asiri login --force`.
-- `asiri device trust`, `asiri device revoke`, or dashboard trust changes.
+- `asiri device trust --workspace <workspace>`, `asiri device revoke --remote --workspace <workspace> <device-id>`, or dashboard trust changes.
 - `asiri service-account create`, `asiri service-account disable`, or `asiri service-account grant`.
 - `asiri service-account login` when it would bind a new runtime device to a service account.
-- `asiri recovery setup`, `asiri recovery restore`, or recovery key handling.
-- `asiri rekey`.
+- `asiri recovery setup --workspace <workspace>`, `asiri recovery restore --workspace <workspace>`, or recovery key handling.
+- `asiri rekey --workspace <workspace>`.
 - Deleting or editing local Asiri state, keychain entries, or keyring material.
 - Recreating a workspace binding, migrating prefixes, or removing local secrets.
 
@@ -203,6 +205,6 @@ Trusted device state is the runtime security boundary. Agent, app, process, and 
 
 Strict audit gives administrators visibility over Asiri-controlled secret release. It does not make a compromised trusted host safe, and it only applies after the device has synced the envelope policy.
 
-For CI or servers, prefer service accounts over long-lived shared tokens. A service account should receive a browser-approved scoped session, then use the same local-runtime patterns: inject, mount, broker, pull, and audit. Service-account sessions cannot mutate secrets, policies, devices, members, billing, recovery, or service accounts.
+Human CLI login creates one account/device session. Every command names its target workspace explicitly and reuses that session. For CI or servers, prefer service accounts over long-lived shared tokens. A service account receives a browser-approved session scoped to one workspace, then uses the same local-runtime patterns: inject, mount, broker, pull, and audit. Service-account sessions cannot mutate secrets, policies, devices, members, billing, recovery, or service accounts.
 
 For suspected host compromise, revocation blocks future access but does not erase what the host may already have seen. Rotate the upstream secret after revocation.

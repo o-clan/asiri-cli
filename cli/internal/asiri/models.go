@@ -28,7 +28,9 @@ type KeyRef struct {
 }
 
 type ControlPlaneLink struct {
-	Origin               string    `json:"origin"`
+	Origin string `json:"origin"`
+	// WorkspaceID, WorkspaceSlug, and DeviceID record where this account
+	// session was approved. They do not select an active CLI workspace.
 	WorkspaceID          string    `json:"workspaceId"`
 	WorkspaceSlug        string    `json:"workspaceSlug"`
 	UserID               string    `json:"userId"`

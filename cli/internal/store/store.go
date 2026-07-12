@@ -988,6 +988,14 @@ func NormalizeSubjectLabel(subject string) string {
 	return strings.TrimSpace(subject)
 }
 
+func ServiceAccountRuntimeSubject(serviceAccountID string) string {
+	serviceAccountID = strings.TrimSpace(serviceAccountID)
+	if serviceAccountID == "" {
+		return ""
+	}
+	return "service-account:" + serviceAccountID
+}
+
 func (s *FileStore) RevokeDevice(nameOrID string) error {
 	for i := range s.State.Devices {
 		if s.State.Devices[i].ID == nameOrID || s.State.Devices[i].Name == nameOrID {
@@ -1151,6 +1159,14 @@ func (s *FileStore) LinkServiceAccountControlPlane(origin, workspaceID, workspac
 	}
 	s.addKeyRef("control-plane-access-token", accessAccount)
 	s.addKeyRef("control-plane-refresh-token", refreshAccount)
+	runtimeSubject := ServiceAccountRuntimeSubject(serviceAccountID)
+	keptPolicies := s.State.Policies[:0]
+	for _, policy := range s.State.Policies {
+		if NormalizeSubjectLabel(policy.Subject) != runtimeSubject {
+			keptPolicies = append(keptPolicies, policy)
+		}
+	}
+	s.State.Policies = keptPolicies
 	expiresAt := time.Now().UTC().Add(time.Duration(expiresIn) * time.Second)
 	if expiresIn <= 0 {
 		expiresAt = time.Now().UTC().Add(time.Hour)
@@ -1192,30 +1208,34 @@ func (s *FileStore) ControlPlaneAccessToken() (string, error) {
 	return keystore.Load(s.State.ControlPlane.AccessTokenAccount)
 }
 
-func (s *FileStore) RemoteSecretVersionsForPrefix(prefix string) ([]RemoteSecretVersion, error) {
-	recovery := s.ActiveRecovery()
-	return s.RemoteSecretVersionsForPrefixWithRecovery(prefix, recovery)
+func (s *FileStore) RemoteSecretVersionsForPrefix(workspaceID, workspaceSlug, remoteDeviceID, prefix string) ([]RemoteSecretVersion, error) {
+	recovery := s.RecoveryForWorkspace(workspaceID)
+	return s.RemoteSecretVersionsForPrefixWithRecovery(workspaceID, workspaceSlug, remoteDeviceID, prefix, recovery)
 }
 
-func (s *FileStore) RemoteSecretVersionsForPrefixWithRecovery(prefix string, recovery *asiri.RecoveryConfig) ([]RemoteSecretVersion, error) {
+func (s *FileStore) RemoteSecretVersionsForPrefixWithRecovery(workspaceID, workspaceSlug, remoteDeviceID, prefix string, recovery *asiri.RecoveryConfig) ([]RemoteSecretVersion, error) {
 	refs := []LocalSecretRef{}
 	for _, ref := range s.ActiveSecretRefs() {
 		if WorkspacePrefix(ref.Scope) == prefix {
 			refs = append(refs, ref)
 		}
 	}
-	return s.RemoteSecretVersionsForRefsWithRecovery(prefix, refs, recovery)
+	return s.RemoteSecretVersionsForRefsWithRecovery(workspaceID, workspaceSlug, remoteDeviceID, refs, recovery)
 }
 
-func (s *FileStore) RemoteSecretVersionsForRefsWithRecovery(prefix string, refs []LocalSecretRef, recovery *asiri.RecoveryConfig) ([]RemoteSecretVersion, error) {
+func (s *FileStore) RemoteSecretVersionsForRefsWithRecovery(workspaceID, workspaceSlug, remoteDeviceID string, refs []LocalSecretRef, recovery *asiri.RecoveryConfig) ([]RemoteSecretVersion, error) {
 	if err := s.RequireInitialized(); err != nil {
 		return nil, err
 	}
 	if s.State.ControlPlane == nil {
 		return nil, errors.New("asiri is not linked to a control plane")
 	}
-	if binding, ok := s.RemoteBindingForPrefix(prefix); !ok || binding.WorkspaceID != s.State.ControlPlane.WorkspaceID {
-		return nil, fmt.Errorf("workspace prefix %s is not bound to the current control-plane session for %s", prefix, s.State.ControlPlane.WorkspaceSlug)
+	if workspaceID == "" || workspaceSlug == "" || remoteDeviceID == "" {
+		return nil, errors.New("remote workspace and trusted device are required")
+	}
+	prefix := workspaceSlug
+	if binding, ok := s.RemoteBindingForPrefix(prefix); !ok || binding.WorkspaceID != workspaceID {
+		return nil, fmt.Errorf("workspace prefix %s is not bound to workspace %s", prefix, workspaceSlug)
 	}
 	device, err := s.ActiveDevice()
 	if err != nil {
@@ -1263,7 +1283,7 @@ func (s *FileStore) RemoteSecretVersionsForRefsWithRecovery(prefix string, refs 
 			if err != nil {
 				return nil, err
 			}
-			wrapped, err := wrapKeyToDevice(dataKey, *device, s.State.ControlPlane.DeviceID)
+			wrapped, err := wrapKeyToDevice(dataKey, *device, remoteDeviceID)
 			if err != nil {
 				return nil, err
 			}
@@ -1276,7 +1296,7 @@ func (s *FileStore) RemoteSecretVersionsForRefsWithRecovery(prefix string, refs 
 				wrappedKeys = append(wrappedKeys, recoveryWrapped)
 			}
 			versions = append(versions, RemoteSecretVersion{
-				OrgID:             s.State.ControlPlane.WorkspaceID,
+				OrgID:             workspaceID,
 				Scope:             secret.Scope,
 				Name:              secret.Name,
 				Version:           version.Version,
@@ -1285,7 +1305,7 @@ func (s *FileStore) RemoteSecretVersionsForRefsWithRecovery(prefix string, refs 
 				Ciphertext:        version.Ciphertext,
 				AAD:               version.AAD,
 				WrappedKeys:       wrappedKeys,
-				CreatedByDeviceID: s.State.ControlPlane.DeviceID,
+				CreatedByDeviceID: remoteDeviceID,
 			})
 			break
 		}
@@ -1296,9 +1316,9 @@ func (s *FileStore) RemoteSecretVersionsForRefsWithRecovery(prefix string, refs 
 	return versions, nil
 }
 
-func (s *FileStore) ImportRemoteSecretVersions(versions []RemoteSecretVersion, force bool) (int, error) {
-	return s.importRemoteSecretVersions(versions, force, func(remote RemoteSecretVersion) ([]byte, bool, error) {
-		dataKey, err := s.UnwrapDeviceDataKey(remote.WrappedKeys)
+func (s *FileStore) ImportRemoteSecretVersions(workspaceID, workspaceSlug, remoteDeviceID string, versions []RemoteSecretVersion, force bool) (int, error) {
+	return s.importRemoteSecretVersions(workspaceID, workspaceSlug, versions, force, func(remote RemoteSecretVersion) ([]byte, bool, error) {
+		dataKey, err := s.UnwrapDeviceDataKey(remoteDeviceID, remote.WrappedKeys)
 		if err != nil {
 			return nil, false, fmt.Errorf("is not wrapped to this device: %w", err)
 		}
@@ -1306,7 +1326,7 @@ func (s *FileStore) ImportRemoteSecretVersions(versions []RemoteSecretVersion, f
 	})
 }
 
-func (s *FileStore) ImportRecoveryRemoteSecretVersions(versions []RemoteSecretVersion, recoveryKey string, force bool) (int, RecoveryKeyIdentity, error) {
+func (s *FileStore) ImportRecoveryRemoteSecretVersions(workspaceID, workspaceSlug string, versions []RemoteSecretVersion, recoveryKey string, force bool) (int, RecoveryKeyIdentity, error) {
 	if err := s.RequireInitialized(); err != nil {
 		return 0, RecoveryKeyIdentity{}, err
 	}
@@ -1314,7 +1334,7 @@ func (s *FileStore) ImportRecoveryRemoteSecretVersions(versions []RemoteSecretVe
 	if err != nil {
 		return 0, RecoveryKeyIdentity{}, err
 	}
-	imported, err := s.importRemoteSecretVersions(versions, force, func(remote RemoteSecretVersion) ([]byte, bool, error) {
+	imported, err := s.importRemoteSecretVersions(workspaceID, workspaceSlug, versions, force, func(remote RemoteSecretVersion) ([]byte, bool, error) {
 		return unwrapRecoveryDataKeyWithIdentity(privateKey, identity, remote.WrappedKeys)
 	})
 	if err != nil {
@@ -1331,9 +1351,12 @@ func RecoveryKeyIdentityForKey(recoveryKey string) (RecoveryKeyIdentity, error) 
 	return identity, err
 }
 
-func (s *FileStore) importRemoteSecretVersions(versions []RemoteSecretVersion, force bool, dataKeyForRemote func(RemoteSecretVersion) ([]byte, bool, error)) (int, error) {
+func (s *FileStore) importRemoteSecretVersions(workspaceID, workspaceSlug string, versions []RemoteSecretVersion, force bool, dataKeyForRemote func(RemoteSecretVersion) ([]byte, bool, error)) (int, error) {
 	if err := s.RequireInitialized(); err != nil {
 		return 0, err
+	}
+	if workspaceID == "" || workspaceSlug == "" {
+		return 0, errors.New("remote workspace is required")
 	}
 	if s.State.Secrets == nil {
 		s.State.Secrets = map[string]asiri.Secret{}
@@ -1351,16 +1374,20 @@ func (s *FileStore) importRemoteSecretVersions(versions []RemoteSecretVersion, f
 			partial.add(remote, errors.New("remote secret record is missing scope or name"))
 			continue
 		}
-		if s.State.ControlPlane != nil && remote.OrgID != "" && remote.OrgID != s.State.ControlPlane.WorkspaceID {
-			partial.add(remote, fmt.Errorf("belongs to workspace %s, not %s", remote.OrgID, s.State.ControlPlane.WorkspaceID))
+		if remote.OrgID == "" {
+			partial.add(remote, errors.New("remote secret record is missing workspace id"))
+			continue
+		}
+		if remote.OrgID != workspaceID {
+			partial.add(remote, fmt.Errorf("belongs to workspace %s, not %s", remote.OrgID, workspaceID))
 			continue
 		}
 		if !remoteAADMatches(remote) {
 			partial.add(remote, errors.New("encryption metadata does not match its path"))
 			continue
 		}
-		if s.State.ControlPlane != nil && remote.OrgID == s.State.ControlPlane.WorkspaceID && WorkspacePrefix(remote.Scope) != s.State.ControlPlane.WorkspaceSlug {
-			partial.add(remote, fmt.Errorf("belongs to workspace %s, but its path prefix is %s", s.State.ControlPlane.WorkspaceSlug, WorkspacePrefix(remote.Scope)))
+		if WorkspacePrefix(remote.Scope) != workspaceSlug {
+			partial.add(remote, fmt.Errorf("belongs to workspace %s, but its path prefix is %s", workspaceSlug, WorkspacePrefix(remote.Scope)))
 			continue
 		}
 		if remote.Algorithm != "aes-256-gcm" {
@@ -1476,10 +1503,6 @@ func (s *FileStore) importRemoteSecretVersions(versions []RemoteSecretVersion, f
 		if remote.OrgID != "" {
 			prefix := WorkspacePrefix(remote.Scope)
 			if existing := s.State.RemoteBindings[prefix]; existing.WorkspaceID == "" {
-				workspaceSlug := ""
-				if s.State.ControlPlane != nil && s.State.ControlPlane.WorkspaceID == remote.OrgID {
-					workspaceSlug = s.State.ControlPlane.WorkspaceSlug
-				}
 				s.State.RemoteBindings[prefix] = asiri.RemoteWorkspaceBinding{WorkspaceID: remote.OrgID, WorkspaceSlug: workspaceSlug, BoundAt: now}
 			}
 		}
@@ -1624,41 +1647,38 @@ func (s *FileStore) rotateDataKeys(prefix string) (int, error) {
 	return len(items), nil
 }
 
-func (s *FileStore) ActiveRecovery() *asiri.RecoveryConfig {
-	if s.State.ControlPlane == nil || s.State.ControlPlane.WorkspaceID == "" {
+func (s *FileStore) RecoveryForWorkspace(workspaceID string) *asiri.RecoveryConfig {
+	if workspaceID == "" {
 		return nil
 	}
-	recovery, ok := s.State.Recoveries[s.State.ControlPlane.WorkspaceID]
+	recovery, ok := s.State.Recoveries[workspaceID]
 	if !ok {
 		return nil
 	}
 	return &recovery
 }
 
-func (s *FileStore) SetupRecovery(force bool) (RecoverySetup, error) {
+func (s *FileStore) SetupRecovery(workspaceID, workspaceSlug string, force bool) (RecoverySetup, error) {
 	if err := s.RequireInitialized(); err != nil {
 		return RecoverySetup{}, err
 	}
-	if s.State.ControlPlane == nil || s.State.ControlPlane.WorkspaceID == "" {
-		return RecoverySetup{}, errors.New("asiri is not linked to a control plane")
+	if workspaceID == "" || workspaceSlug == "" {
+		return RecoverySetup{}, errors.New("workspace is required")
 	}
-	if s.ActiveRecovery() != nil && !force {
-		return RecoverySetup{}, fmt.Errorf("recovery is already configured for workspace %s; use --force to replace it", s.State.ControlPlane.WorkspaceSlug)
+	if s.RecoveryForWorkspace(workspaceID) != nil && !force {
+		return RecoverySetup{}, fmt.Errorf("recovery is already configured for workspace %s; use --force to replace it", workspaceSlug)
 	}
 	setup, err := s.GenerateRecoverySetup()
 	if err != nil {
 		return RecoverySetup{}, err
 	}
-	s.CommitRecoverySetup(setup)
+	s.CommitRecoverySetup(workspaceID, workspaceSlug, setup)
 	return setup, nil
 }
 
 func (s *FileStore) GenerateRecoverySetup() (RecoverySetup, error) {
 	if err := s.RequireInitialized(); err != nil {
 		return RecoverySetup{}, err
-	}
-	if s.State.ControlPlane == nil || s.State.ControlPlane.WorkspaceID == "" {
-		return RecoverySetup{}, errors.New("asiri is not linked to a control plane")
 	}
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -1691,46 +1711,46 @@ func (s *FileStore) GenerateRecoverySetup() (RecoverySetup, error) {
 	}, nil
 }
 
-func (s *FileStore) CommitRecoverySetup(setup RecoverySetup) {
+func (s *FileStore) CommitRecoverySetup(workspaceID, workspaceSlug string, setup RecoverySetup) {
 	if s.State.Recoveries == nil {
 		s.State.Recoveries = map[string]asiri.RecoveryConfig{}
 	}
-	s.State.Recoveries[s.State.ControlPlane.WorkspaceID] = setup.Config
-	s.Audit(s.State.UserID, "recovery_configured", "allowed", s.State.ControlPlane.WorkspaceSlug, "", "workspace recovery public key stored locally", map[string]string{"recipient": setup.RecipientID, "fingerprint": setup.Fingerprint, "workspace": s.State.ControlPlane.WorkspaceSlug})
+	s.State.Recoveries[workspaceID] = setup.Config
+	s.Audit(s.State.UserID, "recovery_configured", "allowed", workspaceSlug, "", "workspace recovery public key stored locally", map[string]string{"recipient": setup.RecipientID, "fingerprint": setup.Fingerprint, "workspace": workspaceSlug})
 }
 
-func (s *FileStore) SetActiveRecovery(recovery *asiri.RecoveryConfig) error {
-	if s.State.ControlPlane == nil || s.State.ControlPlane.WorkspaceID == "" {
-		return errors.New("asiri is not linked to a control plane")
+func (s *FileStore) SetRecoveryForWorkspace(workspaceID string, recovery *asiri.RecoveryConfig) error {
+	if workspaceID == "" {
+		return errors.New("workspace is required")
 	}
 	if s.State.Recoveries == nil {
 		s.State.Recoveries = map[string]asiri.RecoveryConfig{}
 	}
 	if recovery == nil {
-		delete(s.State.Recoveries, s.State.ControlPlane.WorkspaceID)
+		delete(s.State.Recoveries, workspaceID)
 		return s.Save()
 	}
-	s.State.Recoveries[s.State.ControlPlane.WorkspaceID] = *recovery
+	s.State.Recoveries[workspaceID] = *recovery
 	return s.Save()
 }
 
-func (s *FileStore) RecoveryWrappedKeyForSecretVersion(scope, name string, version int) (RemoteWrappedKey, error) {
+func (s *FileStore) RecoveryWrappedKeyForSecretVersion(workspaceID, workspaceSlug, scope, name string, version int) (RemoteWrappedKey, error) {
 	if err := s.RequireInitialized(); err != nil {
 		return RemoteWrappedKey{}, err
 	}
-	recovery := s.ActiveRecovery()
+	recovery := s.RecoveryForWorkspace(workspaceID)
 	if recovery == nil {
-		return RemoteWrappedKey{}, errors.New("recovery is not configured for the current control-plane workspace")
+		return RemoteWrappedKey{}, fmt.Errorf("recovery is not configured for workspace %s", workspaceSlug)
 	}
-	return s.RecoveryWrappedKeyForSecretVersionWithConfig(scope, name, version, *recovery)
+	return s.RecoveryWrappedKeyForSecretVersionWithConfig(workspaceSlug, scope, name, version, *recovery)
 }
 
-func (s *FileStore) RecoveryWrappedKeyForSecretVersionWithConfig(scope, name string, version int, recovery asiri.RecoveryConfig) (RemoteWrappedKey, error) {
+func (s *FileStore) RecoveryWrappedKeyForSecretVersionWithConfig(workspaceSlug, scope, name string, version int, recovery asiri.RecoveryConfig) (RemoteWrappedKey, error) {
 	if err := s.RequireInitialized(); err != nil {
 		return RemoteWrappedKey{}, err
 	}
-	if WorkspacePrefix(scope) != s.State.ControlPlane.WorkspaceSlug {
-		return RemoteWrappedKey{}, fmt.Errorf("secret scope %s is not in the current control-plane workspace %s", scope, s.State.ControlPlane.WorkspaceSlug)
+	if WorkspacePrefix(scope) != workspaceSlug {
+		return RemoteWrappedKey{}, fmt.Errorf("secret scope %s is not in workspace %s", scope, workspaceSlug)
 	}
 	dataKey, err := s.dataKeyForSecretVersion(scope, name, version)
 	if err != nil {
@@ -1743,12 +1763,12 @@ func recoveryWrappedDataKey(dataKey []byte, recovery asiri.RecoveryConfig) (Remo
 	return wrapKeyToPublicKeyWithOptions(dataKey, recovery.PublicKey, recovery.RecipientID, "recovery", "recovery-hkdf-aes256gcm", "asiri recovery wrap", "asiri-recovery-wrap:")
 }
 
-func (s *FileStore) UnwrapDeviceDataKey(wrappedKeys []RemoteWrappedKey) ([]byte, error) {
+func (s *FileStore) UnwrapDeviceDataKey(remoteDeviceID string, wrappedKeys []RemoteWrappedKey) ([]byte, error) {
 	if err := s.RequireInitialized(); err != nil {
 		return nil, err
 	}
-	if s.State.ControlPlane == nil || s.State.ControlPlane.DeviceID == "" {
-		return nil, errors.New("asiri is not linked to a control plane")
+	if remoteDeviceID == "" {
+		return nil, errors.New("remote device is required")
 	}
 	device, err := s.ActiveDevice()
 	if err != nil {
@@ -1759,8 +1779,8 @@ func (s *FileStore) UnwrapDeviceDataKey(wrappedKeys []RemoteWrappedKey) ([]byte,
 		return nil, err
 	}
 	for _, key := range wrappedKeys {
-		if key.RecipientType == "device" && key.RecipientID == s.State.ControlPlane.DeviceID && key.WrapAlgorithm == "p256-hkdf-aes256gcm" {
-			return unwrapKeyWithPrivate(privateKey, key, s.State.ControlPlane.DeviceID, "asiri p256 wrap", "asiri-wrap:")
+		if key.RecipientType == "device" && key.RecipientID == remoteDeviceID && key.WrapAlgorithm == "p256-hkdf-aes256gcm" {
+			return unwrapKeyWithPrivate(privateKey, key, remoteDeviceID, "asiri p256 wrap", "asiri-wrap:")
 		}
 	}
 	return nil, errors.New("remote secrets are not wrapped to this device")
@@ -1791,30 +1811,24 @@ func unwrapRecoveryDataKeyWithIdentity(privateKey *ecdsa.PrivateKey, identity Re
 	return nil, false, nil
 }
 
-func (s *FileStore) MarkRecoveryWrapped(prefix string, count int) error {
-	if s.State.ControlPlane == nil || s.State.ControlPlane.WorkspaceID == "" {
-		return errors.New("asiri is not linked to a control plane")
+func (s *FileStore) MarkRecoveryWrapped(workspaceID, workspaceSlug string, count int) error {
+	if workspaceID == "" || workspaceSlug == "" {
+		return errors.New("workspace is required")
 	}
-	if prefix != "" && prefix != s.State.ControlPlane.WorkspaceSlug {
-		return fmt.Errorf("workspace prefix %s does not match the current control-plane workspace %s", prefix, s.State.ControlPlane.WorkspaceSlug)
-	}
-	recovery := s.ActiveRecovery()
+	recovery := s.RecoveryForWorkspace(workspaceID)
 	if recovery == nil {
 		return nil
 	}
 	recovery.WrappedSecretCount = count
 	recovery.LastWrappedAt = time.Now().UTC()
-	s.State.Recoveries[s.State.ControlPlane.WorkspaceID] = *recovery
-	metadata := map[string]string{"count": fmt.Sprintf("%d", count), "recipient": recovery.RecipientID, "workspace": s.State.ControlPlane.WorkspaceSlug}
-	s.Audit(s.State.UserID, "recovery_wrapped", "allowed", prefix, "", "recovery-wrapped active remote secrets", metadata)
+	s.State.Recoveries[workspaceID] = *recovery
+	metadata := map[string]string{"count": fmt.Sprintf("%d", count), "recipient": recovery.RecipientID, "workspace": workspaceSlug}
+	s.Audit(s.State.UserID, "recovery_wrapped", "allowed", workspaceSlug, "", "recovery-wrapped active remote secrets", metadata)
 	return s.Save()
 }
 
-func (s *FileStore) RecoveryWrappedCountForPrefix(prefix string) int {
-	if s.State.ControlPlane == nil || prefix != s.State.ControlPlane.WorkspaceSlug {
-		return 0
-	}
-	recovery := s.ActiveRecovery()
+func (s *FileStore) RecoveryWrappedCount(workspaceID string) int {
+	recovery := s.RecoveryForWorkspace(workspaceID)
 	if recovery == nil {
 		return 0
 	}
@@ -2052,14 +2066,14 @@ func (s *FileStore) RenameWorkspacePrefix(oldSlug, newSlug, remoteWorkspaceID st
 	return nil
 }
 
-func (s *FileStore) RemoteWrappedKeyForSecretVersionPublicKey(scope, name string, version int, remoteDeviceID, encryptionPublicKey string) (RemoteWrappedKey, error) {
+func (s *FileStore) RemoteWrappedKeyForSecretVersionPublicKey(workspaceID, scope, name string, version int, remoteDeviceID, encryptionPublicKey string) (RemoteWrappedKey, error) {
 	if err := s.RequireInitialized(); err != nil {
 		return RemoteWrappedKey{}, err
 	}
 	if s.State.ControlPlane == nil {
 		return RemoteWrappedKey{}, errors.New("asiri is not linked to a control plane")
 	}
-	if err := s.requirePrefixBoundToActiveWorkspace(scope, "rewrap secrets"); err != nil {
+	if err := s.requirePrefixBoundToWorkspace(scope, workspaceID, "rewrap secrets"); err != nil {
 		return RemoteWrappedKey{}, err
 	}
 	dataKey, err := s.dataKeyForSecretVersion(scope, name, version)
@@ -2205,17 +2219,20 @@ func (s *FileStore) RemoteBindingForPrefix(prefix string) (asiri.RemoteWorkspace
 	return binding, binding.WorkspaceID != ""
 }
 
-func (s *FileStore) requirePrefixBoundToActiveWorkspace(scope, action string) error {
+func (s *FileStore) requirePrefixBoundToWorkspace(scope, workspaceID, action string) error {
 	if s.State.ControlPlane == nil {
 		return errors.New("asiri is not linked to a control plane")
+	}
+	if workspaceID == "" {
+		return errors.New("workspace is required")
 	}
 	prefix := WorkspacePrefix(scope)
 	binding, ok := s.RemoteBindingForPrefix(prefix)
 	if !ok {
 		return fmt.Errorf("workspace prefix %s is not bound to a control-plane workspace; push or pull it before trying to %s", prefix, action)
 	}
-	if binding.WorkspaceID != s.State.ControlPlane.WorkspaceID {
-		return fmt.Errorf("workspace prefix %s is bound to workspace id %s, but the current control-plane session is workspace id %s; refusing to %s", prefix, binding.WorkspaceID, s.State.ControlPlane.WorkspaceID, action)
+	if binding.WorkspaceID != workspaceID {
+		return fmt.Errorf("workspace prefix %s is bound to workspace id %s, not requested workspace id %s; refusing to %s", prefix, binding.WorkspaceID, workspaceID, action)
 	}
 	return nil
 }

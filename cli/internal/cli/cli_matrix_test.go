@@ -94,9 +94,11 @@ func TestCLICommandMatrix(t *testing.T) {
 	} {
 		expectFail("requires --workspace", step...)
 	}
-	if devices := expectOK("device", "list"); !strings.Contains(devices, "qa-laptop") || !strings.Contains(devices, "trusted") {
+	if devices := expectOK("device", "list", "--local"); !strings.Contains(devices, "qa-laptop") || !strings.Contains(devices, "trusted") {
 		t.Fatalf("device list missing enrolled trusted device: %s", devices)
 	}
+	expectFail("requires --local or --remote", "device", "list")
+	expectFail("requires --local or --remote", "device", "list", "--workspace", "qa")
 	expectFail("--value is unsafe", "add", "--workspace", "qa", "openai/leaky", "--value", "qa_secret_value")
 	expectFail("unknown option", "secret", "delete", "--workspace", "qa", "openai/api_key", "--force")
 	expectFail("does not accept scope/name", "secret", "delete", "--workspace", "qa", "--remote-only-unwrapped", "openai/api_key")
@@ -135,7 +137,7 @@ func TestCLICommandMatrix(t *testing.T) {
 	expectFail("requires --workspace", "run", "--agent", "codex", "sh", "-c", "test asiri://openai/api_key = qa_secret_value")
 	expectFail("argument substitution is disabled", "run", "--workspace", "qa", "--agent", "codex", "sh", "-c", "test asiri://openai/api_key = qa_secret_value")
 	expectOK("run", "--workspace", "qa", "--agent", "codex", "--unsafe-argv", "sh", "-c", "test $1 = qa_secret_value", "sh", "asiri://openai/api_key")
-	if policies := expectOK("policy", "list"); !strings.Contains(policies, "codex") || !strings.Contains(policies, "analyst") || !strings.Contains(policies, "prod-bot") {
+	if policies := expectOK("policy", "list", "--workspace", "qa"); !strings.Contains(policies, "codex") || !strings.Contains(policies, "analyst") || !strings.Contains(policies, "prod-bot") {
 		t.Fatalf("policy list missing grants/denies: %s", policies)
 	}
 	expectOK("run", "--workspace", "qa", "--agent", "codex", "--env", "OPENAI_API_KEY=openai/api_key", "--", "sh", "-c", "test \"$OPENAI_API_KEY\" = qa_secret_value")
@@ -144,7 +146,7 @@ func TestCLICommandMatrix(t *testing.T) {
 	if value := expectOK("get", "--workspace", "qa", "openai/api_key"); strings.TrimSpace(value) != "qa_rotated_value" {
 		t.Fatalf("rotated get returned %q", value)
 	}
-	if audit := expectOK("audit", "tail", "--limit", "20"); !strings.Contains(audit, "secret_rotated") || !strings.Contains(audit, "secret_injected") || !strings.Contains(audit, "secret_read") {
+	if audit := expectOK("audit", "tail", "--workspace", "qa", "--limit", "20"); !strings.Contains(audit, "secret_rotated") || !strings.Contains(audit, "secret_injected") || !strings.Contains(audit, "secret_read") {
 		t.Fatalf("audit tail missing expected events: %s", audit)
 	}
 	expectFail("last trusted local device", "device", "revoke", "qa-laptop")
@@ -154,12 +156,12 @@ func TestCLICommandMatrix(t *testing.T) {
 		t.Fatalf("removed secret still listed: %s", listing)
 	}
 	expectOK("device", "revoke", "qa-laptop")
-	if devices := expectOK("device", "list", "--include-revoked"); !strings.Contains(devices, "revoked") {
+	if devices := expectOK("device", "list", "--local", "--include-revoked"); !strings.Contains(devices, "revoked") {
 		t.Fatalf("device revoke not reflected in list: %s", devices)
 	}
 	expectOK("cache", "wipe")
-	expectFail("asiri is not initialized", "audit", "tail")
+	expectFail("asiri is not initialized", "audit", "tail", "--workspace", "qa")
 	expectOK("init", "--device", "qa-laptop")
 	expectOK("local", "wipe", "--yes")
-	expectFail("asiri is not initialized", "audit", "tail")
+	expectFail("asiri is not initialized", "audit", "tail", "--workspace", "qa")
 }
