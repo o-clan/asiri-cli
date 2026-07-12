@@ -19,20 +19,19 @@ Asiri is a secrets access layer. Treat it as the source of operational secrets a
 - Stop before changing trust, device, recovery, rekey, or local key material unless the user explicitly asked for that repair.
 - If Asiri reports missing platform key material, keyring errors, duplicated devices, unknown trust, or recovery problems, report the state and ask before mutating anything.
 
-## First Checks
+## First Check
 
-Run these before using or changing secrets:
+Start routine work by discovering the visible workspaces:
 
 ```sh
-asiri --version
-asiri setup doctor --workspace <workspace>
 asiri workspace list
 ```
 
-If the user named a workspace, verify it is visible and whether this device is trusted:
+Do not run `asiri --version` or `asiri setup doctor` routinely. Use them only when troubleshooting installation, configuration, authentication, trust, key material, or unexpected CLI behavior.
+
+If the user named a workspace, confirm it is visible above, then inspect its secret metadata:
 
 ```sh
-asiri workspace list
 asiri list --workspace <workspace>
 ```
 
