@@ -80,12 +80,14 @@ func (a App) push(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	devices, err := listRemoteDevices(st, st.State.ControlPlane.Origin, target.ID, accessToken, false)
-	if err != nil {
-		return a.fail(fmt.Errorf("trusted device discovery failed; refusing to push incomplete wrapped-key coverage: %w", err))
-	}
-	if err := addTrustedDeviceWrappedKeysToVersions(st, target.ID, versions, devices); err != nil {
-		return a.fail(err)
+	for i := range versions {
+		devices, err := listRemoteWrappingDevices(st, st.State.ControlPlane.Origin, target.ID, versions[i].Scope, versions[i].Name, accessToken)
+		if err != nil {
+			return a.fail(fmt.Errorf("trusted device discovery failed; refusing to push without authorized wrapping targets for %s/%s: %w", versions[i].Scope, versions[i].Name, err))
+		}
+		if err := addTrustedDeviceWrappedKeysToVersions(st, target.ID, versions[i:i+1], devices); err != nil {
+			return a.fail(err)
+		}
 	}
 	recoveryRecipientID := ""
 	if recovery != nil {

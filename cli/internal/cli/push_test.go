@@ -150,6 +150,9 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 			if r.Header.Get("authorization") != "Bearer at_push" {
 				t.Fatalf("unexpected device list auth header: %s", r.Header.Get("authorization"))
 			}
+			if r.URL.Query().Get("scope") != "oclan-co/local/asiri" || r.URL.Query().Get("secretName") != "API_KEY" {
+				t.Fatalf("wrapping targets must be requested for one secret: %s", r.URL.RawQuery)
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"devices": []map[string]any{
 					{"id": "dev_remote", "name": "qa-laptop", "status": "trusted", "kind": "laptop", "encryptionPublicKey": devicePublicKey},

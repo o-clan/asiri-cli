@@ -73,6 +73,15 @@ func listRemoteDevices(st *store.FileStore, origin, orgID, accessToken string, i
 	return result.Devices, nil
 }
 
+func listRemoteWrappingDevices(st *store.FileStore, origin, orgID, scope, secretName, accessToken string) ([]remoteDeviceResponse, error) {
+	var result remoteDevicesResponse
+	endpoint := fmt.Sprintf("%s/v1/devices?orgId=%s&scope=%s&secretName=%s", strings.TrimRight(origin, "/"), url.QueryEscape(orgID), url.QueryEscape(scope), url.QueryEscape(secretName))
+	if err := getJSONBearer(st, endpoint, accessToken, &result); err != nil {
+		return nil, fmt.Errorf("authorized wrapping target discovery failed: %w", err)
+	}
+	return result.Devices, nil
+}
+
 func listRemoteSecrets(st *store.FileStore, origin, orgID, accessToken, recoveryRecipientID string, includeInactive bool) ([]remoteSecretRecord, error) {
 	var result remoteSecretsResponse
 	endpoint := fmt.Sprintf("%s/v1/secrets/encrypted?orgId=%s", strings.TrimRight(origin, "/"), url.QueryEscape(orgID))

@@ -127,10 +127,6 @@ type rewrapStats struct {
 }
 
 func (a App) rewrapWorkspace(st *store.FileStore, accessToken string, target remoteWorkspaceResponse) (rewrapStats, error) {
-	devices, err := listRemoteDevices(st, st.State.ControlPlane.Origin, target.ID, accessToken, false)
-	if err != nil {
-		return rewrapStats{}, err
-	}
 	encryptedSecrets, err := listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, "", false)
 	if err != nil {
 		return rewrapStats{}, err
@@ -143,15 +139,6 @@ func (a App) rewrapWorkspace(st *store.FileStore, accessToken string, target rem
 	if status != http.StatusNotFound {
 		secrets = mergeRemoteSecretRecords(metadataSecrets, encryptedSecrets)
 	}
-	targets := map[string]remoteDeviceResponse{}
-	for _, device := range devices {
-		if device.Status == "trusted" && device.EncryptionPublicKey != "" {
-			targets[device.ID] = device
-		}
-	}
-	if len(targets) == 0 {
-		return rewrapStats{}, nil
-	}
 	stats := rewrapStats{}
 	for _, secret := range secrets {
 		if secret.Status != "active" {
@@ -161,8 +148,15 @@ func (a App) rewrapWorkspace(st *store.FileStore, accessToken string, target rem
 			stats.SkippedMissingLocal++
 			continue
 		}
+		devices, err := listRemoteWrappingDevices(st, st.State.ControlPlane.Origin, target.ID, secret.Scope, secret.Name, accessToken)
+		if err != nil {
+			return rewrapStats{}, fmt.Errorf("refusing to rewrap without authorized targets for %s/%s: %w", secret.Scope, secret.Name, err)
+		}
 		missing := make([]store.RemoteWrappedKey, 0)
-		for _, device := range targets {
+		for _, device := range devices {
+			if device.Status != "trusted" || device.EncryptionPublicKey == "" {
+				continue
+			}
 			if remoteSecretHasRecipient(secret, device.ID) {
 				continue
 			}
