@@ -65,6 +65,18 @@ For tools that read files instead of environment variables, use `asiri mount` to
 
 `asiri login`, `asiri push`, and `asiri pull` are optional. Use them when you want this local vault to sync encrypted secrets through the Asiri control plane.
 
+After `asiri login`, a workspace owner can manage human member access from a trusted device:
+
+```bash
+asiri member list --workspace personal
+asiri member access list --workspace personal
+asiri member access grant --workspace personal --member teammate@example.com --secret dev/API_KEY
+asiri rewrap --workspace personal
+asiri member access revoke --workspace personal --grant sag_example
+```
+
+Envelope grants use `--envelope <scope>` and add `--include-descendants` only when child envelopes should be included. These commands show metadata only. Grant and revoke are audited and notify the member. Revocation does not erase copies already decrypted or cached on a device.
+
 Workspace owners and delegated admins set envelope audit mode in the control plane. Use buffered for local or offline-friendly envelopes. Use strict for production, staging, SSH, deploy, and other paths where administrator visibility before release matters.
 
 ## Release Signing

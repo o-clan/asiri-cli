@@ -52,6 +52,8 @@ func (a App) Run(args []string) int {
 		return a.whoami(st, args)
 	case "workspace":
 		return a.workspace(st, args)
+	case "member":
+		return a.member(st, args)
 	case "service-account":
 		return a.serviceAccount(st, args)
 	case "push":

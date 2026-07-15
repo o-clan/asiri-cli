@@ -114,6 +114,41 @@ type remoteWorkspacesResponse struct {
 	Secrets       []visibleRemoteSecretRecord `json:"secrets,omitempty"`
 }
 
+type remoteMemberResponse struct {
+	ID              string `json:"id"`
+	OrgID           string `json:"orgId"`
+	UserID          string `json:"userId"`
+	Role            string `json:"role"`
+	Status          string `json:"status"`
+	UserEmail       string `json:"userEmail"`
+	UserDisplayName string `json:"userDisplayName"`
+	CreatedAt       string `json:"createdAt"`
+	RemovedAt       string `json:"removedAt"`
+}
+
+type remoteMembersResponse struct {
+	Members []remoteMemberResponse `json:"members"`
+}
+
+type remoteMemberAccessGrantResponse struct {
+	ID                 string `json:"id"`
+	OrgID              string `json:"orgId"`
+	UserID             string `json:"userId"`
+	TargetType         string `json:"targetType"`
+	Scope              string `json:"scope"`
+	SecretName         string `json:"secretName"`
+	IncludeDescendants bool   `json:"includeDescendants"`
+	Status             string `json:"status"`
+	GrantedByUserID    string `json:"grantedByUserId"`
+	CreatedAt          string `json:"createdAt"`
+	RevokedAt          string `json:"revokedAt"`
+	RevokedByUserID    string `json:"revokedByUserId"`
+}
+
+type remoteMemberAccessGrantsResponse struct {
+	SecretAccessGrants []remoteMemberAccessGrantResponse `json:"secretAccessGrants"`
+}
+
 type remoteServiceAccountResponse struct {
 	ID              string `json:"id"`
 	OrgID           string `json:"orgId"`

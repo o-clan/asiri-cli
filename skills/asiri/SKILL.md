@@ -1,6 +1,6 @@
 ---
 name: asiri
-description: "Use when an agent needs to operate Asiri CLI or Asiri-managed secrets: inspect secret metadata, run commands with scoped secrets, add or rotate operational secrets, grant local runtime access, push or pull encrypted records, configure service-account runtime access for CI or servers, or diagnose Asiri workspace/device state without exposing secret values. Focus on safe operational use first; use trust, recovery, rekey, revocation, service-account setup, and remote policy changes only when explicitly requested."
+description: "Use when an agent needs to operate Asiri CLI or Asiri-managed secrets: inspect secret metadata, run commands with scoped secrets, add or rotate operational secrets, grant local runtime access, manage human member access, push or pull encrypted records, configure service-account runtime access for CI or servers, or diagnose Asiri workspace/device state without exposing secret values. Focus on safe operational use first; use trust, recovery, rekey, revocation, member access, service-account setup, and remote policy changes only when explicitly requested."
 ---
 
 # Asiri
@@ -123,6 +123,33 @@ asiri policy list --workspace <workspace>
 
 Audit mode is an envelope policy set by the workspace owner or a delegated admin. Do not change it unless the user explicitly asked for an audit-mode change.
 
+## Human Member Access
+
+Use a trusted human device session created by `asiri login`. List members and current access without exposing values:
+
+```sh
+asiri member list --workspace <workspace>
+asiri member access list --workspace <workspace>
+```
+
+Workspace owners can grant one active member access using an exact email or user ID:
+
+```sh
+asiri member access grant --workspace <workspace> --member <email-or-user-id> --secret <scope/SECRET_NAME>
+asiri member access grant --workspace <workspace> --member <email-or-user-id> --envelope <scope>
+asiri member access grant --workspace <workspace> --member <email-or-user-id> --envelope <scope> --include-descendants
+```
+
+Run the printed `asiri rewrap --workspace <workspace>` next step from a trusted device that can already decrypt the permitted secrets. Granting access never rewraps automatically.
+
+Revoke by the stable grant ID returned by `member access list`:
+
+```sh
+asiri member access revoke --workspace <workspace> --grant <grant-id>
+```
+
+Grant and revoke are remote, audited mutations and send transactional notifications. Revocation blocks future access through that grant. It does not erase decrypted or cached copies, and another active grant may still cover the same secrets. Service-account sessions cannot manage members.
+
 ## Pull, Push, And Rewrap
 
 Use pull when a trusted device needs encrypted remote records locally:
@@ -190,6 +217,7 @@ Stop before running any of these unless the user directly requested that exact o
 - `asiri login --force`.
 - `asiri device trust --workspace <workspace>`, `asiri device revoke --remote --workspace <workspace> <device-id>`, or dashboard trust changes.
 - `asiri service-account create`, `asiri service-account disable`, or `asiri service-account grant`.
+- `asiri member access grant` or `asiri member access revoke`.
 - `asiri service-account login` when it would bind a new runtime device to a service account.
 - `asiri recovery setup --workspace <workspace>`, `asiri recovery restore --workspace <workspace>`, or recovery key handling.
 - `asiri rekey --workspace <workspace>`.

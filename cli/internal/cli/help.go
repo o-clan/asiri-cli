@@ -17,6 +17,7 @@ Commands:
   login       Link this device to the hosted control plane.
   logout      Remove the hosted control-plane session from this device.
   workspace   List visible control-plane workspaces.
+  member      List workspace members and manage their secret access.
   service-account
               Manage and log in as service accounts.
   push        Upload encrypted local-only secrets to a specified workspace.
@@ -72,12 +73,16 @@ func commandHelpRequested(args []string) bool {
 
 func commandHelpPath(args []string) []string {
 	path := []string{args[0]}
+	limit := 2
+	if args[0] == "member" && len(args) > 1 && args[1] == "access" {
+		limit = 3
+	}
 	for _, arg := range args[1:] {
 		if arg == "--" || strings.HasPrefix(arg, "-") {
 			break
 		}
 		path = append(path, arg)
-		if len(path) == 2 {
+		if len(path) == limit {
 			break
 		}
 	}
@@ -89,10 +94,7 @@ func (a App) helpFor(path []string) int {
 		a.help()
 		return 0
 	}
-	topic := path[0]
-	if len(path) > 1 {
-		topic += " " + path[1]
-	}
+	topic := strings.Join(path, " ")
 	switch topic {
 	case "init":
 		fmt.Fprint(a.Out, "Usage: asiri init [--device <device>]\n\nCreates a local encrypted vault and a trusted local device. Local vaults do not have workspace slugs.\n")
@@ -112,6 +114,18 @@ func (a App) helpFor(path []string) int {
 		fmt.Fprint(a.Out, "Usage: asiri workspace <command>\n\nCommands:\n  list   Show visible workspaces, role, device trust, account write access, and id.\n")
 	case "workspace list":
 		fmt.Fprint(a.Out, "Usage: asiri workspace list\n\nShows visible workspaces as a table. This device controls pull and workspace-scoped push. Account write means the user owns the workspace or has effective secret-write capability.\n")
+	case "member":
+		fmt.Fprint(a.Out, "Usage: asiri member <command>\n\nCommands:\n  list    List workspace members by name and email.\n  access  List, grant, or revoke member access to envelopes and secrets.\n\nRequires a trusted device linked through asiri login.\n")
+	case "member list":
+		fmt.Fprint(a.Out, "Usage: asiri member list --workspace <slug> [--all]\n\nLists workspace member metadata. Removed members are hidden unless --all is set. Secret values are never shown.\n")
+	case "member access":
+		fmt.Fprint(a.Out, "Usage: asiri member access <command>\n\nCommands:\n  list    List member secret-access grants.\n  grant   Grant an active member access to one envelope or secret.\n  revoke  Revoke one grant by id.\n")
+	case "member access list":
+		fmt.Fprint(a.Out, "Usage: asiri member access list --workspace <slug> [--member <email-or-user-id>] [--all]\n\nLists active member access grants. Revoked grants are included with --all.\n")
+	case "member access grant":
+		fmt.Fprint(a.Out, "Usage: asiri member access grant --workspace <slug> --member <email-or-user-id> --envelope <scope|/> [--include-descendants]\n       asiri member access grant --workspace <slug> --member <email-or-user-id> --secret <scope/name>\n\nUse / for the workspace-root envelope. A direct envelope grant covers secrets directly inside it; --include-descendants also covers child envelopes. Run rewrap afterward so permitted trusted devices receive wrapped keys.\n")
+	case "member access revoke":
+		fmt.Fprint(a.Out, "Usage: asiri member access revoke --workspace <slug> --grant <id>\n\nRevokes future access through that grant. Existing decrypted or cached copies are not erased, and another active grant may still authorize the same secrets.\n")
 	case "service-account":
 		fmt.Fprint(a.Out, "Usage: asiri service-account <command>\n\nCommands:\n  create   Create a service account from a trusted device session.\n  list     List service accounts in a workspace.\n  disable  Disable a service account.\n  grant    Add a remote service policy for a service account.\n  login    Start a browser-approved service account login.\n")
 	case "service-account create":
