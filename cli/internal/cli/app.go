@@ -33,11 +33,21 @@ func (a App) Run(args []string) int {
 		fmt.Fprintf(a.Out, "asiri %s\n", Version)
 		return 0
 	}
-	st, err := store.LoadDefault()
+	cmd := args[0]
+	var st *store.FileStore
+	var err error
+	if commandUsesLifecycleStateLock(cmd) {
+		var release func() error
+		st, release, err = store.LoadDefaultLocked()
+		if err == nil {
+			defer release()
+		}
+	} else {
+		st, err = store.LoadDefault()
+	}
 	if err != nil {
 		return a.fail(err)
 	}
-	cmd := args[0]
 	args = args[1:]
 	switch cmd {
 	case "init":
@@ -102,6 +112,15 @@ func (a App) Run(args []string) int {
 		return a.cache(st, args)
 	default:
 		return a.fail(fmt.Errorf("unknown command %q", cmd))
+	}
+}
+
+func commandUsesLifecycleStateLock(command string) bool {
+	switch command {
+	case "init", "login", "logout", "member", "service-account", "push", "pull", "rewrap", "rekey", "recovery", "device", "secret", "local", "add", "rotate", "rm", "grant", "deny", "cache":
+		return true
+	default:
+		return false
 	}
 }
 

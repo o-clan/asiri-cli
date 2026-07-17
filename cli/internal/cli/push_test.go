@@ -23,6 +23,7 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	secretPushCount := 0
+	wrappingDiscoveryCount := 0
 	syncSeen := false
 	devicePublicKey := ""
 	var pushedSecret map[string]any
@@ -147,6 +148,12 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 				"encryptedSecrets": []map[string]any{pushedSecret},
 			})
 		case "/v1/devices":
+			wrappingDiscoveryCount++
+			if wrappingDiscoveryCount == 1 {
+				w.Header().Set("Retry-After", "0")
+				http.Error(w, `{"error":"rate limited"}`, http.StatusTooManyRequests)
+				return
+			}
 			if r.Header.Get("authorization") != "Bearer at_push" {
 				t.Fatalf("unexpected device list auth header: %s", r.Header.Get("authorization"))
 			}
@@ -198,6 +205,9 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 	}
 	if secretPushCount != 1 || !syncSeen {
 		t.Fatalf("expected push and pull endpoints to be called")
+	}
+	if wrappingDiscoveryCount < 2 {
+		t.Fatal("push did not retry rate-limited wrapping target discovery")
 	}
 	if strings.Contains(out.String(), "secret_value") || strings.Contains(errb.String(), "secret_value") {
 		t.Fatalf("push/pull leaked secret stdout=%q stderr=%q", out.String(), errb.String())
@@ -684,6 +694,13 @@ func TestParsePushArgsAcceptsLegacyYes(t *testing.T) {
 	}
 	if options.Workspace != "oclan-co" || !options.DryRun || len(options.Secrets) != 1 || options.Secrets[0] != "prod/github/SYNC_KEY" {
 		t.Fatalf("unexpected parsed push options: %#v", options)
+	}
+}
+
+func TestRateLimitRetryDelayIsCapped(t *testing.T) {
+	headers := http.Header{"Retry-After": []string{"3600"}}
+	if delay := rateLimitRetryDelay(headers, time.Now()); delay != time.Minute {
+		t.Fatalf("expected one-minute retry cap, got %s", delay)
 	}
 }
 

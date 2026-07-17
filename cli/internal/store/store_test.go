@@ -9,9 +9,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -58,6 +60,198 @@ func TestEncryptedLocalSecretStoreDoesNotPersistPlaintext(t *testing.T) {
 	}
 	if secret.NameHash == "" || !strings.HasPrefix(secret.NameHash, "sn_") {
 		t.Fatalf("expected secret name hash, got %q", secret.NameHash)
+	}
+}
+
+func TestStaleWriterCannotMixSecretCiphertextAndDataKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	initial, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial.UseDefaultFileKeyStore()
+	t.Cleanup(keystore.ClearConfiguredFileKeyStoreDir)
+	if err := initial.InitializeLocal(); err != nil {
+		t.Fatal(err)
+	}
+	initial.State.Devices = append(initial.State.Devices, asiri.Device{ID: "dev_test", Name: "test", Kind: "laptop", Status: asiri.DeviceTrusted})
+	if err := initial.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSecret, err := first.AddSecret("qa/concurrent/API_KEY", "first-value")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stale.AddSecret("qa/concurrent/API_KEY", "stale-value"); !errors.Is(err, ErrConcurrentStateChange) {
+		t.Fatalf("expected stale writer rejection, got %v", err)
+	}
+
+	staleAccount := stale.State.Secrets[SecretKey("qa/concurrent", "API_KEY")].Versions[0].DataKeyAccount
+	firstAccount := firstSecret.Versions[0].DataKeyAccount
+	if staleAccount == firstAccount {
+		t.Fatal("concurrent writers reused a secret data-key account")
+	}
+	if _, err := keystore.Load(staleAccount); err == nil {
+		t.Fatal("rejected stale writer left its data key behind")
+	}
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, _, err := reloaded.GetSecret("qa/concurrent/API_KEY")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value != "first-value" {
+		t.Fatalf("stale writer changed the stored value: got %q", value)
+	}
+}
+
+func TestLifecycleLockSerializesConcurrentSecretRotations(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	initial, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial.UseDefaultFileKeyStore()
+	t.Cleanup(keystore.ClearConfiguredFileKeyStoreDir)
+	if err := initial.InitializeLocal(); err != nil {
+		t.Fatal(err)
+	}
+	initial.State.Devices = append(initial.State.Devices, asiri.Device{ID: "dev_test", Name: "test", Kind: "laptop", Status: asiri.DeviceTrusted})
+	if err := initial.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	const writers = 16
+	start := make(chan struct{})
+	errorsCh := make(chan error, writers)
+	var wait sync.WaitGroup
+	for index := 0; index < writers; index++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			<-start
+			lock, err := acquireStateFileLock(path)
+			if err != nil {
+				errorsCh <- err
+				return
+			}
+			writer, err := Load(path)
+			if err == nil {
+				writer.stateLockHeld = true
+				_, err = writer.AddSecret("qa/concurrent/API_KEY", fmt.Sprintf("value-%d", index))
+				writer.stateLockHeld = false
+			}
+			if closeErr := lock.Close(); err == nil {
+				err = closeErr
+			}
+			if err != nil {
+				errorsCh <- err
+			}
+		}(index)
+	}
+	close(start)
+	wait.Wait()
+	close(errorsCh)
+	for err := range errorsCh {
+		t.Fatal(err)
+	}
+
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := reloaded.State.Secrets[SecretKey("qa/concurrent", "API_KEY")]
+	if len(secret.Versions) != writers || secret.ActiveVersion != writers {
+		t.Fatalf("expected %d contiguous versions, got active=%d versions=%d", writers, secret.ActiveVersion, len(secret.Versions))
+	}
+	accounts := map[string]struct{}{}
+	for _, version := range secret.Versions {
+		if _, err := reloaded.decryptSecretVersion(version); err != nil {
+			t.Fatalf("version %d is not decryptable: %v", version.Version, err)
+		}
+		if _, exists := accounts[version.DataKeyAccount]; exists {
+			t.Fatalf("version %d reused data-key account %s", version.Version, version.DataKeyAccount)
+		}
+		accounts[version.DataKeyAccount] = struct{}{}
+	}
+}
+
+func TestAddSecretUsesMaximumStoredVersion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	st, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InitializeLocal(); err != nil {
+		t.Fatal(err)
+	}
+	st.State.Devices = append(st.State.Devices, asiri.Device{ID: "dev_test", Name: "test", Kind: "laptop", Status: asiri.DeviceTrusted})
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddSecret("prod/app/API_KEY", "one"); err != nil {
+		t.Fatal(err)
+	}
+	secret := st.State.Secrets[SecretKey("prod/app", "API_KEY")]
+	secret.Versions[0].Version = 4
+	secret.ActiveVersion = 4
+	st.State.Secrets[SecretKey("prod/app", "API_KEY")] = secret
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := st.AddSecret("prod/app/API_KEY", "two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rotated.ActiveVersion != 5 {
+		t.Fatalf("expected version 5 after gapped history, got %d", rotated.ActiveVersion)
+	}
+}
+
+func TestStaleQuarantineDoesNotDeleteOrOverwriteNewerState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	current, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := current.InitializeLocal(); err != nil {
+		t.Fatal(err)
+	}
+	current.State.Devices = append(current.State.Devices, asiri.Device{ID: "dev_test", Name: "test", Kind: "laptop", Status: asiri.DeviceTrusted})
+	if err := current.Save(); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := current.AddSecret("prod/app/API_KEY", "still-readable"); err != nil {
+		t.Fatal(err)
+	}
+	if err := stale.QuarantineLocalKeys("test stale writer"); !errors.Is(err, ErrConcurrentStateChange) {
+		t.Fatalf("expected stale quarantine rejection, got %v", err)
+	}
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, _, err := reloaded.GetSecret("prod/app/API_KEY")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value != "still-readable" {
+		t.Fatal("stale quarantine changed the newer secret")
 	}
 }
 

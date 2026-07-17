@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -74,12 +75,55 @@ func listRemoteDevices(st *store.FileStore, origin, orgID, accessToken string, i
 }
 
 func listRemoteWrappingDevices(st *store.FileStore, origin, orgID, scope, secretName, accessToken string) ([]remoteDeviceResponse, error) {
-	var result remoteDevicesResponse
 	endpoint := fmt.Sprintf("%s/v1/devices?orgId=%s&scope=%s&secretName=%s", strings.TrimRight(origin, "/"), url.QueryEscape(orgID), url.QueryEscape(scope), url.QueryEscape(secretName))
-	if err := getJSONBearer(st, endpoint, accessToken, &result); err != nil {
-		return nil, fmt.Errorf("authorized wrapping target discovery failed: %w", err)
+	for attempt := 0; attempt < 3; attempt++ {
+		var result remoteDevicesResponse
+		status, headers, err := getJSONBearerStatusWithHeaders(st, endpoint, accessToken, &result)
+		if status != http.StatusTooManyRequests {
+			if err != nil {
+				return nil, fmt.Errorf("authorized wrapping target discovery failed: %w", err)
+			}
+			if status < 200 || status >= 300 {
+				return nil, fmt.Errorf("authorized wrapping target discovery failed: control plane returned HTTP %d", status)
+			}
+			return result.Devices, nil
+		}
+		if attempt == 2 {
+			if err != nil {
+				return nil, fmt.Errorf("authorized wrapping target discovery failed after rate-limit retries: %w", err)
+			}
+			return nil, errors.New("authorized wrapping target discovery failed after rate-limit retries: control plane returned HTTP 429")
+		}
+		time.Sleep(rateLimitRetryDelay(headers, time.Now()))
 	}
-	return result.Devices, nil
+	return nil, errors.New("authorized wrapping target discovery failed")
+}
+
+func rateLimitRetryDelay(headers http.Header, now time.Time) time.Duration {
+	const maximumDelay = time.Minute
+	clamp := func(delay time.Duration) time.Duration {
+		if delay > maximumDelay {
+			return maximumDelay
+		}
+		return delay
+	}
+	retryAfter := strings.TrimSpace(headers.Get("Retry-After"))
+	if seconds, err := strconv.Atoi(retryAfter); err == nil && seconds >= 0 {
+		return clamp(time.Duration(seconds) * time.Second)
+	}
+	if retryAt, err := http.ParseTime(retryAfter); err == nil {
+		if delay := retryAt.Sub(now); delay > 0 {
+			return clamp(delay)
+		}
+		return 0
+	}
+	if reset, err := strconv.ParseInt(strings.TrimSpace(headers.Get("X-RateLimit-Reset")), 10, 64); err == nil {
+		if delay := time.Unix(reset, 0).Sub(now); delay > 0 {
+			return clamp(delay)
+		}
+		return 0
+	}
+	return time.Minute
 }
 
 func listRemoteSecrets(st *store.FileStore, origin, orgID, accessToken, recoveryRecipientID string, includeInactive bool) ([]remoteSecretRecord, error) {

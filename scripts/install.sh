@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="${ASIRI_VERSION:-0.1.40}"
+VERSION="${ASIRI_VERSION:-0.1.41}"
 INSTALL_DIR="${ASIRI_INSTALL_DIR:-$HOME/.local/bin}"
 SOURCE_DIR="${ASIRI_INSTALL_SOURCE_DIR:-}"
 BASE_URL="${ASIRI_RELEASE_BASE_URL:-https://github.com/o-clan/asiri-cli/releases/download/v${VERSION}}"

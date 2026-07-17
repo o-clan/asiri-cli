@@ -40,9 +40,14 @@ type FileStore struct {
 	Path                   string
 	State                  asiri.State
 	auditLedgerUnavailable bool
+	loadedStateDigest      [sha256.Size]byte
+	loadedStateExists      bool
+	loadedStateKnown       bool
+	stateLockHeld          bool
 }
 
 var ErrAuditLedgerKeyUnavailable = errors.New("local audit ledger key unavailable")
+var ErrConcurrentStateChange = errors.New("local Asiri state changed in another process; retry the command")
 
 type persistedAuditFields struct {
 	Audit       []asiri.AuditEvent        `json:"audit"`
@@ -174,11 +179,34 @@ func LoadDefault() (*FileStore, error) {
 	return Load(path)
 }
 
+func LoadDefaultLocked() (*FileStore, func() error, error) {
+	path, err := DefaultPath()
+	if err != nil {
+		return nil, nil, err
+	}
+	lock, err := acquireStateFileLock(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	store, err := Load(path)
+	if err != nil {
+		_ = lock.Close()
+		return nil, nil, err
+	}
+	store.stateLockHeld = true
+	release := func() error {
+		store.stateLockHeld = false
+		return lock.Close()
+	}
+	return store, release, nil
+}
+
 func Load(path string) (*FileStore, error) {
 	store := &FileStore{Path: path}
 	bytes, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		store.State = asiri.State{Version: 1, Secrets: map[string]asiri.Secret{}, Policies: []asiri.Policy{}, Audit: []asiri.AuditEvent{}, RemoteBindings: map[string]asiri.RemoteWorkspaceBinding{}}
+		store.loadedStateKnown = true
 		return store, nil
 	}
 	if err != nil {
@@ -205,6 +233,9 @@ func Load(path string) (*FileStore, error) {
 		return nil, err
 	}
 	store.removeLegacyOidcControlPlaneSession()
+	store.loadedStateDigest = sha256.Sum256(bytes)
+	store.loadedStateExists = true
+	store.loadedStateKnown = true
 	return store, nil
 }
 
@@ -263,13 +294,25 @@ func (s *FileStore) SaveWithAuditLedger() error {
 }
 
 func (s *FileStore) save() error {
+	if err := os.MkdirAll(filepath.Dir(s.Path), 0o700); err != nil {
+		return err
+	}
+	var lock *stateFileLock
+	var err error
+	if !s.stateLockHeld {
+		lock, err = acquireStateFileLock(s.Path)
+		if err != nil {
+			return err
+		}
+		defer lock.Close()
+	}
+	if err := s.requireCurrentStateSnapshot(); err != nil {
+		return err
+	}
 	if s.State.CreatedAt.IsZero() {
 		s.State.CreatedAt = time.Now().UTC()
 	}
 	s.State.UpdatedAt = time.Now().UTC()
-	if err := os.MkdirAll(filepath.Dir(s.Path), 0o700); err != nil {
-		return err
-	}
 	newAuditLedgerKeyAccount := ""
 	if err := s.rebuildAuditLedger(&newAuditLedgerKeyAccount); err != nil {
 		if newAuditLedgerKeyAccount != "" {
@@ -277,21 +320,86 @@ func (s *FileStore) save() error {
 		}
 		return err
 	}
-	if err := s.writeStateFile(); err != nil {
+	bytes, err := s.writeStateFile()
+	if err != nil {
 		if newAuditLedgerKeyAccount != "" {
 			_ = keystore.Delete(newAuditLedgerKeyAccount)
 		}
 		return err
 	}
+	s.loadedStateDigest = sha256.Sum256(bytes)
+	s.loadedStateExists = true
+	s.loadedStateKnown = true
 	return nil
 }
 
-func (s *FileStore) writeStateFile() error {
-	bytes, err := json.MarshalIndent(s.State, "", "  ")
+func (s *FileStore) requireCurrentStateSnapshot() error {
+	if !s.loadedStateKnown {
+		return ErrConcurrentStateChange
+	}
+	bytes, err := os.ReadFile(s.Path)
+	if errors.Is(err, os.ErrNotExist) {
+		if s.loadedStateExists {
+			return ErrConcurrentStateChange
+		}
+		return nil
+	}
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.Path, bytes, 0o600)
+	if !s.loadedStateExists || sha256.Sum256(bytes) != s.loadedStateDigest {
+		return ErrConcurrentStateChange
+	}
+	return nil
+}
+
+func (s *FileStore) writeStateFile() ([]byte, error) {
+	bytes, err := json.MarshalIndent(s.State, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	if err := writeFileAtomically(s.Path, bytes); err != nil {
+		return nil, err
+	}
+	return bytes, nil
+}
+
+func writeFileAtomically(path string, bytes []byte) (resultErr error) {
+	dir := filepath.Dir(path)
+	if info, err := os.Stat(path); err == nil && info.Mode().Perm()&0o200 == 0 {
+		return os.ErrPermission
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	temp, err := os.CreateTemp(dir, ".asiri-state-*")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	defer func() {
+		_ = temp.Close()
+		_ = os.Remove(tempPath)
+	}()
+	if err := temp.Chmod(0o600); err != nil {
+		return err
+	}
+	if _, err := temp.Write(bytes); err != nil {
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if err := replaceStateFile(tempPath, path); err != nil {
+		return err
+	}
+	if dirHandle, err := os.Open(dir); err == nil {
+		_ = dirHandle.Sync()
+		_ = dirHandle.Close()
+	}
+	return nil
 }
 
 func (s *FileStore) loadAuditFromLedger(bytes []byte) error {
@@ -763,7 +871,7 @@ func (s *FileStore) AddSecret(fullPath, value string) (asiri.Secret, error) {
 			secret.Versions[i].Status = "stale"
 		}
 	}
-	version := len(secret.Versions) + 1
+	version := nextSecretVersion(secret.Versions)
 	workspaceID := s.encryptionWorkspaceIDForScope(scope)
 	aad := fmt.Sprintf("%s:%s:%s:%d:%s", workspaceID, scope, name, version, device.ID)
 	dataKey, dataKeyAccount, err := s.newSecretDataKey(scope, name, version)
@@ -1420,10 +1528,14 @@ func (s *FileStore) importRemoteSecretVersions(workspaceID, workspaceSlug string
 			}
 			accountWorkspaceID = remote.OrgID
 		}
+		account, err := newSecretDataKeyAccount(accountWorkspaceID)
+		if err != nil {
+			return 0, err
+		}
 		prepared = append(prepared, preparedRemoteSecretVersion{
 			remote:  remote,
 			dataKey: dataKey,
-			account: secretDataKeyAccount(accountWorkspaceID, remote.Scope, remote.Name, remote.Version),
+			account: account,
 		})
 	}
 	imported := 0
@@ -1617,7 +1729,7 @@ func (s *FileStore) rotateDataKeys(prefix string) (int, error) {
 				secret.Versions[i].Status = "stale"
 			}
 		}
-		nextVersion := len(secret.Versions) + 1
+		nextVersion := nextSecretVersion(secret.Versions)
 		workspaceID := s.encryptionWorkspaceIDForScope(secret.Scope)
 		aad := fmt.Sprintf("%s:%s:%s:%d:%s", workspaceID, secret.Scope, secret.Name, nextVersion, device.ID)
 		dataKey, dataKeyAccount, err := s.newSecretDataKey(secret.Scope, secret.Name, nextVersion)
@@ -2127,6 +2239,23 @@ func (s *FileStore) ClearControlPlane() error {
 }
 
 func (s *FileStore) QuarantineLocalKeys(reason string) error {
+	var lock *stateFileLock
+	if !s.stateLockHeld {
+		var err error
+		lock, err = acquireStateFileLock(s.Path)
+		if err != nil {
+			return err
+		}
+		if err := s.requireCurrentStateSnapshot(); err != nil {
+			_ = lock.Close()
+			return err
+		}
+		s.stateLockHeld = true
+		defer func() {
+			s.stateLockHeld = false
+			_ = lock.Close()
+		}()
+	}
 	accounts := s.allKeyRefAccounts()
 	deleteErr := deleteKeyAccounts(accounts)
 	s.State.KeyRefs = []asiri.KeyRef{}
@@ -2147,9 +2276,13 @@ func (s *FileStore) QuarantineLocalKeys(reason string) error {
 		if len(s.State.Audit) > auditLen {
 			s.State.Audit = s.State.Audit[:auditLen]
 		}
-		if writeErr := s.writeStateFile(); writeErr != nil {
+		bytes, writeErr := s.writeStateFile()
+		if writeErr != nil {
 			return fmt.Errorf("%w; failed to persist local key quarantine: %v", err, writeErr)
 		}
+		s.loadedStateDigest = sha256.Sum256(bytes)
+		s.loadedStateExists = true
+		s.loadedStateKnown = true
 		if deleteErr != nil {
 			return deleteErr
 		}
@@ -2486,7 +2619,10 @@ func (s *FileStore) newSecretDataKeyForWorkspace(workspaceID, scope, name string
 	if err != nil {
 		return nil, "", err
 	}
-	account := secretDataKeyAccount(workspaceID, scope, name, version)
+	account, err := newSecretDataKeyAccount(workspaceID)
+	if err != nil {
+		return nil, "", err
+	}
 	if err := s.storeDataKey(account, key); err != nil {
 		return nil, "", err
 	}
@@ -2563,9 +2699,22 @@ func decodeDataKey(encoded string) ([]byte, error) {
 	return key, nil
 }
 
-func secretDataKeyAccount(workspaceID, scope, name string, version int) string {
-	digest := sha256.Sum256([]byte(workspaceID + "\x00" + scope + "\x00" + name + "\x00" + strconv.Itoa(version)))
-	return keystore.DataKeyAccount(workspaceID, hex.EncodeToString(digest[:16]))
+func newSecretDataKeyAccount(workspaceID string) (string, error) {
+	bytes := make([]byte, 9)
+	if _, err := io.ReadFull(rand.Reader, bytes); err != nil {
+		return "", err
+	}
+	return keystore.DataKeyAccount(workspaceID, "key_"+hex.EncodeToString(bytes)), nil
+}
+
+func nextSecretVersion(versions []asiri.SecretVersion) int {
+	next := 1
+	for _, version := range versions {
+		if version.Version >= next {
+			next = version.Version + 1
+		}
+	}
+	return next
 }
 
 func decryptWithKey(key []byte, nonceB64, ciphertextB64 string, aad []byte) ([]byte, error) {

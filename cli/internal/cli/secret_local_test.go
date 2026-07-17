@@ -4,14 +4,116 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/o-clan/asiri/cli/internal/keystore"
+	"github.com/o-clan/asiri/cli/internal/store"
 )
+
+func TestConcurrentAddsAcrossProcessesPreserveEverySecret(t *testing.T) {
+	if os.Getenv("ASIRI_CONCURRENT_ADD_HELPER") == "1" {
+		index, err := strconv.Atoi(os.Args[len(os.Args)-1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		gate := os.Getenv("ASIRI_CONCURRENT_ADD_GATE")
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			if _, err := os.Stat(gate); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("timed out waiting for concurrent add gate")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		var out, errb bytes.Buffer
+		app := New(&out, &errb)
+		app.In = strings.NewReader(fmt.Sprintf("value-%d\n", index))
+		path := fmt.Sprintf("local/concurrent/KEY_%02d", index)
+		if code := app.Run([]string{"add", "--workspace", "oclan-co", path, "--stdin"}); code != 0 {
+			t.Fatalf("concurrent add failed: %s", errb.String())
+		}
+		return
+	}
+
+	tmp := t.TempDir()
+	oldHome := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", oldHome) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	seed, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed.UseDefaultFileKeyStore()
+	t.Cleanup(keystore.ClearConfiguredFileKeyStoreDir)
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "concurrency-test"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+
+	const writers = 12
+	gate := filepath.Join(tmp, "start-concurrent-adds")
+	commands := make([]*exec.Cmd, 0, writers)
+	outputs := make([]*bytes.Buffer, 0, writers)
+	for index := 0; index < writers; index++ {
+		command := exec.Command(os.Args[0], "-test.run=^TestConcurrentAddsAcrossProcessesPreserveEverySecret$", "--", strconv.Itoa(index))
+		command.Env = append(os.Environ(),
+			"ASIRI_HOME="+tmp,
+			"ASIRI_CONCURRENT_ADD_HELPER=1",
+			"ASIRI_CONCURRENT_ADD_GATE="+gate,
+		)
+		var output bytes.Buffer
+		command.Stdout = &output
+		command.Stderr = &output
+		if err := command.Start(); err != nil {
+			t.Fatal(err)
+		}
+		commands = append(commands, command)
+		outputs = append(outputs, &output)
+	}
+	if err := os.WriteFile(gate, []byte("go"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for index, command := range commands {
+		if err := command.Wait(); err != nil {
+			t.Fatalf("writer %d failed: %v\n%s", index, err, outputs[index].String())
+		}
+	}
+
+	reloaded, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < writers; index++ {
+		path := fmt.Sprintf("oclan-co/local/concurrent/KEY_%02d", index)
+		value, _, err := reloaded.GetSecret(path)
+		if err != nil {
+			t.Fatalf("%s is not readable: %v", path, err)
+		}
+		if value != fmt.Sprintf("value-%d", index) {
+			t.Fatalf("%s has the wrong value", path)
+		}
+	}
+}
+
+func TestLoginUsesLifecycleStateLock(t *testing.T) {
+	if !commandUsesLifecycleStateLock("login") {
+		t.Fatal("login must hold the state lock while replacing session key material")
+	}
+}
 
 func TestRawReadDoesNotPrintSecretWhenAuditSaveFails(t *testing.T) {
 	tmp := t.TempDir()

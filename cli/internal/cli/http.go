@@ -113,43 +113,54 @@ func getJSONBearer(st *store.FileStore, url, bearer string, out any) error {
 }
 
 func getJSONBearerStatus(st *store.FileStore, url, bearer string, out any) (int, error) {
+	status, _, err := getJSONBearerStatusWithHeaders(st, url, bearer, out)
+	return status, err
+}
+
+func getJSONBearerStatusWithHeaders(st *store.FileStore, url, bearer string, out any) (int, http.Header, error) {
 	bearer = latestControlPlaneBearer(st, bearer)
-	status, responseBody, err := sendGetJSONBearer(st, http.DefaultClient, url, bearer)
+	status, responseBody, headers, err := sendGetJSONBearerWithHeaders(st, http.DefaultClient, url, bearer)
 	if err != nil {
-		return status, err
+		return status, headers, err
 	}
 	if status == http.StatusUnauthorized {
 		if refreshed, ok, err := refreshBearerAfterUnauthorized(st, bearer); err != nil {
-			return status, err
+			return status, headers, err
 		} else if ok {
-			status, responseBody, err = sendGetJSONBearer(st, http.DefaultClient, url, refreshed)
+			status, responseBody, headers, err = sendGetJSONBearerWithHeaders(st, http.DefaultClient, url, refreshed)
 			if err != nil {
-				return status, err
+				return status, headers, err
 			}
 		}
 	}
-	return decodeBearerResponse(status, responseBody, out, st)
+	status, err = decodeBearerResponse(status, responseBody, out, st)
+	return status, headers, err
 }
 
 func sendGetJSONBearer(st *store.FileStore, client *http.Client, url, bearer string) (int, []byte, error) {
+	status, body, _, err := sendGetJSONBearerWithHeaders(st, client, url, bearer)
+	return status, body, err
+}
+
+func sendGetJSONBearerWithHeaders(st *store.FileStore, client *http.Client, url, bearer string) (int, []byte, http.Header, error) {
 	request, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	request.Header.Set("authorization", "Bearer "+bearer)
 	if err := signBearerRequest(st, request, nil, bearer); err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	defer response.Body.Close()
 	responseBody, err := io.ReadAll(response.Body)
 	if err != nil {
-		return response.StatusCode, nil, err
+		return response.StatusCode, nil, response.Header.Clone(), err
 	}
-	return response.StatusCode, responseBody, nil
+	return response.StatusCode, responseBody, response.Header.Clone(), nil
 }
 
 func decodeBearerResponse(status int, responseBody []byte, out any, st *store.FileStore) (int, error) {
