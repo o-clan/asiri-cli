@@ -127,19 +127,23 @@ type rewrapStats struct {
 }
 
 func (a App) rewrapWorkspace(st *store.FileStore, accessToken string, target remoteWorkspaceResponse) (rewrapStats, error) {
-	encryptedSecrets, err := listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, "", false)
-	if err != nil {
-		return rewrapStats{}, err
-	}
 	metadataSecrets, status, err := listRemoteSecretMetadata(st, st.State.ControlPlane.Origin, target.ID, accessToken, false)
 	if err != nil {
 		return rewrapStats{}, err
 	}
-	secrets := encryptedSecrets
-	if status != http.StatusNotFound {
-		secrets = mergeRemoteSecretRecords(metadataSecrets, encryptedSecrets)
+	secrets := metadataSecrets
+	if status == http.StatusNotFound {
+		secrets, err = listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, "", false)
+		if err != nil {
+			return rewrapStats{}, err
+		}
+	}
+	wrappingTargets, batchTargetsSupported, err := listRemoteWrappingTargets(st, st.State.ControlPlane.Origin, target.ID, accessToken)
+	if err != nil {
+		return rewrapStats{}, err
 	}
 	stats := rewrapStats{}
+	entries := make([]remoteWrappedKeyBatchEntry, 0)
 	for _, secret := range secrets {
 		if secret.Status != "active" {
 			continue
@@ -148,9 +152,14 @@ func (a App) rewrapWorkspace(st *store.FileStore, accessToken string, target rem
 			stats.SkippedMissingLocal++
 			continue
 		}
-		devices, err := listRemoteWrappingDevices(st, st.State.ControlPlane.Origin, target.ID, secret.Scope, secret.Name, accessToken)
-		if err != nil {
-			return rewrapStats{}, fmt.Errorf("refusing to rewrap without authorized targets for %s/%s: %w", secret.Scope, secret.Name, err)
+		devices, found := wrappingTargets[secret.ID]
+		if !batchTargetsSupported {
+			devices, err = listRemoteWrappingDevices(st, st.State.ControlPlane.Origin, target.ID, secret.Scope, secret.Name, accessToken)
+			if err != nil {
+				return rewrapStats{}, fmt.Errorf("refusing to rewrap without authorized targets for %s/%s: %w", secret.Scope, secret.Name, err)
+			}
+		} else if !found {
+			return rewrapStats{}, fmt.Errorf("refusing to rewrap without authorized targets for %s/%s", secret.Scope, secret.Name)
 		}
 		missing := make([]store.RemoteWrappedKey, 0)
 		for _, device := range devices {
@@ -169,11 +178,36 @@ func (a App) rewrapWorkspace(st *store.FileStore, accessToken string, target rem
 		if len(missing) == 0 {
 			continue
 		}
-		if err := addRemoteWrappedKeys(st, st.State.ControlPlane.Origin, target.ID, secret.ID, accessToken, missing, true); err != nil {
+		entries = append(entries, remoteWrappedKeyBatchEntry{SecretID: secret.ID, WrappedKeys: missing, LocalRepair: true})
+	}
+	if len(entries) == 0 {
+		return stats, nil
+	}
+	batchWritesSupported := true
+	for start := 0; start < len(entries); start += 100 {
+		end := start + 100
+		if end > len(entries) {
+			end = len(entries)
+		}
+		supported, err := addRemoteWrappedKeysBatch(st, st.State.ControlPlane.Origin, target.ID, accessToken, entries[start:end])
+		if err != nil {
 			return rewrapStats{}, err
 		}
+		if !supported {
+			batchWritesSupported = false
+			break
+		}
+	}
+	if !batchWritesSupported {
+		for _, entry := range entries {
+			if err := addRemoteWrappedKeys(st, st.State.ControlPlane.Origin, target.ID, entry.SecretID, accessToken, entry.WrappedKeys, entry.LocalRepair); err != nil {
+				return rewrapStats{}, err
+			}
+		}
+	}
+	for _, entry := range entries {
 		stats.Updated++
-		stats.Added += len(missing)
+		stats.Added += len(entry.WrappedKeys)
 	}
 	return stats, nil
 }

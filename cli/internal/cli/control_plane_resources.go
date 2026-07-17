@@ -99,6 +99,26 @@ func listRemoteWrappingDevices(st *store.FileStore, origin, orgID, scope, secret
 	return nil, errors.New("authorized wrapping target discovery failed")
 }
 
+func listRemoteWrappingTargets(st *store.FileStore, origin, orgID, accessToken string) (map[string][]remoteDeviceResponse, bool, error) {
+	var result remoteWrappingTargetsResponse
+	endpoint := fmt.Sprintf("%s/v1/devices/wrapping-targets?orgId=%s", strings.TrimRight(origin, "/"), url.QueryEscape(orgID))
+	status, err := getJSONBearerStatus(st, endpoint, accessToken, &result)
+	if err != nil {
+		return nil, false, fmt.Errorf("authorized wrapping target discovery failed: %w", err)
+	}
+	if status == http.StatusNotFound {
+		return nil, false, nil
+	}
+	if status < 200 || status >= 300 {
+		return nil, false, fmt.Errorf("authorized wrapping target discovery failed: control plane returned HTTP %d", status)
+	}
+	targets := make(map[string][]remoteDeviceResponse, len(result.Targets))
+	for _, target := range result.Targets {
+		targets[target.SecretID] = target.Devices
+	}
+	return targets, true, nil
+}
+
 func rateLimitRetryDelay(headers http.Header, now time.Time) time.Duration {
 	const maximumDelay = time.Minute
 	clamp := func(delay time.Duration) time.Duration {
@@ -365,6 +385,27 @@ func addRemoteWrappedKeys(st *store.FileStore, origin, orgID, secretID, accessTo
 		body["localRepair"] = true
 	}
 	return postJSONBearer(st, endpoint, accessToken, body, nil)
+}
+
+type remoteWrappedKeyBatchEntry struct {
+	SecretID    string                   `json:"secretId"`
+	WrappedKeys []store.RemoteWrappedKey `json:"wrappedKeys"`
+	LocalRepair bool                     `json:"localRepair"`
+}
+
+func addRemoteWrappedKeysBatch(st *store.FileStore, origin, orgID, accessToken string, entries []remoteWrappedKeyBatchEntry) (bool, error) {
+	endpoint := strings.TrimRight(origin, "/") + "/v1/secrets/wrapped-keys/batch"
+	status, err := postJSONBearerStatus(st, endpoint, accessToken, map[string]any{"orgId": orgID, "entries": entries}, nil)
+	if err != nil {
+		return false, err
+	}
+	if status == http.StatusNotFound {
+		return false, nil
+	}
+	if status < 200 || status >= 300 {
+		return false, fmt.Errorf("control plane returned HTTP %d", status)
+	}
+	return true, nil
 }
 
 func registerRemoteRecoveryRecipient(st *store.FileStore, origin, orgID, deviceID, accessToken string, setup store.RecoverySetup, replacements []recoveryRecipientReplacement) error {

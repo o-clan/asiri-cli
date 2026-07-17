@@ -233,6 +233,15 @@ type remoteDevicesResponse struct {
 	Devices []remoteDeviceResponse `json:"devices"`
 }
 
+type remoteWrappingTargetResponse struct {
+	SecretID string                 `json:"secretId"`
+	Devices  []remoteDeviceResponse `json:"devices"`
+}
+
+type remoteWrappingTargetsResponse struct {
+	Targets []remoteWrappingTargetResponse `json:"targets"`
+}
+
 type remoteSecretsResponse struct {
 	Secrets []remoteSecretRecord `json:"secrets"`
 }
