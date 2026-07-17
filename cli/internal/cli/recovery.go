@@ -301,11 +301,7 @@ func (a App) recovery(st *store.FileStore, args []string) int {
 				}
 			}()
 		}
-		previousRecipientID := ""
-		if remoteRecovery != nil {
-			previousRecipientID = remoteRecovery.RecipientID
-		}
-		replacements, covered, err := a.prepareRemoteRecoveryReplacementKeys(st, accessToken, target, setup.Config, previousRecipientID)
+		replacements, covered, remoteWrapped, err := a.prepareRemoteRecoveryReplacementKeys(st, accessToken, target, setup.Config)
 		if err != nil {
 			return a.fail(err)
 		}
@@ -339,12 +335,34 @@ func (a App) recovery(st *store.FileStore, args []string) int {
 		if len(replacements) > 0 {
 			fmt.Fprintf(a.Out, "✓ Added recovery wrapping to %d remote secret(s)\n", len(replacements))
 		}
+		if remoteWrapped > 0 {
+			fmt.Fprintf(a.Out, "✓ Used current remote key material for %d secret version(s) not stored locally\n", remoteWrapped)
+		}
 		return 0
 	case "restore":
 		return a.recoveryRestore(st, args[1:])
 	default:
 		return a.fail(fmt.Errorf("unknown recovery command %q", args[0]))
 	}
+}
+
+func recoverySecretVersionSummary(secrets []remoteSecretRecord) string {
+	const limit = 3
+	capacity := len(secrets)
+	if capacity > limit {
+		capacity = limit
+	}
+	labels := make([]string, 0, capacity)
+	for index, secret := range secrets {
+		if index == limit {
+			break
+		}
+		labels = append(labels, fmt.Sprintf("%s v%d", shortSecretPath(secret.Scope, secret.Name), secret.Version))
+	}
+	if len(secrets) > limit {
+		labels = append(labels, fmt.Sprintf("and %d more", len(secrets)-limit))
+	}
+	return strings.Join(labels, ", ")
 }
 func (a App) recoveryRestore(st *store.FileStore, args []string) int {
 	if st.State.ControlPlane == nil {
@@ -447,38 +465,64 @@ func (a App) addRecoveredDeviceWrappedKeys(st *store.FileStore, accessToken stri
 	return updated, nil
 }
 
-func (a App) prepareRemoteRecoveryReplacementKeys(st *store.FileStore, accessToken string, target remoteWorkspaceResponse, recovery asiri.RecoveryConfig, previousRecoveryRecipientID string) ([]recoveryRecipientReplacement, int, error) {
+func (a App) prepareRemoteRecoveryReplacementKeys(st *store.FileStore, accessToken string, target remoteWorkspaceResponse, recovery asiri.RecoveryConfig) ([]recoveryRecipientReplacement, int, int, error) {
 	if st.State.ControlPlane == nil {
-		return nil, 0, nil
+		return nil, 0, 0, nil
 	}
-	if binding, ok := st.RemoteBindingForPrefix(target.Slug); !ok || binding.WorkspaceID != target.ID {
-		return nil, 0, nil
-	}
-	secrets, err := listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, previousRecoveryRecipientID, false)
+	encryptedSecrets, err := listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, "", false)
 	if err != nil {
-		if previousRecoveryRecipientID != "" && strings.Contains(err.Error(), "HTTP 403") {
-			secrets, err = listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, "", false)
-		}
-		if err != nil {
-			return nil, 0, err
-		}
+		return nil, 0, 0, err
+	}
+	metadataSecrets, status, err := listRemoteSecretMetadata(st, st.State.ControlPlane.Origin, target.ID, accessToken, false)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	secrets := metadataSecrets
+	if status == http.StatusNotFound {
+		secrets = encryptedSecrets
+	}
+	encryptedByVersion := make(map[string]remoteSecretRecord, len(encryptedSecrets))
+	for _, secret := range encryptedSecrets {
+		encryptedByVersion[pushVersionKey(secret.Scope, secret.Name, secret.Version)] = secret
 	}
 	replacements := make([]recoveryRecipientReplacement, 0, len(secrets))
+	missingAccess := make([]remoteSecretRecord, 0)
 	covered := 0
+	remoteWrapped := 0
 	for _, secret := range secrets {
-		if secret.Status != "active" || !localSecretVersionExists(st, secret.Scope, secret.Name, secret.Version) {
+		if secret.Status != "active" {
 			continue
 		}
 		if remoteSecretHasRecoveryRecipient(secret, recovery.RecipientID) {
 			covered += 1
 			continue
 		}
-		key, err := st.RecoveryWrappedKeyForSecretVersionWithConfig(target.Slug, secret.Scope, secret.Name, secret.Version, recovery)
+		var key store.RemoteWrappedKey
+		encrypted, remoteAvailable := encryptedByVersion[pushVersionKey(secret.Scope, secret.Name, secret.Version)]
+		if remoteAvailable {
+			key, err = st.RecoveryWrappedKeyForRemoteVersion(target.CurrentDeviceID, encrypted.WrappedKeys, recovery)
+			if err == nil && !localSecretVersionExists(st, secret.Scope, secret.Name, secret.Version) {
+				remoteWrapped += 1
+			}
+		}
+		if (!remoteAvailable || err != nil) && localSecretVersionExists(st, secret.Scope, secret.Name, secret.Version) {
+			key, err = st.RecoveryWrappedKeyForSecretVersionWithConfig(target.Slug, secret.Scope, secret.Name, secret.Version, recovery)
+		} else if !remoteAvailable {
+			missingAccess = append(missingAccess, secret)
+			continue
+		}
 		if err != nil {
-			return nil, 0, err
+			missingAccess = append(missingAccess, secret)
+			continue
 		}
 		replacements = append(replacements, recoveryRecipientReplacement{SecretID: secret.ID, WrappedKey: key})
 		covered += 1
 	}
-	return replacements, covered, nil
+	if len(missingAccess) > 0 {
+		return nil, 0, 0, fmt.Errorf(
+			"recovery setup cannot cover %d active remote secret version(s) because this device cannot decrypt them (%s); run asiri rewrap --workspace %s from another trusted device that has the matching key material, then retry",
+			len(missingAccess), recoverySecretVersionSummary(missingAccess), target.Slug,
+		)
+	}
+	return replacements, covered, remoteWrapped, nil
 }

@@ -24,6 +24,7 @@ func TestRecoverySetupShowsKeyOnceAndWrapsRemoteSecrets(t *testing.T) {
 		t.Fatal(err)
 	}
 	secretPushSeen := false
+	var pushedSecret map[string]any
 	recoveryCreateSeen := false
 	var recoveryCreateBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -69,7 +70,6 @@ func TestRecoverySetupShowsKeyOnceAndWrapsRemoteSecrets(t *testing.T) {
 			})
 		case "/v1/secrets":
 			if r.Method == http.MethodPost {
-				secretPushSeen = true
 				var body map[string]any
 				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 					t.Fatal(err)
@@ -78,6 +78,10 @@ func TestRecoverySetupShowsKeyOnceAndWrapsRemoteSecrets(t *testing.T) {
 				if !ok || len(wrapped) != 1 {
 					t.Fatalf("initial push should contain only the device wrapped key: %#v", body["wrappedKeys"])
 				}
+				body["id"] = "secv_recovery"
+				body["status"] = "active"
+				pushedSecret = body
+				secretPushSeen = true
 				_ = json.NewEncoder(w).Encode(map[string]any{"id": "secv_recovery", "status": "active"})
 				return
 			}
@@ -92,22 +96,7 @@ func TestRecoverySetupShowsKeyOnceAndWrapsRemoteSecrets(t *testing.T) {
 				_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{}})
 				return
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"secrets": []map[string]any{{
-					"id":      "secv_recovery",
-					"orgId":   "org_recovery",
-					"scope":   "oclan-co/local/asiri",
-					"name":    "API_KEY",
-					"version": 1,
-					"status":  "active",
-					"wrappedKeys": []map[string]any{{
-						"recipientType": "device",
-						"recipientId":   "dev_recovery",
-						"wrapAlgorithm": "p256-hkdf-aes256gcm",
-						"wrappedKey":    "wrapped",
-					}},
-				}},
-			})
+			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{pushedSecret}})
 		case "/v1/secrets/encrypted":
 			if r.Method != http.MethodGet {
 				http.NotFound(w, r)
@@ -120,22 +109,7 @@ func TestRecoverySetupShowsKeyOnceAndWrapsRemoteSecrets(t *testing.T) {
 				_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{}})
 				return
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"secrets": []map[string]any{{
-					"id":      "secv_recovery",
-					"orgId":   "org_recovery",
-					"scope":   "oclan-co/local/asiri",
-					"name":    "API_KEY",
-					"version": 1,
-					"status":  "active",
-					"wrappedKeys": []map[string]any{{
-						"recipientType": "device",
-						"recipientId":   "dev_recovery",
-						"wrapAlgorithm": "p256-hkdf-aes256gcm",
-						"wrappedKey":    "wrapped",
-					}},
-				}},
-			})
+			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{pushedSecret}})
 		case "/v1/recovery-recipient":
 			recoveryCreateSeen = true
 			if r.Method != http.MethodPost {
@@ -194,6 +168,29 @@ func TestRecoverySetupShowsKeyOnceAndWrapsRemoteSecrets(t *testing.T) {
 			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
 		}
 	}
+	for _, step := range [][]string{
+		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "new_remote_value")},
+		{"push", "--workspace", "oclan-co"},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	st, err := store.Load(filepath.Join(tmp, "local-state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secretKey := store.SecretKey("oclan-co/local/asiri", "API_KEY")
+	secret := st.State.Secrets[secretKey]
+	secret.ActiveVersion = 1
+	secret.Versions = secret.Versions[:1]
+	secret.Versions[0].Status = "active"
+	st.State.Secrets[secretKey] = secret
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
 	out.Reset()
 	errb.Reset()
 	recoveryKeyPath := filepath.Join(tmp, "recovery.key")
@@ -204,7 +201,7 @@ func TestRecoverySetupShowsKeyOnceAndWrapsRemoteSecrets(t *testing.T) {
 		t.Fatal("expected push and recovery create endpoints")
 	}
 	all := out.String()
-	if !strings.Contains(all, "Recovery key written") || !strings.Contains(all, "Added recovery wrapping to 1 remote secret") {
+	if !strings.Contains(all, "Recovery key written") || !strings.Contains(all, "Added recovery wrapping to 1 remote secret") || !strings.Contains(all, "Used current remote key material for 1 secret version") {
 		t.Fatalf("recovery output missing expected copy or wrapping result: %s", all)
 	}
 	keyBytes, err := os.ReadFile(recoveryKeyPath)
@@ -221,12 +218,118 @@ func TestRecoverySetupShowsKeyOnceAndWrapsRemoteSecrets(t *testing.T) {
 	if strings.Contains(fmt.Sprint(recoveryCreateBody), recoveryKey) {
 		t.Fatal("recovery registration sent raw recovery key")
 	}
+	replacements := recoveryCreateBody["replacements"].([]any)
+	replacement := replacements[0].(map[string]any)
+	recoveryWrappedJSON, err := json.Marshal(replacement["wrappedKey"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recoveryWrapped store.RemoteWrappedKey
+	if err := json.Unmarshal(recoveryWrappedJSON, &recoveryWrapped); err != nil {
+		t.Fatal(err)
+	}
+	remoteWrappedJSON, err := json.Marshal(pushedSecret["wrappedKeys"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var remoteWrappedKeys []store.RemoteWrappedKey
+	if err := json.Unmarshal(remoteWrappedJSON, &remoteWrappedKeys); err != nil {
+		t.Fatal(err)
+	}
+	remoteDataKey, err := st.UnwrapDeviceDataKey("dev_recovery", remoteWrappedKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveryDataKey, _, err := store.UnwrapRecoveryDataKey([]store.RemoteWrappedKey{recoveryWrapped}, recoveryKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(remoteDataKey, recoveryDataKey) {
+		t.Fatal("recovery setup should wrap the active remote data key")
+	}
 	bytes, err := os.ReadFile(filepath.Join(tmp, "local-state.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(bytes), recoveryKey) {
 		t.Fatal("local state persisted raw recovery key")
+	}
+	reloaded, err := store.Load(filepath.Join(tmp, "local-state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version := reloaded.State.Secrets[secretKey].ActiveVersion; version != 1 {
+		t.Fatalf("recovery setup should not replace local secret state, got active version %d", version)
+	}
+}
+
+func TestRecoverySetupFailsBeforeKeyDeliveryWhenRemoteSecretIsNotWrappedToDevice(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	registrationSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode": "dc_recovery_missing", "userCode": "MISS-1234",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=MISS-1234", "expiresIn": 30, "interval": 0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "approved", "orgId": "org_recovery", "workspaceSlug": "oclan-co", "userId": "usr_owner",
+				"deviceId": "dev_recovery", "accessToken": "at_recovery", "refreshToken": "rt_recovery", "expiresIn": 3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/orgs":
+			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{
+				"id": "org_recovery", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_recovery",
+			}}})
+		case "/v1/recovery-recipient":
+			if r.Method == http.MethodPost {
+				registrationSeen = true
+			}
+			http.NotFound(w, r)
+		case "/v1/secrets/encrypted":
+			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{}})
+		case "/v1/secrets":
+			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{{
+				"id": "secv_missing", "orgId": "org_recovery", "scope": "oclan-co/prod/api", "name": "API_KEY", "version": 2, "status": "active",
+			}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{{"init", "--device", "qa-laptop"}, {"login", "--origin", server.URL}} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	out.Reset()
+	errb.Reset()
+	recoveryKeyPath := filepath.Join(tmp, "recovery.key")
+	if code := app.Run([]string{"recovery", "setup", "--workspace", "oclan-co", "--output-file", recoveryKeyPath}); code == 0 {
+		t.Fatal("recovery setup should fail when an active secret is unavailable")
+	}
+	if registrationSeen {
+		t.Fatal("recovery registration should not start with incomplete coverage")
+	}
+	if !strings.Contains(errb.String(), "cannot decrypt") || !strings.Contains(errb.String(), "asiri rewrap --workspace oclan-co") {
+		t.Fatalf("expected actionable recovery guidance, got %s", errb.String())
+	}
+	if _, err := os.Stat(recoveryKeyPath); !os.IsNotExist(err) {
+		t.Fatal("recovery key file should be removed when preflight fails")
 	}
 }
 
@@ -335,8 +438,8 @@ func TestRecoverySetupFreshLinkedWorkspaceSendsEmptyReplacements(t *testing.T) {
 	if !recoveryCreateSeen {
 		t.Fatal("expected recovery create endpoint")
 	}
-	if remoteSecretListSeen {
-		t.Fatal("fresh workspace without a remote binding should not list remote secrets")
+	if !remoteSecretListSeen {
+		t.Fatal("fresh workspace recovery setup should preflight active remote secrets")
 	}
 	if keyBytes, err := os.ReadFile(recoveryKeyPath); err != nil {
 		t.Fatal(err)
@@ -876,7 +979,7 @@ func TestRecoverySetupFailsWhenRemoteReplacementFails(t *testing.T) {
 	}
 }
 
-func TestRecoverySetupForceCommitsWhenPreviousRecipientIsRetired(t *testing.T) {
+func TestRecoverySetupForceUsesCurrentDeviceWrapWhenPreviousRecipientIsRetired(t *testing.T) {
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")
 	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
@@ -885,7 +988,6 @@ func TestRecoverySetupForceCommitsWhenPreviousRecipientIsRetired(t *testing.T) {
 	}
 	var registeredRecipients []string
 	replacementCount := 0
-	staleRecoveryListRejected := false
 	unscopedRecoveryListSeen := false
 	var pushedSecret map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -995,13 +1097,7 @@ func TestRecoverySetupForceCommitsWhenPreviousRecipientIsRetired(t *testing.T) {
 			if r.URL.Query().Get("orgId") != "org_recovery" {
 				t.Fatalf("unexpected secrets query: %s", r.URL.RawQuery)
 			}
-			recoveryRecipientID := r.URL.Query().Get("recoveryRecipientId")
-			if len(registeredRecipients) >= 1 && recoveryRecipientID == registeredRecipients[0] {
-				staleRecoveryListRejected = true
-				http.Error(w, `{"error":"recovery recipient is not registered for this workspace"}`, http.StatusForbidden)
-				return
-			}
-			if len(registeredRecipients) >= 1 && recoveryRecipientID == "" {
+			if len(registeredRecipients) >= 1 && r.URL.Query().Get("recoveryRecipientId") == "" {
 				unscopedRecoveryListSeen = true
 			}
 			if pushedSecret == nil {
@@ -1048,8 +1144,8 @@ func TestRecoverySetupForceCommitsWhenPreviousRecipientIsRetired(t *testing.T) {
 	if replacementCount != 2 {
 		t.Fatalf("expected both setup runs to replace recovery wrapping, got %d", replacementCount)
 	}
-	if !staleRecoveryListRejected || !unscopedRecoveryListSeen {
-		t.Fatalf("forced setup should fall back after stale recovery recipient rejection, rejected=%v unscoped=%v", staleRecoveryListRejected, unscopedRecoveryListSeen)
+	if !unscopedRecoveryListSeen {
+		t.Fatal("forced setup should use current device wrapping without relying on the previous recovery recipient")
 	}
 	st, err := store.Load(filepath.Join(tmp, "local-state.json"))
 	if err != nil {
