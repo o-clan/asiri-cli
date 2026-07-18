@@ -108,8 +108,8 @@ func (a App) rewrap(st *store.FileStore, args []string) int {
 	if err := st.Save(); err != nil {
 		return a.fail(err)
 	}
-	if stats.Added == 0 && stats.SkippedMissingLocal > 0 {
-		fmt.Fprintf(a.Out, "No remote secrets can be rewrapped from this machine; %d active remote secret version(s) are missing matching local key material\n", stats.SkippedMissingLocal)
+	if stats.Added == 0 && stats.SkippedUnavailable > 0 {
+		fmt.Fprintf(a.Out, "No remote secrets can be rewrapped from this machine; %d active remote secret version(s) cannot be decrypted by this device\n", stats.SkippedUnavailable)
 		return 0
 	}
 	if stats.Added == 0 {
@@ -121,9 +121,9 @@ func (a App) rewrap(st *store.FileStore, args []string) int {
 }
 
 type rewrapStats struct {
-	Updated             int
-	Added               int
-	SkippedMissingLocal int
+	Updated            int
+	Added              int
+	SkippedUnavailable int
 }
 
 func (a App) rewrapWorkspace(st *store.FileStore, accessToken string, target remoteWorkspaceResponse) (rewrapStats, error) {
@@ -132,10 +132,22 @@ func (a App) rewrapWorkspace(st *store.FileStore, accessToken string, target rem
 		return rewrapStats{}, err
 	}
 	secrets := metadataSecrets
+	encryptedByVersion := map[string]remoteSecretRecord{}
 	if status == http.StatusNotFound {
 		secrets, err = listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, "", false)
 		if err != nil {
 			return rewrapStats{}, err
+		}
+		for _, secret := range secrets {
+			encryptedByVersion[pushVersionKey(secret.Scope, secret.Name, secret.Version)] = secret
+		}
+	} else {
+		encryptedSecrets, err := listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, "", false)
+		if err != nil {
+			return rewrapStats{}, err
+		}
+		for _, secret := range encryptedSecrets {
+			encryptedByVersion[pushVersionKey(secret.Scope, secret.Name, secret.Version)] = secret
 		}
 	}
 	wrappingTargets, batchTargetsSupported, err := listRemoteWrappingTargets(st, st.State.ControlPlane.Origin, target.ID, accessToken)
@@ -148,8 +160,10 @@ func (a App) rewrapWorkspace(st *store.FileStore, accessToken string, target rem
 		if secret.Status != "active" {
 			continue
 		}
-		if !localSecretVersionExists(st, secret.Scope, secret.Name, secret.Version) {
-			stats.SkippedMissingLocal++
+		localAvailable := localSecretVersionExists(st, secret.Scope, secret.Name, secret.Version)
+		encrypted, remoteAvailable := encryptedByVersion[pushVersionKey(secret.Scope, secret.Name, secret.Version)]
+		if !localAvailable && !remoteAvailable {
+			stats.SkippedUnavailable++
 			continue
 		}
 		devices, found := wrappingTargets[secret.ID]
@@ -169,7 +183,13 @@ func (a App) rewrapWorkspace(st *store.FileStore, accessToken string, target rem
 			if remoteSecretHasRecipient(secret, device.ID) {
 				continue
 			}
-			wrapped, err := st.RemoteWrappedKeyForSecretVersionPublicKey(target.ID, secret.Scope, secret.Name, secret.Version, device.ID, device.EncryptionPublicKey)
+			var wrapped store.RemoteWrappedKey
+			if remoteAvailable {
+				wrapped, err = st.RemoteWrappedKeyForRemoteVersionPublicKey(target.CurrentDeviceID, encrypted.WrappedKeys, device.ID, device.EncryptionPublicKey)
+			}
+			if !remoteAvailable || (err != nil && localAvailable) {
+				wrapped, err = st.RemoteWrappedKeyForSecretVersionPublicKey(target.ID, secret.Scope, secret.Name, secret.Version, device.ID, device.EncryptionPublicKey)
+			}
 			if err != nil {
 				return rewrapStats{}, err
 			}

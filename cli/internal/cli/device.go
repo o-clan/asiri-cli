@@ -208,8 +208,8 @@ func (a App) trustDeviceInWorkspace(st *store.FileStore, origin, accessToken, wo
 			return result, err
 		}
 		fmt.Fprintf(a.Out, "✓ Automatically rewrapped %d key(s) across %d secret version(s) in workspace %s\n", stats.Added, stats.Updated, result.WorkspaceSlug)
-	} else if stats.SkippedMissingLocal > 0 {
-		fmt.Fprintf(a.Out, "No local key material available to rewrap %d active remote secret version(s) in workspace %s\n", stats.SkippedMissingLocal, result.WorkspaceSlug)
+	} else if stats.SkippedUnavailable > 0 {
+		fmt.Fprintf(a.Out, "This device cannot decrypt %d active remote secret version(s) in workspace %s\n", stats.SkippedUnavailable, result.WorkspaceSlug)
 	}
 	return result, nil
 }

@@ -1324,6 +1324,55 @@ func TestRewrapCanUseStoredStaleVersionDataKey(t *testing.T) {
 	}
 }
 
+func TestRemoteWrappedKeyForRemoteVersionPublicKey(t *testing.T) {
+	source := testInitializedStore(t)
+	sourceDevice := testDevice(t, "source")
+	source.State.Devices = append(source.State.Devices, sourceDevice)
+	if err := source.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.AddSecret("oclan-co/local/asiri/API_KEY", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	expires := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	if err := source.LinkControlPlane("http://control.test", "org_oclan", "oclan-co", "usr_owner", "dev_source", "at_source", "rt_source", 3600, expires); err != nil {
+		t.Fatal(err)
+	}
+	bindPrefixForTest(t, source, "oclan-co", "org_oclan")
+	remoteVersions, err := source.RemoteSecretVersionsForPrefix("org_oclan", "oclan-co", "dev_source", "oclan-co")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remoteVersions) != 1 {
+		t.Fatalf("expected one remote version, got %d", len(remoteVersions))
+	}
+	target := testInitializedStore(t)
+	targetDevice := testDevice(t, "target")
+	target.State.Devices = append(target.State.Devices, targetDevice)
+	if err := target.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := target.LinkControlPlane("http://control.test", "org_oclan", "oclan-co", "usr_owner", "dev_target", "at_target", "rt_target", 3600, expires); err != nil {
+		t.Fatal(err)
+	}
+
+	rewrapped, err := source.RemoteWrappedKeyForRemoteVersionPublicKey("dev_source", remoteVersions[0].WrappedKeys, "dev_target", targetDevice.EncryptionPublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actualKey, err := target.UnwrapDeviceDataKey("dev_target", []RemoteWrappedKey{rewrapped})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedKey, err := source.UnwrapDeviceDataKey("dev_source", remoteVersions[0].WrappedKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(actualKey, expectedKey) {
+		t.Fatal("remote rewrap changed the data key")
+	}
+}
+
 func TestRecoveryKeyRestoresRemoteSecretsOnAnotherDevice(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "source.json")
 	source, err := Load(sourcePath)

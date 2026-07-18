@@ -1879,6 +1879,14 @@ func (s *FileStore) RecoveryWrappedKeyForRemoteVersion(remoteDeviceID string, wr
 	return recoveryWrappedDataKey(dataKey, recovery)
 }
 
+func (s *FileStore) RemoteWrappedKeyForRemoteVersionPublicKey(remoteDeviceID string, wrappedKeys []RemoteWrappedKey, targetRemoteDeviceID, encryptionPublicKey string) (RemoteWrappedKey, error) {
+	dataKey, err := s.UnwrapDeviceDataKey(remoteDeviceID, wrappedKeys)
+	if err != nil {
+		return RemoteWrappedKey{}, err
+	}
+	return wrapKeyToPublicKey(dataKey, encryptionPublicKey, targetRemoteDeviceID)
+}
+
 func recoveryWrappedDataKey(dataKey []byte, recovery asiri.RecoveryConfig) (RemoteWrappedKey, error) {
 	return wrapKeyToPublicKeyWithOptions(dataKey, recovery.PublicKey, recovery.RecipientID, "recovery", "recovery-hkdf-aes256gcm", "asiri recovery wrap", "asiri-recovery-wrap:")
 }
