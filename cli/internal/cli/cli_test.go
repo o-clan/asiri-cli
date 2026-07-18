@@ -61,6 +61,14 @@ func runBrokerValueRequest(t *testing.T, app App, request map[string]string, tok
 		tokenOverride = cfg.Token
 	}
 	resp, payload := postBrokerValueRequest(t, cfg, request, tokenOverride)
+	if tokenOverride != cfg.Token {
+		// Invalid authentication intentionally does not consume --once. Send one
+		// authenticated request so the helper can shut the broker down promptly.
+		cleanupResp, cleanupPayload := postBrokerValueRequest(t, cfg, request, cfg.Token)
+		if cleanupResp.StatusCode != http.StatusOK {
+			t.Fatalf("broker cleanup request failed status=%d body=%s", cleanupResp.StatusCode, cleanupPayload)
+		}
+	}
 	select {
 	case code := <-done:
 		if code != 0 {
