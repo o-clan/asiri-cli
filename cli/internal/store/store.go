@@ -899,6 +899,10 @@ func (s *FileStore) deviceSigningPrivateKey(deviceID string) (*ecdsa.PrivateKey,
 }
 
 func (s *FileStore) AddSecret(fullPath, value string) (asiri.Secret, error) {
+	return s.AddSecretBytes(fullPath, []byte(value))
+}
+
+func (s *FileStore) AddSecretBytes(fullPath string, value []byte) (asiri.Secret, error) {
 	if err := s.RequireInitialized(); err != nil {
 		return asiri.Secret{}, err
 	}
@@ -928,7 +932,7 @@ func (s *FileStore) AddSecret(fullPath, value string) (asiri.Secret, error) {
 	if err != nil {
 		return asiri.Secret{}, err
 	}
-	nonce, ciphertext, err := encryptWithKey(dataKey, []byte(value), []byte(aad))
+	nonce, ciphertext, err := encryptWithKey(dataKey, value, []byte(aad))
 	if err != nil {
 		s.deleteDataKeyAccounts(dataKeyAccount)
 		return asiri.Secret{}, err
@@ -952,23 +956,28 @@ func (s *FileStore) AddSecret(fullPath, value string) (asiri.Secret, error) {
 }
 
 func (s *FileStore) GetSecret(fullPath string) (string, asiri.Secret, error) {
+	value, secret, err := s.GetSecretBytes(fullPath)
+	return string(value), secret, err
+}
+
+func (s *FileStore) GetSecretBytes(fullPath string) ([]byte, asiri.Secret, error) {
 	if err := s.RequireInitialized(); err != nil {
-		return "", asiri.Secret{}, err
+		return nil, asiri.Secret{}, err
 	}
 	secret, err := s.SecretMetadata(fullPath)
 	if err != nil {
-		return "", asiri.Secret{}, err
+		return nil, asiri.Secret{}, err
 	}
 	for _, version := range secret.Versions {
 		if version.Version == secret.ActiveVersion && version.Status == "active" {
 			plaintext, err := s.decryptSecretVersion(version)
 			if err != nil {
-				return "", asiri.Secret{}, err
+				return nil, asiri.Secret{}, err
 			}
-			return string(plaintext), secret, nil
+			return plaintext, secret, nil
 		}
 	}
-	return "", asiri.Secret{}, fmt.Errorf("secret %s has no active version", fullPath)
+	return nil, asiri.Secret{}, fmt.Errorf("secret %s has no active version", fullPath)
 }
 
 func (s *FileStore) CheckSecretReadable(fullPath string) error {

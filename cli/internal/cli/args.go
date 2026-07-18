@@ -443,47 +443,68 @@ func workspacePrefixedSelection(target workspacePathTarget, shortSelection, comm
 }
 
 func (a App) readSensitiveInput(args []string, label, fileFlag string, rejectedFlags ...string) (string, error) {
+	value, err := a.readSensitiveInputWithMode(args, label, fileFlag, false, rejectedFlags...)
+	return string(value), err
+}
+
+// readSecretInput preserves file and stdin input exactly. Interactive input is
+// still validated as a human-entered value because terminal password reads do
+// not include a line ending and an empty interactive submission is accidental.
+func (a App) readSecretInput(args []string, label, fileFlag string, rejectedFlags ...string) ([]byte, error) {
+	return a.readSensitiveInputWithMode(args, label, fileFlag, true, rejectedFlags...)
+}
+
+func (a App) readSensitiveInputWithMode(args []string, label, fileFlag string, preserveStreamBytes bool, rejectedFlags ...string) ([]byte, error) {
 	for _, flag := range rejectedFlags {
 		if _, present, err := optionalFlagValue(args, flag); present || err != nil {
 			if err != nil {
-				return "", err
+				return nil, err
 			}
-			return "", fmt.Errorf("%s is unsafe because values in arguments can leak; use --stdin, %s, or the interactive prompt", flag, fileFlag)
+			return nil, fmt.Errorf("%s is unsafe because values in arguments can leak; use --stdin, %s, or the interactive prompt", flag, fileFlag)
 		}
 	}
 	filePath, hasFile, err := optionalFlagValue(args, fileFlag)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	hasStdin := hasFlag(args, "--stdin")
 	if hasFile && hasStdin {
-		return "", fmt.Errorf("use either --stdin or %s, not both", fileFlag)
+		return nil, fmt.Errorf("use either --stdin or %s, not both", fileFlag)
 	}
 	if hasFile {
 		bytes, err := os.ReadFile(filePath)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		return normalizeSensitiveInput(string(bytes), label)
+		if preserveStreamBytes {
+			return bytes, nil
+		}
+		value, err := normalizeSensitiveInput(string(bytes), label)
+		return []byte(value), err
 	}
 	if hasStdin {
 		bytes, err := io.ReadAll(a.In)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		return normalizeSensitiveInput(string(bytes), label)
+		if preserveStreamBytes {
+			return bytes, nil
+		}
+		value, err := normalizeSensitiveInput(string(bytes), label)
+		return []byte(value), err
 	}
 	file, ok := a.In.(*os.File)
 	if !ok || !term.IsTerminal(int(file.Fd())) {
-		return "", fmt.Errorf("%s input requires --stdin or %s in non-interactive mode", strings.ToLower(label), fileFlag)
+		return nil, fmt.Errorf("%s input requires --stdin or %s in non-interactive mode", strings.ToLower(label), fileFlag)
 	}
 	fmt.Fprintf(a.Err, "%s: ", label)
 	bytes, err := term.ReadPassword(int(file.Fd()))
 	fmt.Fprintln(a.Err)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return normalizeSensitiveInput(string(bytes), label)
+	value, err := normalizeSensitiveInput(string(bytes), label)
+	return []byte(value), err
 }
 
 func normalizeSensitiveInput(value, label string) (string, error) {

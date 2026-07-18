@@ -40,15 +40,15 @@ func (a App) add(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	value, err := a.readSensitiveInput(remaining[1:], "Secret value", "--value-file", "--value")
+	value, err := a.readSecretInput(remaining[1:], "Secret value", "--value-file", "--value")
 	if err != nil {
 		return a.fail(err)
 	}
-	secret, err := st.AddSecret(fullPath, value)
+	secret, err := st.AddSecretBytes(fullPath, value)
 	if err != nil {
 		return a.fail(err)
 	}
-	fmt.Fprintf(a.Out, "✓ Stored %s in workspace %s as encrypted version %d (%s)\n", shortSecretPath(secret.Scope, secret.Name), target.Slug, secret.ActiveVersion, store.Mask(value))
+	fmt.Fprintf(a.Out, "✓ Stored %s in workspace %s as encrypted version %d (%s)\n", shortSecretPath(secret.Scope, secret.Name), target.Slug, secret.ActiveVersion, store.Mask(string(value)))
 	return 0
 }
 
@@ -307,15 +307,15 @@ func (a App) rotate(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	value, err := a.readSensitiveInput(remaining[1:], "Secret value", "--value-file", "--value")
+	value, err := a.readSecretInput(remaining[1:], "Secret value", "--value-file", "--value")
 	if err != nil {
 		return a.fail(err)
 	}
-	secret, err := st.AddSecret(fullPath, value)
+	secret, err := st.AddSecretBytes(fullPath, value)
 	if err != nil {
 		return a.fail(err)
 	}
-	fmt.Fprintf(a.Out, "✓ Rotated %s in workspace %s to encrypted version %d (%s)\n", shortSecretPath(secret.Scope, secret.Name), target.Slug, secret.ActiveVersion, store.Mask(value))
+	fmt.Fprintf(a.Out, "✓ Rotated %s in workspace %s to encrypted version %d (%s)\n", shortSecretPath(secret.Scope, secret.Name), target.Slug, secret.ActiveVersion, store.Mask(string(value)))
 	return 0
 }
 

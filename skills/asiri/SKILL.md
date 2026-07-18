@@ -115,7 +115,7 @@ Use stdin or a value file. Do not put values in command arguments.
 From an environment variable:
 
 ```sh
-printf '%s\n' "$VALUE_FROM_EXISTING_ENV" | asiri add --workspace <workspace> <scope/SECRET_NAME> --stdin
+printf '%s' "$VALUE_FROM_EXISTING_ENV" | asiri add --workspace <workspace> <scope/SECRET_NAME> --stdin
 ```
 
 From a file:
@@ -123,6 +123,10 @@ From a file:
 ```sh
 asiri add --workspace <workspace> <scope/SECRET_NAME> --value-file <path>
 ```
+
+Both forms preserve exact bytes, including final newlines and empty input. Add
+a newline to stdin only when it is part of the secret. Binary secrets are safe
+for file mounts; environment injection cannot represent NUL bytes.
 
 After adding or rotating a secret that must be preserved remotely, push the narrowest target:
 

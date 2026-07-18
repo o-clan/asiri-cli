@@ -22,7 +22,16 @@ func TestMain(m *testing.M) {
 func testSecretFile(t *testing.T, value string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "secret.txt")
-	if err := os.WriteFile(path, []byte(value+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(value), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func testSecretBytesFile(t *testing.T, value []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "secret.bin")
+	if err := os.WriteFile(path, value, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return path

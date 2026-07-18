@@ -210,14 +210,14 @@ func (a App) mount(st *store.FileStore, args []string) int {
 		return a.fail(err)
 	}
 	for index := range reservedTargets {
-		value, _, err := st.GetSecret(reservedTargets[index].release.Path)
+		value, _, err := st.GetSecretBytes(reservedTargets[index].release.Path)
 		if err != nil {
 			a.auditFailedPreparedRelease(st, agent, reservedTargets[index].release, "secret release failed after audit gate: "+err.Error())
 			_ = st.Save()
 			a.syncRuntimeAuditBestEffort(st)
 			return a.fail(err)
 		}
-		if err := writeReservedSecretFile(reservedTargets[index].file, []byte(value)); err != nil {
+		if err := writeReservedSecretFile(reservedTargets[index].file, value); err != nil {
 			a.auditFailedPreparedRelease(st, agent, reservedTargets[index].release, "secret file write failed after audit gate: "+err.Error())
 			_ = st.Save()
 			a.syncRuntimeAuditBestEffort(st)

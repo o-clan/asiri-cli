@@ -185,13 +185,13 @@ func (a App) helpFor(path []string) int {
 	case "local wipe":
 		fmt.Fprint(a.Out, "Usage: asiri local wipe [--yes]\n\nDeletes local state and Asiri key material for this machine. This never calls remote APIs. Without --yes, type `wipe local` to confirm.\n")
 	case "add":
-		fmt.Fprint(a.Out, "Usage: asiri add --workspace <slug> <scope/name> --stdin|--value-file <path>\n\nAdds a local encrypted secret. Use short paths without the workspace prefix. Values are accepted only through stdin or a file to avoid shell history exposure.\n")
+		fmt.Fprint(a.Out, "Usage: asiri add --workspace <slug> <scope/name> --stdin|--value-file <path>\n\nAdds a local encrypted secret. Use short paths without the workspace prefix. File and stdin input are stored byte-for-byte, including final newlines and empty input.\n")
 	case "get":
 		fmt.Fprint(a.Out, "Usage: asiri get --workspace <slug> <scope/name> [--agent <agent>]\n\nReads a local secret when policy allows raw read for the human user or named agent label. Use short paths without the workspace prefix.\n")
 	case "list":
 		fmt.Fprint(a.Out, "Usage: asiri list --workspace <canonical-slug-or-alias> [filter] [--local|--remote] [--status <status>] [--include-inactive]\n\nShows metadata for one explicit local or hosted workspace. A fresh offline vault will suggest creating a workspace first. Values are never printed.\n")
 	case "rotate":
-		fmt.Fprint(a.Out, "Usage: asiri rotate --workspace <slug> <scope/name> --stdin|--value-file <path>\n\nAdds a new local encrypted version for an existing secret. Use short paths without the workspace prefix.\n")
+		fmt.Fprint(a.Out, "Usage: asiri rotate --workspace <slug> <scope/name> --stdin|--value-file <path>\n\nAdds a new local encrypted version for an existing secret. Use short paths without the workspace prefix. File and stdin input are stored byte-for-byte.\n")
 	case "rm":
 		fmt.Fprint(a.Out, "Usage: asiri rm --workspace <slug> <scope/name>\n       asiri rm --remote --workspace <slug> <scope/name> [--dry-run|--confirm-token <token>]\n       asiri rm --remote --workspace <slug> --where remote-only [--dry-run|--confirm-token <token>]\n\nMarks a local secret as deleted by default. With --remote, soft-deletes active remote secret versions in the control plane. Use short paths without the workspace prefix.\n")
 	case "grant":

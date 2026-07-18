@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -16,12 +17,32 @@ import (
 )
 
 func TestPushAndPullUseBearerAccessToken(t *testing.T) {
+	if os.Getenv("ASIRI_MOUNT_BYTE_COMPARE_HELPER") == "1" {
+		if len(os.Args) < 2 {
+			t.Fatal("mount byte compare helper requires two paths")
+		}
+		mounted, err := os.ReadFile(os.Args[len(os.Args)-2])
+		if err != nil {
+			t.Fatal(err)
+		}
+		source, err := os.ReadFile(os.Args[len(os.Args)-1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(mounted, source) {
+			t.Fatalf("mounted bytes changed: got %d bytes, want %d", len(mounted), len(source))
+		}
+		return
+	}
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")
 	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
 	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
 		t.Fatal(err)
 	}
+	sourceValue := testOpenSSHPrivateKey(t)
+	sourcePath := testSecretBytesFile(t, sourceValue)
+	mountedPath := filepath.Join(tmp, "mounted-private-key")
 	secretPushCount := 0
 	wrappingDiscoveryCount := 0
 	syncSeen := false
@@ -190,7 +211,7 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 	app := New(&out, &errb)
 	for _, step := range [][]string{
 		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
-		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
+		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", sourcePath},
 		{"login", "--origin", server.URL},
 	} {
 		out.Reset()
@@ -203,8 +224,32 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 	for _, step := range [][]string{
 		{"push", "--workspace", "oclan-co"},
 		{"push", "--workspace", "oclan-co"},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(st.State.Secrets, store.SecretKey("oclan-co/local/asiri", "API_KEY"))
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+	childName := filepath.Base(os.Args[0])
+	oldCompareHelper := os.Getenv("ASIRI_MOUNT_BYTE_COMPARE_HELPER")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_MOUNT_BYTE_COMPARE_HELPER", oldCompareHelper) })
+	if err := os.Setenv("ASIRI_MOUNT_BYTE_COMPARE_HELPER", "1"); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range [][]string{
 		{"pull", "--workspace", "oclan-co"},
 		{"rewrap", "--workspace", "oclan-co"},
+		{"grant", "--workspace", "oclan-co", childName, "local/asiri/API_KEY", "--mount"},
+		{"mount", "--workspace", "oclan-co", "local/asiri/API_KEY:" + mountedPath, "--", os.Args[0], "-test.run=^TestPushAndPullUseBearerAccessToken$", "--", mountedPath, sourcePath},
 	} {
 		out.Reset()
 		errb.Reset()
@@ -218,7 +263,7 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 	if wrappingDiscoveryCount < 2 {
 		t.Fatal("push did not retry rate-limited wrapping target discovery")
 	}
-	if strings.Contains(out.String(), "secret_value") || strings.Contains(errb.String(), "secret_value") {
+	if strings.Contains(out.String(), "BEGIN OPENSSH PRIVATE KEY") || strings.Contains(errb.String(), "BEGIN OPENSSH PRIVATE KEY") {
 		t.Fatalf("push/pull leaked secret stdout=%q stderr=%q", out.String(), errb.String())
 	}
 }

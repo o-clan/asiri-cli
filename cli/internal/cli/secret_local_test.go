@@ -2,6 +2,9 @@ package cli
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +21,115 @@ import (
 	"github.com/o-clan/asiri/cli/internal/keystore"
 	"github.com/o-clan/asiri/cli/internal/store"
 )
+
+func TestAddFileAndStdinPreserveExactBytes(t *testing.T) {
+	tmp := t.TempDir()
+	oldHome := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", oldHome) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "byte-test", "--workspace", "exact"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+
+	cases := []struct {
+		name  string
+		value []byte
+	}{
+		{name: "openssh-final-newline", value: testOpenSSHPrivateKey(t)},
+		{name: "multiline-final-newline", value: []byte("first\nsecond\nthird\n")},
+		{name: "multiline-no-final-newline", value: []byte("first\nsecond\nthird")},
+		{name: "crlf", value: []byte("first\r\nsecond\r\n")},
+		{name: "empty", value: []byte{}},
+		{name: "binary", value: []byte{0x00, 0x01, 0x02, 0x7f, 0x80, 0xff, '\r', '\n'}},
+	}
+
+	for _, input := range []string{"file", "stdin"} {
+		for index, tc := range cases {
+			t.Run(input+"/"+tc.name, func(t *testing.T) {
+				out.Reset()
+				errb.Reset()
+				path := fmt.Sprintf("fixtures/%s_%d", strings.ToUpper(input), index)
+				args := []string{"add", "--workspace", "exact", path}
+				if input == "file" {
+					args = append(args, "--value-file", testSecretBytesFile(t, tc.value))
+				} else {
+					app.In = bytes.NewReader(tc.value)
+					args = append(args, "--stdin")
+				}
+				if code := app.Run(args); code != 0 {
+					t.Fatalf("add failed: %s", errb.String())
+				}
+				st, err := store.LoadDefault()
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, _, err := st.GetSecretBytes("exact/" + path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(got, tc.value) {
+					t.Fatalf("stored bytes changed: got %d bytes, want %d", len(got), len(tc.value))
+				}
+			})
+		}
+	}
+}
+
+func testOpenSSHPrivateKey(t *testing.T) []byte {
+	t.Helper()
+	privateKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x42}, ed25519.SeedSize))
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	keyType := []byte("ssh-ed25519")
+
+	publicBlob := appendSSHString(nil, keyType)
+	publicBlob = appendSSHString(publicBlob, publicKey)
+
+	privateBlob := make([]byte, 8)
+	binary.BigEndian.PutUint32(privateBlob[:4], 0x12345678)
+	binary.BigEndian.PutUint32(privateBlob[4:], 0x12345678)
+	privateBlob = appendSSHString(privateBlob, keyType)
+	privateBlob = appendSSHString(privateBlob, publicKey)
+	privateBlob = appendSSHString(privateBlob, privateKey)
+	privateBlob = appendSSHString(privateBlob, []byte("asiri-byte-regression"))
+	for padding := byte(1); len(privateBlob)%8 != 0; padding++ {
+		privateBlob = append(privateBlob, padding)
+	}
+
+	encoded := append([]byte("openssh-key-v1\x00"), appendSSHString(nil, []byte("none"))...)
+	encoded = appendSSHString(encoded, []byte("none"))
+	encoded = appendSSHString(encoded, nil)
+	encoded = binary.BigEndian.AppendUint32(encoded, 1)
+	encoded = appendSSHString(encoded, publicBlob)
+	encoded = appendSSHString(encoded, privateBlob)
+
+	base64Value := base64.StdEncoding.EncodeToString(encoded)
+	var pem bytes.Buffer
+	pem.WriteString("-----BEGIN OPENSSH PRIVATE KEY-----\n")
+	for len(base64Value) > 0 {
+		lineLength := 70
+		if len(base64Value) < lineLength {
+			lineLength = len(base64Value)
+		}
+		pem.WriteString(base64Value[:lineLength])
+		pem.WriteByte('\n')
+		base64Value = base64Value[lineLength:]
+	}
+	pem.WriteString("-----END OPENSSH PRIVATE KEY-----\n")
+	if pem.Len() != 411 {
+		t.Fatalf("OpenSSH regression fixture is %d bytes, want 411", pem.Len())
+	}
+	return pem.Bytes()
+}
+
+func appendSSHString(target, value []byte) []byte {
+	target = binary.BigEndian.AppendUint32(target, uint32(len(value)))
+	return append(target, value...)
+}
 
 func TestConcurrentAddsAcrossProcessesPreserveEverySecret(t *testing.T) {
 	if os.Getenv("ASIRI_CONCURRENT_ADD_HELPER") == "1" {
@@ -38,7 +150,7 @@ func TestConcurrentAddsAcrossProcessesPreserveEverySecret(t *testing.T) {
 		}
 		var out, errb bytes.Buffer
 		app := New(&out, &errb)
-		app.In = strings.NewReader(fmt.Sprintf("value-%d\n", index))
+		app.In = strings.NewReader(fmt.Sprintf("value-%d", index))
 		path := fmt.Sprintf("local/concurrent/KEY_%02d", index)
 		if code := app.Run([]string{"add", "--workspace", "oclan-co", path, "--stdin"}); code != 0 {
 			t.Fatalf("concurrent add failed: %s", errb.String())
