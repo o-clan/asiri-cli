@@ -37,7 +37,7 @@ func TestRunDirectAsiriRefUsesCommandBasenamePolicy(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	steps := [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "cloudflare/prod-token", "--value-file", testSecretFile(t, "cf_prod_token")},
 		{"grant", "--workspace", "qa", "wrangler", "cloudflare/prod-token", "--inject-only"},
 	}
@@ -134,7 +134,7 @@ func TestRunExplicitEnvMappingUsesCommandBasenamePolicy(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	steps := [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")},
 		{"grant", "--workspace", "qa", "wrangler", "cloudflare/WRANGLER_SECRET", "--inject-only"},
 		{"run", "--workspace", "qa", "--env", "WRANGLER_SECRET=cloudflare/WRANGLER_SECRET", "--", "wrangler", "deploy"},
@@ -187,7 +187,7 @@ func TestRunExplicitEnvMappingDeniesMissingDerivedCommandGrant(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")},
 	} {
 		out.Reset()
@@ -245,7 +245,7 @@ func TestRunDirectAsiriRefSupportsExplicitAgentAndEmbeddedRefs(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	steps := [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "org"},
 		{"add", "--workspace", "org", "team/cloudflare/prod-token", "--value-file", testSecretFile(t, "embedded_token")},
 		{"grant", "--workspace", "org", "release-bot", "team/cloudflare/prod-token", "--inject-only"},
 	}
@@ -319,7 +319,7 @@ func TestRunDirectAsiriRefDeniesMissingGrantBeforeExecuting(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "cloudflare/prod-token", "--value-file", testSecretFile(t, "cf_prod_token")},
 	} {
 		out.Reset()

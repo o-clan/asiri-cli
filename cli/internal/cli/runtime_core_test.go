@@ -27,7 +27,7 @@ func TestCLIEndToEndLocalRuntime(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	steps := [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "openai/api_key", "--value-file", testSecretFile(t, "qa_secret_value")},
 		{"grant", "--workspace", "qa", "codex", "openai/api_key", "--inject-only"},
 		{"grant", "--workspace", "qa", "codex", "openai/api_key", "--broker"},
@@ -86,7 +86,7 @@ func TestEnvExportInvalidNameDoesNotAuditMaterialization(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "app/api-key", "--value-file", testSecretFile(t, "env_secret")},
 		{"grant", "--workspace", "qa", "sh", "app/api-key", "--inject-only"},
 	} {
@@ -124,7 +124,7 @@ func TestMountExplicitDestinationScopeDoesNotAuditMaterialization(t *testing.T) 
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "app/ONE", "--value-file", testSecretFile(t, "one")},
 		{"add", "--workspace", "qa", "app/TWO", "--value-file", testSecretFile(t, "two")},
 		{"grant", "--workspace", "qa", "sh", "app/ONE", "--mount"},
@@ -205,7 +205,7 @@ func TestRuntimePreflightBlocksPartialMaterialization(t *testing.T) {
 			var errb bytes.Buffer
 			app := New(&out, &errb)
 			for _, step := range [][]string{
-				{"init", "--device", "qa-laptop"},
+				{"init", "--device", "qa-laptop", "--workspace", "qa"},
 				{"add", "--workspace", "qa", "app/ONE", "--value-file", testSecretFile(t, "one")},
 				{"add", "--workspace", "qa", "app/TWO", "--value-file", testSecretFile(t, "two")},
 				tc.grant,
@@ -250,7 +250,7 @@ func TestUnusableSecretDoesNotAuditAllowedMaterialization(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "app/ONE", "--value-file", testSecretFile(t, "one")},
 	} {
 		out.Reset()
@@ -307,7 +307,7 @@ func TestAuditTailShowsLocalStatusForLocalOnlyEvents(t *testing.T) {
 	var out bytes.Buffer
 	var errb bytes.Buffer
 	app := New(&out, &errb)
-	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+	if code := app.Run([]string{"init", "--device", "qa-laptop", "--workspace", "qa"}); code != 0 {
 		t.Fatalf("init failed with code %d stderr=%s", code, errb.String())
 	}
 	if code := app.Run([]string{"add", "--workspace", "qa", "local/TEST", "--value-file", testSecretFile(t, "test")}); code != 0 {
@@ -337,7 +337,7 @@ func TestBrokerReloadsLocalStateBetweenRequests(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "openai/api_key", "--value-file", testSecretFile(t, "old_secret")},
 		{"grant", "--workspace", "qa", "codex", "openai/api_key", "--broker"},
 	} {
@@ -415,7 +415,7 @@ func TestBrokerRequiresExplicitBrokerGrant(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "openai/api_key", "--value-file", testSecretFile(t, "qa_secret_value")},
 		{"grant", "--workspace", "qa", "codex", "openai/api_key", "--inject-only"},
 	} {
@@ -455,7 +455,7 @@ func TestAuditTailWorkspaceFilterMatchesWorkspaceMetadata(t *testing.T) {
 	var out bytes.Buffer
 	var errb bytes.Buffer
 	app := New(&out, &errb)
-	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+	if code := app.Run([]string{"init", "--device", "qa-laptop", "--workspace", "qa"}); code != 0 {
 		t.Fatalf("init failed: %s", errb.String())
 	}
 	st, err := store.LoadDefault()
@@ -494,7 +494,7 @@ func TestShortPathRejectsKnownDifferentWorkspacePrefix(t *testing.T) {
 	var out bytes.Buffer
 	var errb bytes.Buffer
 	app := New(&out, &errb)
-	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+	if code := app.Run([]string{"init", "--device", "qa-laptop", "--workspace", "qa"}); code != 0 {
 		t.Fatalf("init failed: %s", errb.String())
 	}
 	st, err := store.LoadDefault()

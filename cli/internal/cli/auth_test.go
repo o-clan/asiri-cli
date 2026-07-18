@@ -48,14 +48,14 @@ func TestDetectedDeviceKindUsesReliableRuntimeSignals(t *testing.T) {
 }
 
 func TestParseInitArgsAcceptsExplicitDeviceKind(t *testing.T) {
-	name, kind, err := parseInitArgs([]string{"--device", "octo-staging-host", "--kind", "server"})
+	name, kind, workspace, err := parseInitArgs([]string{"--device", "octo-staging-host", "--kind", "server"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if name != "octo-staging-host" || kind != "server" {
-		t.Fatalf("unexpected init options: name=%q kind=%q", name, kind)
+	if name != "octo-staging-host" || kind != "server" || workspace != "" {
+		t.Fatalf("unexpected init options: name=%q kind=%q workspace=%q", name, kind, workspace)
 	}
-	if _, _, err := parseInitArgs([]string{"--kind", "hostname-guess"}); err == nil {
+	if _, _, _, err := parseInitArgs([]string{"--kind", "hostname-guess"}); err == nil {
 		t.Fatal("invalid device kind accepted")
 	}
 }
@@ -74,7 +74,7 @@ func TestInitFallsBackToLocalFileKeyStoreWhenPlatformKeyringUnavailable(t *testi
 
 	var out, errb bytes.Buffer
 	app := New(&out, &errb)
-	if code := app.Run([]string{"init", "--device", "headless-box", "--kind", "server"}); code != 0 {
+	if code := app.Run([]string{"init", "--device", "headless-box", "--kind", "server", "--workspace", "personal"}); code != 0 {
 		t.Fatalf("init failed: %s", errb.String())
 	}
 	if !strings.Contains(out.String(), "using local file key store") {
@@ -1047,7 +1047,7 @@ func TestLoginReportsCloudflareChallengeInsteadOfJSONDecodeError(t *testing.T) {
 	}
 }
 
-func TestInitRejectsWorkspaceSlug(t *testing.T) {
+func TestInitAcceptsWorkspaceSlug(t *testing.T) {
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")
 	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
@@ -1057,11 +1057,16 @@ func TestInitRejectsWorkspaceSlug(t *testing.T) {
 	var out bytes.Buffer
 	var errb bytes.Buffer
 	app := New(&out, &errb)
-	if code := app.Run([]string{"init", "--workspace", "oclan-co", "--device", "qa-laptop"}); code == 0 {
-		t.Fatal("init should reject workspace slugs")
+	if code := app.Run([]string{"init", "--workspace", "xai-dev", "--device", "qa-laptop"}); code != 0 {
+		t.Fatalf("init should accept a local workspace slug: %s", errb.String())
 	}
-	if !strings.Contains(errb.String(), "local vaults do not have workspace slugs") {
-		t.Fatalf("expected workspace rejection, got stderr=%s", errb.String())
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, ok := st.LocalWorkspace("xai-dev")
+	if !ok || workspace.CanonicalSlug != "xai-dev" {
+		t.Fatalf("expected xai-dev local workspace, got %#v", st.State.Workspaces)
 	}
 }
 
@@ -1200,6 +1205,9 @@ func TestLoginUsesDeviceCodeFlow(t *testing.T) {
 	}
 	if st.State.ControlPlane == nil || st.State.ControlPlane.DeviceID != "dev_remote" || st.State.ControlPlane.WorkspaceSlug != "oclan-co" {
 		t.Fatalf("control-plane link not persisted: %#v", st.State.ControlPlane)
+	}
+	if len(st.State.Workspaces) != 0 {
+		t.Fatalf("control-plane-first login created local workspaces: %#v", st.State.Workspaces)
 	}
 	bytes, err := os.ReadFile(filepath.Join(tmp, "local-state.json"))
 	if err != nil {

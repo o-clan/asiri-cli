@@ -303,7 +303,7 @@ func TestRemoteSelfRevokeKeepsLocalRuntimeAndAuthSession(t *testing.T) {
 	var out, errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "blocked_after_revoke")},
 		{"login", "--origin", server.URL},
 		{"device", "revoke", "--workspace", "oclan-co", "dev_remote", "--remote"},
@@ -517,7 +517,7 @@ func TestRemoteWorkspaceRevocationDoesNotClearLocalKeyMaterial(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
 		{"login", "--origin", server.URL},
 	} {

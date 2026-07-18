@@ -23,7 +23,7 @@ func TestEnvSingleSecretExport(t *testing.T) {
 	var out, errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")},
 		{"grant", "--workspace", "qa", "sh", "cloudflare/WRANGLER_SECRET", "--inject-only"},
 		{"env", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--", "sh", "-c", "test \"$WRANGLER_SECRET\" = env_secret"},
@@ -47,7 +47,7 @@ func TestEnvDirectScopeExport(t *testing.T) {
 	var out, errb bytes.Buffer
 	app := New(&out, &errb)
 	steps := [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")},
 		{"add", "--workspace", "qa", "cloudflare/CLOUDFLARE_ACCOUNT_ID", "--value-file", testSecretFile(t, "acct_123")},
 		{"add", "--workspace", "qa", "cloudflare/nested/IGNORED", "--value-file", testSecretFile(t, "ignored")},
@@ -121,7 +121,7 @@ func TestEnvRemoteHintFallsBackToSlashyScopeSelection(t *testing.T) {
 	var out, errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 	} {
 		out.Reset()
 		errb.Reset()
@@ -244,7 +244,7 @@ func TestEnvInvalidNameAndMissingGrantDoNotExecute(t *testing.T) {
 	_ = os.Setenv("PATH", binDir+string(os.PathListSeparator)+oldPath)
 	var out, errb bytes.Buffer
 	app := New(&out, &errb)
-	setup := [][]string{{"init", "--device", "qa-laptop"}, {"add", "--workspace", "qa", "cloudflare/BAD-NAME", "--value-file", testSecretFile(t, "bad_secret")}, {"grant", "--workspace", "qa", "tool", "cloudflare/BAD-NAME", "--inject-only"}, {"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")}}
+	setup := [][]string{{"init", "--device", "qa-laptop", "--workspace", "qa"}, {"add", "--workspace", "qa", "cloudflare/BAD-NAME", "--value-file", testSecretFile(t, "bad_secret")}, {"grant", "--workspace", "qa", "tool", "cloudflare/BAD-NAME", "--inject-only"}, {"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")}}
 	for _, step := range setup {
 		out.Reset()
 		errb.Reset()
@@ -286,7 +286,7 @@ func TestMountSingleSecretFileAndCleanup(t *testing.T) {
 	var out, errb bytes.Buffer
 	app := New(&out, &errb)
 	steps := [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "mounted_secret")},
 		{"grant", "--workspace", "qa", "sh", "cloudflare/WRANGLER_SECRET", "--mount"},
 		{"mount", "--workspace", "qa", "--dir", mountDir, "cloudflare/WRANGLER_SECRET", "--", "sh", "-c", "test \"$(cat \"$ASIRI_SECRETS_DIR/WRANGLER_SECRET\")\" = mounted_secret && (stat -c %a \"$ASIRI_SECRETS_DIR/WRANGLER_SECRET\" 2>/dev/null || stat -f %Lp \"$ASIRI_SECRETS_DIR/WRANGLER_SECRET\") > '" + modeFile + "'"},
@@ -318,7 +318,7 @@ func TestMountChildDirArgumentDoesNotChangeMountDirectory(t *testing.T) {
 	var out, errb bytes.Buffer
 	app := New(&out, &errb)
 	steps := [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "mounted_secret")},
 		{"grant", "--workspace", "qa", "sh", "cloudflare/WRANGLER_SECRET", "--mount"},
 		{"mount", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--", "sh", "-c", "test \"$ASIRI_SECRETS_DIR\" != \"$1\" && test \"$(cat \"$ASIRI_SECRETS_DIR/WRANGLER_SECRET\")\" = mounted_secret", "sh", childDir, "--dir", childDir},
@@ -343,7 +343,7 @@ func TestMountDirectScopeFiles(t *testing.T) {
 	var out, errb bytes.Buffer
 	app := New(&out, &errb)
 	steps := [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "mounted_secret")},
 		{"add", "--workspace", "qa", "cloudflare/CLOUDFLARE_ACCOUNT_ID", "--value-file", testSecretFile(t, "acct_123")},
 		{"grant", "--workspace", "qa", "sh", "cloudflare/WRANGLER_SECRET", "--mount"},
@@ -374,7 +374,7 @@ func TestMountMissingGrantAndUnsafeDestinationDoNotExecute(t *testing.T) {
 	_ = os.Setenv("PATH", binDir+string(os.PathListSeparator)+oldPath)
 	var out, errb bytes.Buffer
 	app := New(&out, &errb)
-	for _, step := range [][]string{{"init", "--device", "qa-laptop"}, {"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "mounted_secret")}} {
+	for _, step := range [][]string{{"init", "--device", "qa-laptop", "--workspace", "qa"}, {"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "mounted_secret")}} {
 		out.Reset()
 		errb.Reset()
 		if code := app.Run(step); code != 0 {

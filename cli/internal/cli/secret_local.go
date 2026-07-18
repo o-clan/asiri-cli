@@ -26,9 +26,15 @@ func (a App) add(st *store.FileStore, args []string) int {
 	if err := rejectUnknownArgs(remaining[1:], "--stdin", "--value-file", "--value"); err != nil {
 		return a.fail(err)
 	}
+	if hasFlag(remaining[1:], "--value") {
+		return a.fail(errors.New("--value is unsafe because values in arguments can leak; use --stdin, --value-file, or the interactive prompt"))
+	}
 	target, err := a.workspacePathTarget(st, workspaceArg, "add")
 	if err != nil {
 		return a.fail(err)
+	}
+	if _, ok := st.LocalWorkspace(target.Slug); !ok {
+		return a.fail(fmt.Errorf("local workspace %s not found; create it with `asiri workspace create %s`", target.Slug, target.Slug))
 	}
 	fullPath, err := workspacePrefixedPath(target, remaining[0], "add")
 	if err != nil {
@@ -129,7 +135,7 @@ func (a App) list(st *store.FileStore, args []string) int {
 	if err := st.RequireInitialized(); err != nil {
 		return a.fail(err)
 	}
-	workspaceArg, remaining, err := splitWorkspaceFlag(args, "list", true)
+	workspaceArg, remaining, err := splitWorkspaceFlag(args, "list", false)
 	if err != nil {
 		return a.fail(err)
 	}
@@ -149,13 +155,23 @@ func (a App) list(st *store.FileStore, args []string) int {
 	if localOnly && remoteOnly {
 		return a.fail(errors.New("use either --local or --remote, not both"))
 	}
+	if workspaceArg == "" {
+		if st.State.ControlPlane == nil && len(st.LocalWorkspaces()) == 0 {
+			return a.fail(errors.New("list requires --workspace <slug>; run `asiri login` for hosted workspaces, or stay offline with `asiri workspace create <slug>`"))
+		}
+		return a.fail(errors.New("list requires --workspace <slug>"))
+	}
 	if err := requireServiceAccountWorkspace(st, workspaceArg); err != nil {
 		return a.fail(err)
 	}
 	filter := strings.Trim(firstPositionalSkippingFlagValues(remaining, "--status"), "/")
 	var workspaceSet map[string]bool
-	if localOnly {
-		workspaceSet, err = localWorkspaceFilterSet([]string{workspaceArg}, "list")
+	if localOnly || st.State.ControlPlane == nil {
+		workspace, ok := st.LocalWorkspace(workspaceArg)
+		if !ok {
+			return a.fail(fmt.Errorf("local workspace %s not found; create it with `asiri workspace create %s`", workspaceArg, workspaceArg))
+		}
+		workspaceSet = map[string]bool{workspace.CanonicalSlug: true}
 	} else {
 		workspaceSet, err = a.workspaceFilterSet(st, []string{workspaceArg}, "list")
 	}

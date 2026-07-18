@@ -117,7 +117,7 @@ func (a App) Run(args []string) int {
 
 func commandUsesLifecycleStateLock(command string) bool {
 	switch command {
-	case "init", "login", "logout", "member", "service-account", "push", "pull", "rewrap", "rekey", "recovery", "device", "secret", "local", "add", "rotate", "rm", "grant", "deny", "cache":
+	case "init", "login", "logout", "workspace", "member", "service-account", "push", "pull", "rewrap", "rekey", "recovery", "device", "secret", "local", "add", "rotate", "rm", "grant", "deny", "cache":
 		return true
 	default:
 		return false

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"text/tabwriter"
 
@@ -18,16 +19,29 @@ func (a App) workspace(st *store.FileStore, args []string) int {
 	if err := st.RequireInitialized(); err != nil {
 		return a.fail(err)
 	}
-	if st.State.ControlPlane == nil {
-		return a.fail(errors.New("asiri is not linked to a control plane"))
-	}
-	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
-	if err != nil {
-		return a.fail(err)
-	}
 	switch args[0] {
+	case "create":
+		if len(args) != 2 {
+			return a.fail(errors.New("workspace create requires a slug"))
+		}
+		workspace, err := st.CreateLocalWorkspace(args[1])
+		if err != nil {
+			return a.fail(err)
+		}
+		fmt.Fprintf(a.Out, "✓ Created local workspace %s\n", workspace.CanonicalSlug)
+		return 0
+	case "alias":
+		return a.workspaceAlias(st, args[1:])
 	case "list":
 		if err := rejectUnknownArgs(args[1:]); err != nil {
+			return a.fail(err)
+		}
+		if st.State.ControlPlane == nil {
+			printLocalWorkspaces(a.Out, st)
+			return 0
+		}
+		accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+		if err != nil {
 			return a.fail(err)
 		}
 		workspaceResult, err := listRemoteWorkspaceOverview(st, st.State.ControlPlane.Origin, accessToken, "", true, false)
@@ -35,13 +49,20 @@ func (a App) workspace(st *store.FileStore, args []string) int {
 			return a.fail(err)
 		}
 		workspaces := workspaceResult.Organizations
+		sortRemoteWorkspaces(workspaces)
 		if st.State.ControlPlane.Source != "service-account" && workspaceResult.Secrets == nil {
 			return a.fail(errors.New("control plane did not return workspace secret metadata"))
 		}
 		keySummaries := workspaceKeySummaries(st, workspaces, workspaceResult.Secrets, st.State.ControlPlane.Source != "service-account")
 		tw := tabwriter.NewWriter(a.Out, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "WORKSPACE\tROLE\tTHIS DEVICE\tACCOUNT WRITE\tKEYS\tNEXT\tID")
+		fmt.Fprintln(tw, "WORKSPACE\tALIAS\tTYPE\tROLE\tTHIS DEVICE\tACCOUNT WRITE\tKEYS\tNEXT\tID")
 		hasUntrusted := false
+		remoteIDs := map[string]bool{}
+		remoteSlugs := map[string]bool{}
+		for _, workspace := range workspaces {
+			remoteIDs[workspace.ID] = true
+			remoteSlugs[workspace.Slug] = true
+		}
 		for _, workspace := range workspaces {
 			if !workspaceDeviceTrusted(workspace) {
 				hasUntrusted = true
@@ -51,7 +72,27 @@ func (a App) workspace(st *store.FileStore, args []string) int {
 			if st.State.ControlPlane.Source == "service-account" {
 				accountWrite = "no"
 			}
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", workspace.Slug, workspaceRoleLabel(workspace, st.State.UserID), deviceTrustLabelForWorkspace(workspace), accountWrite, keySummary.Keys, keySummary.Next, workspace.ID)
+			alias := workspace.Alias
+			if alias == "" {
+				alias = "-"
+			}
+			kind := workspace.Kind
+			if kind == "" {
+				kind = "-"
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", workspace.Slug, alias, kind, workspaceRoleLabel(workspace, st.State.UserID), deviceTrustLabelForWorkspace(workspace), accountWrite, keySummary.Keys, keySummary.Next, workspace.ID)
+		}
+		if st.State.ControlPlane.Source != "service-account" {
+			for _, workspace := range st.LocalWorkspaces() {
+				if remoteIDs[workspace.RemoteWorkspaceID] || remoteSlugs[workspace.CanonicalSlug] {
+					continue
+				}
+				alias := workspace.Alias
+				if alias == "" {
+					alias = "-"
+				}
+				fmt.Fprintf(tw, "%s\t%s\t%s\tlocal\tlocal\tyes\t%s\t%s\t%s\n", workspace.CanonicalSlug, alias, workspace.Kind, localWorkspaceKeyLabel(st, workspace.CanonicalSlug), "asiri push --workspace "+workspace.CanonicalSlug, workspace.ID)
+			}
 		}
 		if err := tw.Flush(); err != nil {
 			return a.fail(err)
@@ -61,6 +102,13 @@ func (a App) workspace(st *store.FileStore, args []string) int {
 		}
 		return 0
 	case "tree":
+		if st.State.ControlPlane == nil {
+			return a.fail(errors.New("asiri is not linked to a control plane"))
+		}
+		accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+		if err != nil {
+			return a.fail(err)
+		}
 		workspaceArg, remaining, err := splitWorkspaceFlag(args[1:], "workspace tree", true)
 		if err != nil {
 			return a.fail(err)
@@ -92,6 +140,123 @@ func (a App) workspace(st *store.FileStore, args []string) int {
 	default:
 		return a.fail(fmt.Errorf("unknown workspace command %q", args[0]))
 	}
+}
+
+func localWorkspaceKeyLabel(st *store.FileStore, slug string) string {
+	count := 0
+	for _, ref := range st.ActiveSecretRefs() {
+		if store.WorkspacePrefix(ref.Scope) == slug {
+			count++
+		}
+	}
+	if count == 0 {
+		return "no secrets"
+	}
+	if count == 1 {
+		return "1 local"
+	}
+	return fmt.Sprintf("%d local", count)
+}
+
+func printLocalWorkspaces(out io.Writer, st *store.FileStore) {
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "WORKSPACE\tALIAS\tTYPE\tSYNC\tID")
+	for _, workspace := range st.LocalWorkspaces() {
+		alias := workspace.Alias
+		if alias == "" {
+			alias = "-"
+		}
+		syncState := "local-only"
+		if workspace.RemoteWorkspaceID != "" {
+			syncState = "synced"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", workspace.CanonicalSlug, alias, workspace.Kind, syncState, workspace.ID)
+	}
+	_ = tw.Flush()
+	if len(st.State.Workspaces) == 0 {
+		fmt.Fprintln(out, "No local workspaces. Sign in with `asiri login`, or stay offline with `asiri workspace create <slug>`.")
+	}
+}
+
+func sortRemoteWorkspaces(workspaces []remoteWorkspaceResponse) {
+	sort.SliceStable(workspaces, func(i, j int) bool {
+		rank := func(workspace remoteWorkspaceResponse) int {
+			if workspace.Kind == "personal" && workspace.Role == "owner" {
+				return 0
+			}
+			if workspace.Role == "owner" {
+				return 1
+			}
+			return 2
+		}
+		left, right := rank(workspaces[i]), rank(workspaces[j])
+		if left != right {
+			return left < right
+		}
+		return workspaces[i].Slug < workspaces[j].Slug
+	})
+}
+
+func (a App) workspaceAlias(st *store.FileStore, args []string) int {
+	if len(args) == 0 || args[0] != "set" {
+		return a.fail(errors.New("workspace alias set is required"))
+	}
+	workspaceArg, remaining, err := splitWorkspaceFlag(args[1:], "workspace alias set", true)
+	if err != nil {
+		return a.fail(err)
+	}
+	if len(remaining) != 1 {
+		return a.fail(errors.New("workspace alias set requires one alias"))
+	}
+	alias := remaining[0]
+	localWorkspace, local := st.LocalWorkspace(workspaceArg)
+	if st.State.ControlPlane == nil || (local && localWorkspace.RemoteWorkspaceID == "") {
+		workspace, err := st.SetLocalWorkspaceAlias(workspaceArg, alias)
+		if err != nil {
+			return a.fail(err)
+		}
+		fmt.Fprintf(a.Out, "✓ Workspace %s alias is %s\n", workspace.CanonicalSlug, alias)
+		return 0
+	}
+	if err := requireHumanMemberSession(st); err != nil {
+		return a.fail(err)
+	}
+	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	if err != nil {
+		return a.fail(err)
+	}
+	requested := workspaceArg
+	if local && localWorkspace.RemoteWorkspaceID != "" {
+		requested = localWorkspace.RemoteWorkspaceID
+	}
+	target, accessToken, err := a.remoteWorkspaceTarget(st, accessToken, requested)
+	if err != nil {
+		return a.fail(err)
+	}
+	if alias == target.Slug {
+		return a.fail(errors.New("workspace alias must differ from the canonical slug"))
+	}
+	exceptLocalID := ""
+	if local {
+		exceptLocalID = localWorkspace.ID
+	}
+	for _, existing := range st.LocalWorkspaces() {
+		if existing.ID != exceptLocalID && (existing.CanonicalSlug == alias || existing.Alias == alias) {
+			return a.fail(fmt.Errorf("workspace alias %s is already in use", alias))
+		}
+	}
+	var updated remoteWorkspaceResponse
+	endpoint := strings.TrimRight(st.State.ControlPlane.Origin, "/") + "/v1/workspaces/" + target.ID + "/alias"
+	if err := putJSONBearer(st, endpoint, accessToken, map[string]string{"alias": alias}, &updated); err != nil {
+		return a.fail(err)
+	}
+	if local {
+		if _, err := st.SetLocalWorkspaceAlias(localWorkspace.ID, alias); err != nil {
+			return a.fail(err)
+		}
+	}
+	fmt.Fprintf(a.Out, "✓ Workspace %s alias is %s\n", target.Slug, alias)
+	return 0
 }
 
 func printWorkspaceTree(out io.Writer, tree remoteWorkspaceTreeResponse) {
@@ -432,7 +597,7 @@ func setupDoctorWorkspaceNext(st *store.FileStore, workspace remoteWorkspaceResp
 
 func findWorkspace(workspaces []remoteWorkspaceResponse, value string) (remoteWorkspaceResponse, bool) {
 	for _, workspace := range workspaces {
-		if workspace.Slug == value {
+		if workspace.ID == value || workspace.Slug == value || workspace.CanonicalSlug == value || workspace.Alias == value {
 			return workspace, true
 		}
 	}

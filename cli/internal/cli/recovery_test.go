@@ -157,13 +157,16 @@ func TestRecoverySetupShowsKeyOnceAndWrapsRemoteSecrets(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
 		{"login", "--origin", server.URL},
 		{"push", "--workspace", "oclan-co"},
 	} {
 		out.Reset()
 		errb.Reset()
+		if step[0] == "push" {
+			linkLocalWorkspaceForTest(t, "oclan-co")
+		}
 		if code := app.Run(step); code != 0 {
 			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
 		}
@@ -309,7 +312,7 @@ func TestRecoverySetupFailsBeforeKeyDeliveryWhenRemoteSecretIsNotWrappedToDevice
 	var out bytes.Buffer
 	var errb bytes.Buffer
 	app := New(&out, &errb)
-	for _, step := range [][]string{{"init", "--device", "qa-laptop"}, {"login", "--origin", server.URL}} {
+	for _, step := range [][]string{{"init", "--device", "qa-laptop", "--workspace", "oclan-co"}, {"login", "--origin", server.URL}} {
 		out.Reset()
 		errb.Reset()
 		if code := app.Run(step); code != 0 {
@@ -409,7 +412,7 @@ func TestRecoverySetupFreshLinkedWorkspaceSendsEmptyReplacements(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"login", "--origin", server.URL},
 	} {
 		out.Reset()
@@ -524,7 +527,7 @@ func TestRecoveryStatusPreservesSameRecipientLocalWrappingCounters(t *testing.T)
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"login", "--origin", server.URL},
 	} {
 		out.Reset()
@@ -658,7 +661,7 @@ func TestTargetedPushPreservesRecoveryWrappedCount(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
 		{"add", "--workspace", "oclan-co", "prod/asiri/OTHER_KEY", "--value-file", testSecretFile(t, "other_value")},
 		{"login", "--origin", server.URL},
@@ -683,6 +686,7 @@ func TestTargetedPushPreservesRecoveryWrappedCount(t *testing.T) {
 		t.Fatal(err)
 	}
 	activeRecovery = st.RecoveryForWorkspace(st.State.ControlPlane.WorkspaceID)
+	linkLocalWorkspaceForTest(t, "oclan-co")
 	out.Reset()
 	errb.Reset()
 	if code := app.Run([]string{"push", "--workspace", "oclan-co", "--secret", "local/asiri/API_KEY"}); code != 0 {
@@ -810,13 +814,16 @@ func TestRecoverySetupSkipsWrappingWhenRemoteRegistrationFails(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
 		{"login", "--origin", server.URL},
 		{"push", "--workspace", "oclan-co"},
 	} {
 		out.Reset()
 		errb.Reset()
+		if step[0] == "push" {
+			linkLocalWorkspaceForTest(t, "oclan-co")
+		}
 		if code := app.Run(step); code != 0 {
 			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
 		}
@@ -941,13 +948,16 @@ func TestRecoverySetupFailsWhenRemoteReplacementFails(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
 		{"login", "--origin", server.URL},
 		{"push", "--workspace", "oclan-co"},
 	} {
 		out.Reset()
 		errb.Reset()
+		if step[0] == "push" {
+			linkLocalWorkspaceForTest(t, "oclan-co")
+		}
 		if code := app.Run(step); code != 0 {
 			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
 		}
@@ -1117,13 +1127,16 @@ func TestRecoverySetupForceUsesCurrentDeviceWrapWhenPreviousRecipientIsRetired(t
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
 		{"login", "--origin", server.URL},
 		{"push", "--workspace", "oclan-co"},
 	} {
 		out.Reset()
 		errb.Reset()
+		if step[0] == "push" {
+			linkLocalWorkspaceForTest(t, "oclan-co")
+		}
 		if code := app.Run(step); code != 0 {
 			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
 		}
@@ -1208,7 +1221,7 @@ func TestRecoveryRestoreUsesSuppliedKeyWhenLocalMetadataIsStale(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"login", "--origin", server.URL},
 	} {
 		out.Reset()
@@ -1299,7 +1312,7 @@ func TestRecoverySetupDoesNotPersistWhenKeyDeliveryFails(t *testing.T) {
 	}))
 	defer server.Close()
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"login", "--origin", server.URL},
 	} {
 		out.Reset()

@@ -99,6 +99,9 @@ type remoteWorkspaceResponse struct {
 	ID                   string `json:"id"`
 	Name                 string `json:"name"`
 	Slug                 string `json:"slug"`
+	CanonicalSlug        string `json:"canonicalSlug"`
+	Alias                string `json:"alias"`
+	Kind                 string `json:"kind"`
 	OwnerUserID          string `json:"ownerUserId"`
 	Role                 string `json:"role"`
 	CanPull              *bool  `json:"canPull"`

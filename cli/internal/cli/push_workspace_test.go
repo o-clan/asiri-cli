@@ -98,7 +98,7 @@ func TestPushOffersConfirmedWorkspacePrefixRenameWhenSourceWorkspaceIsNotVisible
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "google-com"},
 		{"add", "--workspace", "google-com", "recipe-app/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
 		{"login", "--origin", server.URL},
 	} {
@@ -193,7 +193,7 @@ func TestPushReportsRequestedWorkspaceWriteDenial(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"add", "--workspace", "oclan-co", "recipe-app/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
 		{"login", "--origin", server.URL},
 	} {
@@ -203,6 +203,7 @@ func TestPushReportsRequestedWorkspaceWriteDenial(t *testing.T) {
 			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
 		}
 	}
+	linkLocalWorkspaceForTest(t, "oclan-co")
 	out.Reset()
 	errb.Reset()
 	if code := app.Run([]string{"push", "--workspace", "oclan-co"}); code == 0 {
@@ -296,7 +297,7 @@ func TestPushRefusesToMoveVisibleReadOnlyWorkspaceSecrets(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "google-com"},
 		{"add", "--workspace", "google-com", "recipe-app/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
 		{"login", "--origin", server.URL},
 	} {
@@ -383,7 +384,7 @@ func TestPushExplainsMissingWorkspaceDeviceTrust(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "asiri-dev"},
 		{"add", "--workspace", "asiri-dev", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
 		{"login", "--origin", server.URL},
 	} {
@@ -394,6 +395,7 @@ func TestPushExplainsMissingWorkspaceDeviceTrust(t *testing.T) {
 		}
 	}
 
+	linkLocalWorkspaceForTest(t, "asiri-dev", "org_asiri")
 	out.Reset()
 	errb.Reset()
 	if code := app.Run([]string{"push", "--workspace", "asiri-dev", "--yes"}); code == 0 {

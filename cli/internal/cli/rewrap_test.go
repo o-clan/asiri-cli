@@ -108,7 +108,7 @@ func TestRewrapSkipsRemoteVersionMissingLocally(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
 		{"login", "--origin", server.URL},
 		{"rewrap", "--workspace", "oclan-co"},
@@ -215,7 +215,7 @@ func TestRewrapUsesAccessibleRemoteVersionWhenLocalVersionIsOlder(t *testing.T) 
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
 		{"login", "--origin", server.URL},
 	} {
@@ -434,7 +434,7 @@ func TestRewrapAddsCurrentTrustedDeviceWhenLocalKeyExists(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
 		{"login", "--origin", server.URL},
 	} {
@@ -539,7 +539,7 @@ func TestRewrapUsesBatchTargetsAndWrites(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
 		{"add", "--workspace", "oclan-co", "prod/api/OTHER_KEY", "--value-file", testSecretFile(t, "other_value")},
 		{"login", "--origin", server.URL},

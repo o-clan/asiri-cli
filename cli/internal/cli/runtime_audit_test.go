@@ -84,7 +84,7 @@ func TestRuntimeAuditSyncReportsRuntimeLabelMetadata(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")},
 		{"grant", "--workspace", "qa", "wrangler", "cloudflare/WRANGLER_SECRET", "--inject-only"},
 	} {
@@ -203,7 +203,7 @@ func TestRuntimeAuditSyncFailureDoesNotBlockLocalUse(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")},
 		{"grant", "--workspace", "qa", "wrangler", "cloudflare/WRANGLER_SECRET", "--inject-only"},
 	} {
@@ -314,7 +314,7 @@ func TestRuntimeAuditBestEffortSyncIsolatesWorkspaceFailures(t *testing.T) {
 	var out bytes.Buffer
 	var errb bytes.Buffer
 	app := New(&out, &errb)
-	if code := app.Run([]string{"init", "--device", "qa-laptop"}); code != 0 {
+	if code := app.Run([]string{"init", "--device", "qa-laptop", "--workspace", "qa"}); code != 0 {
 		t.Fatalf("init failed with code %d stderr=%s", code, errb.String())
 	}
 	st, err := store.LoadDefault()
@@ -435,7 +435,7 @@ func TestStrictEnvelopeAuditAckGatesRuntimeRelease(t *testing.T) {
 			var errb bytes.Buffer
 			app := New(&out, &errb)
 			for _, step := range [][]string{
-				{"init", "--device", "qa-laptop"},
+				{"init", "--device", "qa-laptop", "--workspace", "qa"},
 				{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")},
 				{"grant", "--workspace", "qa", "wrangler", "cloudflare/WRANGLER_SECRET", "--inject-only"},
 			} {
@@ -585,7 +585,7 @@ func TestStrictEnvelopeAuditAckRequiresCompleteBatchBeforeRuntimeRelease(t *test
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "app/ONE", "--value-file", testSecretFile(t, "one")},
 		{"add", "--workspace", "qa", "app/TWO", "--value-file", testSecretFile(t, "two")},
 		{"grant", "--workspace", "qa", "sh", "app/ONE", "--inject-only"},
@@ -702,7 +702,7 @@ func TestStrictEnvelopeAuditAckFailureDoesNotAuditBufferedPeers(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "strict/ONE", "--value-file", testSecretFile(t, "one")},
 		{"add", "--workspace", "qa", "buffered/TWO", "--value-file", testSecretFile(t, "two")},
 		{"grant", "--workspace", "qa", "sh", "strict/ONE", "--inject-only"},
@@ -819,7 +819,7 @@ func TestStrictEnvelopeAuditAckAllowsDirectHumanRead(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "cloudflare/API_KEY", "--value-file", testSecretFile(t, "human_secret")},
 	} {
 		out.Reset()

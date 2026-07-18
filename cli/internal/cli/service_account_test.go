@@ -50,7 +50,7 @@ func TestServiceAccountSessionRejectsOtherExplicitWorkspaces(t *testing.T) {
 
 	var out, errb bytes.Buffer
 	app := New(&out, &errb)
-	if code := app.Run([]string{"init", "--device", "service-host"}); code != 0 {
+	if code := app.Run([]string{"init", "--device", "service-host", "--workspace", "other"}); code != 0 {
 		t.Fatalf("init failed: %s", errb.String())
 	}
 	if code := app.Run([]string{"add", "--workspace", "other", "app/KEY", "--value-file", testSecretFile(t, "must_not_release")}); code != 0 {

@@ -13,6 +13,27 @@ import (
 	"github.com/o-clan/asiri/cli/internal/store"
 )
 
+func TestFindWorkspaceResolvesCanonicalAliasAndID(t *testing.T) {
+	workspace := remoteWorkspaceResponse{ID: "org_personal", Slug: "pter-olom-dev-gmail", CanonicalSlug: "pter-olom-dev-gmail", Alias: "pter"}
+	for _, target := range []string{"org_personal", "pter-olom-dev-gmail", "pter"} {
+		resolved, ok := findWorkspace([]remoteWorkspaceResponse{workspace}, target)
+		if !ok || resolved.ID != workspace.ID {
+			t.Fatalf("workspace target %s did not resolve: %#v", target, resolved)
+		}
+	}
+}
+
+func TestWorkspaceSortKeepsPersonalFirst(t *testing.T) {
+	workspaces := []remoteWorkspaceResponse{
+		{ID: "org_custom", Slug: "xai-dev-8dhc3udj", Kind: "custom", Role: "owner"},
+		{ID: "org_personal", Slug: "pter-olom-dev-gmail", Kind: "personal", Role: "owner"},
+	}
+	sortRemoteWorkspaces(workspaces)
+	if workspaces[0].ID != "org_personal" {
+		t.Fatalf("personal workspace was not listed first: %#v", workspaces)
+	}
+}
+
 func TestWorkspaceTreeUsesOneCompactRequestAndRendersTextAndJSON(t *testing.T) {
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")
@@ -298,7 +319,7 @@ func TestWorkspaceListAndUseDoesNotBindLocalPrefixBeforePushOrSync(t *testing.T)
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
 		{"login", "--origin", server.URL},
 	} {

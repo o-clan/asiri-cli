@@ -78,7 +78,7 @@ func TestCLICommandMatrix(t *testing.T) {
 	if version := expectOK("--version"); !strings.Contains(version, "asiri "+Version) {
 		t.Fatalf("version output mismatch: %s", version)
 	}
-	expectOK("init", "--device", "qa-laptop")
+	expectOK("init", "--device", "qa-laptop", "--workspace", "qa")
 	expectFail("unknown command", "sync")
 	for _, step := range [][]string{
 		{"add", "openai/missing", "--value-file", testSecretFile(t, "value")},
@@ -161,7 +161,7 @@ func TestCLICommandMatrix(t *testing.T) {
 	}
 	expectOK("cache", "wipe")
 	expectFail("asiri is not initialized", "audit", "tail", "--workspace", "qa")
-	expectOK("init", "--device", "qa-laptop")
+	expectOK("init", "--device", "qa-laptop", "--workspace", "qa")
 	expectOK("local", "wipe", "--yes")
 	expectFail("asiri is not initialized", "audit", "tail", "--workspace", "qa")
 }

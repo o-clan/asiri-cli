@@ -114,7 +114,7 @@ func TestRemoteSecretDeleteMarksActiveRemoteVersionDeleted(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"add", "--workspace", "oclan-co", "local/asiri/PUSHED", "--value-file", testSecretFile(t, "secret_value")},
 		{"login", "--origin", server.URL},
 	} {
@@ -229,7 +229,7 @@ func TestRemoteSecretDeleteConfirmationAndPathGuards(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"login", "--origin", server.URL},
 	} {
 		out.Reset()
@@ -356,7 +356,7 @@ func TestRemoteSecretRestoreRestoresDeletedRemoteVersion(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"login", "--origin", server.URL},
 	} {
 		out.Reset()
@@ -463,7 +463,7 @@ func TestRemoteSecretDeleteFailureModes(t *testing.T) {
 			var errb bytes.Buffer
 			app := New(&out, &errb)
 			for _, step := range [][]string{
-				{"init", "--device", "qa-laptop"},
+				{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 				{"login", "--origin", server.URL},
 			} {
 				out.Reset()
@@ -580,7 +580,7 @@ func TestRemoteSecretBulkDeleteOnlyRemoteOnlyUnwrapped(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"add", "--workspace", "oclan-co", "local/asiri/LOCAL_COPY", "--value-file", testSecretFile(t, "secret_value")},
 		{"login", "--origin", server.URL},
 	} {
@@ -698,7 +698,7 @@ func TestRemoteRemoveDeletesRemoteOnlyRecordsWithToken(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"login", "--origin", server.URL},
 	} {
 		out.Reset()
@@ -828,7 +828,7 @@ func TestRemoteSecretBulkDeletePreflightsBeforeMutation(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"login", "--origin", server.URL},
 	} {
 		out.Reset()
@@ -948,7 +948,7 @@ func TestRemoteSecretBulkDeleteRestoresEarlierDeletesWhenLaterDeleteFails(t *tes
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"login", "--origin", server.URL},
 	} {
 		out.Reset()
@@ -1054,7 +1054,7 @@ func TestRemoteSecretBulkDeleteConfirmation(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"login", "--origin", server.URL},
 	} {
 		out.Reset()

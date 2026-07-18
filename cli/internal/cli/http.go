@@ -40,6 +40,55 @@ func postJSONBearer(st *store.FileStore, url, bearer string, body any, out any) 
 	return nil
 }
 
+func putJSONBearer(st *store.FileStore, url, bearer string, body any, out any) error {
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	bearer = latestControlPlaneBearer(st, bearer)
+	status, responseBody, err := sendJSONBearerMethod(st, http.DefaultClient, http.MethodPut, url, bearer, encoded)
+	if err != nil {
+		return err
+	}
+	if status == http.StatusUnauthorized {
+		if refreshed, ok, refreshErr := refreshBearerAfterUnauthorized(st, bearer); refreshErr != nil {
+			return refreshErr
+		} else if ok {
+			status, responseBody, err = sendJSONBearerMethod(st, http.DefaultClient, http.MethodPut, url, refreshed, encoded)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := decodeBearerResponse(status, responseBody, out, st); err != nil {
+		return err
+	}
+	if status < 200 || status >= 300 {
+		return fmt.Errorf("control plane returned HTTP %d", status)
+	}
+	return nil
+}
+
+func sendJSONBearerMethod(st *store.FileStore, client *http.Client, method, url, bearer string, encoded []byte) (int, []byte, error) {
+	request, err := http.NewRequest(method, url, bytes.NewReader(encoded))
+	if err != nil {
+		return 0, nil, err
+	}
+	request.Header.Set("content-type", "application/json")
+	request.Header.Set("accept", "application/json")
+	request.Header.Set("authorization", "Bearer "+bearer)
+	if err := signBearerRequest(st, request, encoded, bearer); err != nil {
+		return 0, nil, err
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(response.Body)
+	return response.StatusCode, responseBody, err
+}
+
 func postJSONBearerStatus(st *store.FileStore, url, bearer string, body any, out any) (int, error) {
 	return postJSONBearerStatusWithClient(st, http.DefaultClient, url, bearer, body, out)
 }

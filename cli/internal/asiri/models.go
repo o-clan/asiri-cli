@@ -54,6 +54,16 @@ type RemoteWorkspaceBinding struct {
 	BoundAt       time.Time `json:"boundAt,omitempty"`
 }
 
+type LocalWorkspace struct {
+	ID                string    `json:"id"`
+	CanonicalSlug     string    `json:"canonicalSlug"`
+	Alias             string    `json:"alias,omitempty"`
+	Kind              string    `json:"kind"`
+	RemoteWorkspaceID string    `json:"remoteWorkspaceId,omitempty"`
+	CreatedAt         time.Time `json:"createdAt"`
+	UpdatedAt         time.Time `json:"updatedAt"`
+}
+
 type RecoveryConfig struct {
 	RecipientID          string    `json:"recipientId"`
 	PublicKey            string    `json:"publicKey"`
@@ -150,6 +160,7 @@ type AuditLedgerHead struct {
 type State struct {
 	Version            int                               `json:"version"`
 	VaultID            string                            `json:"vaultId"`
+	Workspaces         map[string]LocalWorkspace         `json:"workspaces,omitempty"`
 	RemoteBindings     map[string]RemoteWorkspaceBinding `json:"remoteBindings,omitempty"`
 	UserID             string                            `json:"userId"`
 	LocalDeviceID      string                            `json:"localDeviceId,omitempty"`

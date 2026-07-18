@@ -176,21 +176,34 @@ func rejectUnknownArgs(args []string, allowedFlags ...string) error {
 }
 
 func (a App) workspaceSlugTarget(st *store.FileStore, value, command string) (string, error) {
-	if err := requireServiceAccountWorkspace(st, strings.TrimSpace(value)); err != nil {
+	trimmed := strings.TrimSpace(value)
+	if err := requireServiceAccountWorkspace(st, trimmed); err != nil {
 		return "", err
 	}
-	slug, err := localWorkspaceSlug(value)
-	if err == nil {
+	if st != nil {
+		if workspace, ok := st.LocalWorkspace(trimmed); ok {
+			return workspace.CanonicalSlug, nil
+		}
+	}
+	if st == nil {
+		slug, err := localWorkspaceSlug(trimmed)
+		if err != nil {
+			return "", fmt.Errorf("%s --workspace must be a workspace slug", command)
+		}
 		return slug, nil
 	}
-	if st == nil || st.State.ControlPlane == nil {
-		return "", fmt.Errorf("%s --workspace must be a workspace slug before login", command)
+	if st.State.ControlPlane == nil {
+		slug, err := localWorkspaceSlug(trimmed)
+		if err != nil {
+			return "", fmt.Errorf("%s --workspace must be a workspace slug before login", command)
+		}
+		return "", fmt.Errorf("local workspace %s not found; create it with `asiri workspace create %s`", slug, slug)
 	}
 	accessToken, accessErr := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
 	if accessErr != nil {
 		return "", accessErr
 	}
-	workspaceResult, listErr := listRemoteWorkspaceOverview(st, st.State.ControlPlane.Origin, accessToken, strings.TrimSpace(value), false, false)
+	workspaceResult, listErr := listRemoteWorkspaceOverview(st, st.State.ControlPlane.Origin, accessToken, trimmed, false, false)
 	if listErr != nil {
 		return "", listErr
 	}
@@ -272,6 +285,13 @@ func (a App) workspacePathTarget(st *store.FileStore, value, command string) (wo
 		return workspacePathTarget{}, err
 	}
 	known := knownWorkspaceSlugs(st)
+	localTarget := ""
+	if st != nil {
+		if workspace, ok := st.LocalWorkspace(trimmed); ok {
+			known[workspace.CanonicalSlug] = true
+			localTarget = workspace.CanonicalSlug
+		}
+	}
 	if st != nil && st.State.ControlPlane != nil && time.Until(st.State.ControlPlane.AccessTokenExpiresAt) > 30*time.Second {
 		if accessToken, err := st.ControlPlaneAccessToken(); err == nil && accessToken != "" {
 			if workspaceResult, err := listRemoteWorkspaceOverview(st, st.State.ControlPlane.Origin, accessToken, trimmed, false, false); err == nil {
@@ -280,7 +300,7 @@ func (a App) workspacePathTarget(st *store.FileStore, value, command string) (wo
 						known[workspace.Slug] = true
 					}
 				}
-				if len(workspaceResult.Organizations) == 1 {
+				if len(workspaceResult.Organizations) == 1 && localTarget == "" {
 					workspace := workspaceResult.Organizations[0]
 					if workspace.Slug == "" {
 						return workspacePathTarget{}, fmt.Errorf("workspace %s does not have a slug", value)
@@ -291,12 +311,18 @@ func (a App) workspacePathTarget(st *store.FileStore, value, command string) (wo
 			}
 		}
 	}
+	if localTarget != "" {
+		return workspacePathTarget{Slug: localTarget, KnownSlugs: known}, nil
+	}
 	slug, err := localWorkspaceSlug(trimmed)
 	if err != nil {
 		if st == nil || st.State.ControlPlane == nil {
 			return workspacePathTarget{}, fmt.Errorf("%s --workspace must be a workspace slug before login", command)
 		}
 		return workspacePathTarget{}, fmt.Errorf("%s --workspace must be a workspace slug", command)
+	}
+	if st != nil && st.State.ControlPlane == nil {
+		return workspacePathTarget{}, fmt.Errorf("local workspace %s not found; create it with `asiri workspace create %s`", slug, slug)
 	}
 	known[slug] = true
 	return workspacePathTarget{Slug: slug, KnownSlugs: known}, nil
@@ -306,7 +332,7 @@ func requireServiceAccountWorkspace(st *store.FileStore, requested string) error
 	if st == nil || st.State.ControlPlane == nil || st.State.ControlPlane.Source != "service-account" {
 		return nil
 	}
-	if requested == st.State.ControlPlane.WorkspaceSlug {
+	if requested == st.State.ControlPlane.WorkspaceSlug || requested == st.State.ControlPlane.WorkspaceID {
 		return nil
 	}
 	return fmt.Errorf("service account session is scoped to workspace %s", st.State.ControlPlane.WorkspaceSlug)
@@ -336,6 +362,14 @@ func knownWorkspaceSlugs(st *store.FileStore) map[string]bool {
 	for _, policy := range st.State.Policies {
 		if prefix := store.WorkspacePrefix(policy.ScopePattern); prefix != "" {
 			known[prefix] = true
+		}
+	}
+	for _, workspace := range st.LocalWorkspaces() {
+		if workspace.CanonicalSlug != "" {
+			known[workspace.CanonicalSlug] = true
+		}
+		if workspace.Alias != "" {
+			known[workspace.Alias] = true
 		}
 	}
 	return known

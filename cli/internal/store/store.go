@@ -205,7 +205,7 @@ func Load(path string) (*FileStore, error) {
 	store := &FileStore{Path: path}
 	bytes, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		store.State = asiri.State{Version: 1, Secrets: map[string]asiri.Secret{}, Policies: []asiri.Policy{}, Audit: []asiri.AuditEvent{}, RemoteBindings: map[string]asiri.RemoteWorkspaceBinding{}}
+		store.State = asiri.State{Version: 1, Secrets: map[string]asiri.Secret{}, Policies: []asiri.Policy{}, Audit: []asiri.AuditEvent{}, Workspaces: map[string]asiri.LocalWorkspace{}, RemoteBindings: map[string]asiri.RemoteWorkspaceBinding{}}
 		store.loadedStateKnown = true
 		return store, nil
 	}
@@ -225,6 +225,10 @@ func Load(path string) (*FileStore, error) {
 	if store.State.RemoteBindings == nil {
 		store.State.RemoteBindings = map[string]asiri.RemoteWorkspaceBinding{}
 	}
+	if store.State.Workspaces == nil {
+		store.State.Workspaces = map[string]asiri.LocalWorkspace{}
+	}
+	store.migrateLocalWorkspaces()
 	if store.State.EnvelopeAuditModes == nil {
 		store.State.EnvelopeAuditModes = map[string]asiri.AuditMode{}
 	}
@@ -282,6 +286,51 @@ func (s *FileStore) migratePreviousState(bytes []byte) {
 		WorkspaceID:   previous.RemoteWorkspaceID,
 		WorkspaceSlug: previous.RemoteWorkspaceSlug,
 		BoundAt:       boundAt,
+	}
+}
+
+func (s *FileStore) migrateLocalWorkspaces() {
+	if s.State.VaultID == "" {
+		return
+	}
+	prefixes := map[string]bool{}
+	for _, secret := range s.State.Secrets {
+		if prefix := WorkspacePrefix(secret.Scope); prefix != "" {
+			prefixes[prefix] = true
+		}
+	}
+	for _, policy := range s.State.Policies {
+		if prefix := WorkspacePrefix(policy.ScopePattern); prefix != "" {
+			prefixes[prefix] = true
+		}
+	}
+	for prefix := range s.State.RemoteBindings {
+		if prefix != "" {
+			prefixes[prefix] = true
+		}
+	}
+	for prefix := range prefixes {
+		if _, ok := s.LocalWorkspace(prefix); ok {
+			continue
+		}
+		binding := s.State.RemoteBindings[prefix]
+		kind := "local"
+		if binding.WorkspaceID != "" {
+			kind = "legacy"
+		}
+		workspaceID := deterministicLocalWorkspaceID(s.State.VaultID, prefix)
+		now := s.State.CreatedAt
+		if now.IsZero() {
+			now = time.Now().UTC()
+		}
+		s.State.Workspaces[workspaceID] = asiri.LocalWorkspace{
+			ID:                workspaceID,
+			CanonicalSlug:     prefix,
+			Kind:              kind,
+			RemoteWorkspaceID: binding.WorkspaceID,
+			CreatedAt:         now,
+			UpdatedAt:         now,
+		}
 	}
 }
 
@@ -722,6 +771,7 @@ func (s *FileStore) InitializeLocal() error {
 	s.State.Version = 1
 	s.State.VaultID = NewID("vault")
 	s.State.UserID = "local-human"
+	s.State.Workspaces = map[string]asiri.LocalWorkspace{}
 	s.State.KeyStore = KeyStorePlatform
 	if keystore.FileKeyStoreDir() != "" {
 		s.State.KeyStore = KeyStoreFile
@@ -1982,6 +2032,156 @@ func (s *FileStore) ActiveSecretRefs() []LocalSecretRef {
 	return refs
 }
 
+func deterministicLocalWorkspaceID(vaultID, slug string) string {
+	digest := sha256.Sum256([]byte(vaultID + ":" + slug))
+	return "lws_" + hex.EncodeToString(digest[:8])
+}
+
+func (s *FileStore) LocalWorkspace(value string) (asiri.LocalWorkspace, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return asiri.LocalWorkspace{}, false
+	}
+	for _, workspace := range s.State.Workspaces {
+		if workspace.ID == value || workspace.CanonicalSlug == value || workspace.Alias == value {
+			return workspace, true
+		}
+	}
+	return asiri.LocalWorkspace{}, false
+}
+
+func (s *FileStore) LocalWorkspaceByRemoteID(remoteWorkspaceID string) (asiri.LocalWorkspace, bool) {
+	for _, workspace := range s.State.Workspaces {
+		if remoteWorkspaceID != "" && workspace.RemoteWorkspaceID == remoteWorkspaceID {
+			return workspace, true
+		}
+	}
+	return asiri.LocalWorkspace{}, false
+}
+
+func (s *FileStore) LocalWorkspaces() []asiri.LocalWorkspace {
+	workspaces := make([]asiri.LocalWorkspace, 0, len(s.State.Workspaces))
+	for _, workspace := range s.State.Workspaces {
+		workspaces = append(workspaces, workspace)
+	}
+	sort.Slice(workspaces, func(i, j int) bool {
+		return workspaces[i].CanonicalSlug < workspaces[j].CanonicalSlug
+	})
+	return workspaces
+}
+
+func (s *FileStore) CreateLocalWorkspace(slug string) (asiri.LocalWorkspace, error) {
+	if err := s.RequireInitialized(); err != nil {
+		return asiri.LocalWorkspace{}, err
+	}
+	slug = strings.TrimSpace(slug)
+	if err := ValidateWorkspaceSlug(slug); err != nil {
+		return asiri.LocalWorkspace{}, err
+	}
+	if _, exists := s.LocalWorkspace(slug); exists {
+		return asiri.LocalWorkspace{}, fmt.Errorf("workspace %s already exists", slug)
+	}
+	if s.State.Workspaces == nil {
+		s.State.Workspaces = map[string]asiri.LocalWorkspace{}
+	}
+	now := time.Now().UTC()
+	workspace := asiri.LocalWorkspace{ID: NewID("lws"), CanonicalSlug: slug, Kind: "local", CreatedAt: now, UpdatedAt: now}
+	s.State.Workspaces[workspace.ID] = workspace
+	s.Audit(s.State.UserID, "local_workspace_created", "allowed", slug, "", "local workspace created", map[string]string{"workspace": workspace.ID})
+	if err := s.Save(); err != nil {
+		delete(s.State.Workspaces, workspace.ID)
+		return asiri.LocalWorkspace{}, err
+	}
+	return workspace, nil
+}
+
+func (s *FileStore) SetLocalWorkspaceAlias(value, alias string) (asiri.LocalWorkspace, error) {
+	workspace, ok := s.LocalWorkspace(value)
+	if !ok {
+		return asiri.LocalWorkspace{}, fmt.Errorf("local workspace %s not found", value)
+	}
+	alias = strings.TrimSpace(alias)
+	if err := ValidateWorkspaceSlug(alias); err != nil {
+		return asiri.LocalWorkspace{}, err
+	}
+	if alias == workspace.CanonicalSlug {
+		return asiri.LocalWorkspace{}, errors.New("workspace alias must differ from the canonical slug")
+	}
+	for _, existing := range s.State.Workspaces {
+		if existing.ID != workspace.ID && (existing.CanonicalSlug == alias || existing.Alias == alias) {
+			return asiri.LocalWorkspace{}, fmt.Errorf("workspace alias %s is already in use", alias)
+		}
+	}
+	workspace.Alias = alias
+	workspace.UpdatedAt = time.Now().UTC()
+	s.State.Workspaces[workspace.ID] = workspace
+	s.Audit(s.State.UserID, "local_workspace_alias_changed", "allowed", workspace.CanonicalSlug, "", "local workspace alias changed", map[string]string{"alias": alias, "workspace": workspace.ID})
+	if err := s.Save(); err != nil {
+		return asiri.LocalWorkspace{}, err
+	}
+	return workspace, nil
+}
+
+func (s *FileStore) RegisterRemoteWorkspace(canonicalSlug, alias, kind, remoteWorkspaceID string) (asiri.LocalWorkspace, error) {
+	if err := ValidateWorkspaceSlug(canonicalSlug); err != nil {
+		return asiri.LocalWorkspace{}, err
+	}
+	if alias != "" {
+		if err := ValidateWorkspaceSlug(alias); err != nil {
+			return asiri.LocalWorkspace{}, err
+		}
+	}
+	if remoteWorkspaceID == "" {
+		return asiri.LocalWorkspace{}, errors.New("remote workspace id is required")
+	}
+	if workspace, ok := s.LocalWorkspaceByRemoteID(remoteWorkspaceID); ok {
+		if workspace.CanonicalSlug != canonicalSlug {
+			return asiri.LocalWorkspace{}, fmt.Errorf("remote workspace %s canonical slug changed from %s to %s", remoteWorkspaceID, workspace.CanonicalSlug, canonicalSlug)
+		}
+		for _, existing := range s.State.Workspaces {
+			if existing.ID != workspace.ID && localWorkspaceIdentityCollision(existing, canonicalSlug, alias) {
+				return asiri.LocalWorkspace{}, fmt.Errorf("remote workspace identity collides with local workspace %s", existing.CanonicalSlug)
+			}
+		}
+		workspace.Alias = alias
+		workspace.Kind = firstNonEmptyString(kind, workspace.Kind, "remote")
+		workspace.UpdatedAt = time.Now().UTC()
+		s.State.Workspaces[workspace.ID] = workspace
+		return workspace, nil
+	}
+	for _, existing := range s.State.Workspaces {
+		if localWorkspaceIdentityCollision(existing, canonicalSlug, alias) {
+			return asiri.LocalWorkspace{}, fmt.Errorf("remote workspace identity collides with local workspace %s", existing.CanonicalSlug)
+		}
+	}
+	now := time.Now().UTC()
+	workspace := asiri.LocalWorkspace{ID: NewID("lws"), CanonicalSlug: canonicalSlug, Alias: alias, Kind: firstNonEmptyString(kind, "remote"), RemoteWorkspaceID: remoteWorkspaceID, CreatedAt: now, UpdatedAt: now}
+	s.State.Workspaces[workspace.ID] = workspace
+	if s.State.RemoteBindings == nil {
+		s.State.RemoteBindings = map[string]asiri.RemoteWorkspaceBinding{}
+	}
+	s.State.RemoteBindings[canonicalSlug] = asiri.RemoteWorkspaceBinding{WorkspaceID: remoteWorkspaceID, WorkspaceSlug: canonicalSlug, BoundAt: now}
+	return workspace, nil
+}
+
+func localWorkspaceIdentityCollision(existing asiri.LocalWorkspace, canonicalSlug, alias string) bool {
+	for _, value := range []string{canonicalSlug, alias} {
+		if value != "" && (existing.CanonicalSlug == value || existing.Alias == value) {
+			return true
+		}
+	}
+	return false
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func WorkspacePrefix(scope string) string {
 	trimmed := strings.Trim(scope, "/")
 	if trimmed == "" {
@@ -2074,6 +2274,11 @@ func (s *FileStore) BindWorkspacePrefix(prefix, remoteWorkspaceID, remoteWorkspa
 	}
 	s.State.Secrets = nextSecrets
 	s.State.RemoteBindings[prefix] = asiri.RemoteWorkspaceBinding{WorkspaceID: remoteWorkspaceID, WorkspaceSlug: remoteWorkspaceSlug, BoundAt: time.Now().UTC()}
+	if workspace, ok := s.LocalWorkspace(prefix); ok {
+		workspace.RemoteWorkspaceID = remoteWorkspaceID
+		workspace.UpdatedAt = time.Now().UTC()
+		s.State.Workspaces[workspace.ID] = workspace
+	}
 	s.removeKeyRefs(oldAccounts...)
 	s.Audit(s.State.UserID, "workspace_prefix_bound", "allowed", prefix, "", "local prefix bound to control-plane workspace id", map[string]string{"workspace": remoteWorkspaceID, "versions": fmt.Sprintf("%d", changed)})
 	if err := s.Save(); err != nil {
@@ -2178,6 +2383,22 @@ func (s *FileStore) RenameWorkspacePrefix(oldSlug, newSlug, remoteWorkspaceID st
 		if newScope, ok := ReplaceWorkspacePrefix(s.State.Policies[i].ScopePattern, oldSlug, newSlug); ok {
 			s.State.Policies[i].ScopePattern = newScope
 		}
+	}
+	workspace, hasWorkspace := s.LocalWorkspace(oldSlug)
+	if hasWorkspace {
+		for _, existing := range s.State.Workspaces {
+			if existing.ID != workspace.ID && (existing.CanonicalSlug == newSlug || existing.Alias == newSlug || existing.CanonicalSlug == oldSlug || existing.Alias == oldSlug) {
+				s.deleteDataKeyAccounts(newAccounts...)
+				return fmt.Errorf("cannot rename workspace prefix because workspace identity %s already exists", newSlug)
+			}
+		}
+		workspace.CanonicalSlug = newSlug
+		if workspace.Alias == "" {
+			workspace.Alias = oldSlug
+		}
+		workspace.RemoteWorkspaceID = remoteWorkspaceID
+		workspace.UpdatedAt = time.Now().UTC()
+		s.State.Workspaces[workspace.ID] = workspace
 	}
 	s.State.Secrets = nextSecrets
 	delete(s.State.RemoteBindings, oldSlug)

@@ -16,7 +16,7 @@ Commands:
   setup       Diagnose local, device, workspace, and recovery setup.
   login       Link this device to the hosted control plane.
   logout      Remove the hosted control-plane session from this device.
-  workspace   Inspect visible control-plane workspaces and access trees.
+  workspace   Create and inspect local workspaces, aliases, and hosted access trees.
   member      List workspace members and manage their secret access.
   service-account
               Manage and log in as service accounts.
@@ -97,7 +97,7 @@ func (a App) helpFor(path []string) int {
 	topic := strings.Join(path, " ")
 	switch topic {
 	case "init":
-		fmt.Fprint(a.Out, "Usage: asiri init [--device <device>] [--kind <laptop|server|ci|agent-host>]\n\nCreates a local encrypted vault and a trusted local device. Kind is inferred for common CI and headless Linux environments unless set explicitly. Local vaults do not have workspace slugs.\n")
+		fmt.Fprint(a.Out, "Usage: asiri init [--device <device>] [--kind <laptop|server|ci|agent-host>] [--workspace <slug>]\n\nCreates local encrypted state and a trusted device. Sign in next to use the hosted personal workspace, or provide --workspace to create an offline workspace during initialization.\n")
 	case "setup":
 		fmt.Fprint(a.Out, "Usage: asiri setup <command>\n\nCommands:\n  doctor  Diagnose setup readiness and print next safe steps.\n")
 	case "setup doctor":
@@ -111,9 +111,13 @@ func (a App) helpFor(path []string) int {
 	case "whoami":
 		fmt.Fprint(a.Out, "Usage: asiri whoami\n\nShows the signed-in control-plane identity and authentication device. User sessions do not select a workspace.\n")
 	case "workspace":
-		fmt.Fprint(a.Out, "Usage: asiri workspace <command>\n\nCommands:\n  list   Show visible workspaces, role, device trust, account write access, and id.\n  tree   Show users, trusted devices, effective access, and secret counts.\n")
+		fmt.Fprint(a.Out, "Usage: asiri workspace <command>\n\nCommands:\n  create   Create a local workspace.\n  alias    Set a local or account-scoped workspace alias.\n  list     Show local or visible hosted workspaces.\n  tree     Show users, trusted devices, effective access, and secret counts.\n")
+	case "workspace create":
+		fmt.Fprint(a.Out, "Usage: asiri workspace create <slug>\n\nCreates an offline-capable local workspace. Its first hosted sync assigns an immutable canonical slug and retains the selected local alias, or this slug when no alias was selected.\n")
+	case "workspace alias":
+		fmt.Fprint(a.Out, "Usage: asiri workspace alias set --workspace <canonical-slug-or-alias> <alias>\n\nAliases are unique for one user and may be reused by different users.\n")
 	case "workspace list":
-		fmt.Fprint(a.Out, "Usage: asiri workspace list\n\nShows visible workspaces as a table. This device controls pull and workspace-scoped push. Account write means the user owns the workspace or has effective secret-write capability.\n")
+		fmt.Fprint(a.Out, "Usage: asiri workspace list\n\nShows canonical workspace slugs and user-scoped aliases. Offline it lists local workspaces; after login it lists visible hosted workspaces.\n")
 	case "workspace tree":
 		fmt.Fprint(a.Out, "Usage: asiri workspace tree --workspace <slug> [--json] [--include-revoked]\n\nShows one compact workspace access tree for the workspace owner, including active service-account sessions on trusted devices. Access belongs to users; devices are listed separately because trust only determines where permitted secrets can be decrypted. Secret values are never returned.\n")
 	case "member":
@@ -185,7 +189,7 @@ func (a App) helpFor(path []string) int {
 	case "get":
 		fmt.Fprint(a.Out, "Usage: asiri get --workspace <slug> <scope/name> [--agent <agent>]\n\nReads a local secret when policy allows raw read for the human user or named agent label. Use short paths without the workspace prefix.\n")
 	case "list":
-		fmt.Fprint(a.Out, "Usage: asiri list --workspace <slug> [filter] [--local|--remote] [--status <status>] [--include-inactive]\n\nShows secret metadata for one explicit workspace only. Values are never printed. Inactive remote versions are hidden unless --include-inactive is set.\n")
+		fmt.Fprint(a.Out, "Usage: asiri list --workspace <canonical-slug-or-alias> [filter] [--local|--remote] [--status <status>] [--include-inactive]\n\nShows metadata for one explicit local or hosted workspace. A fresh offline vault will suggest creating a workspace first. Values are never printed.\n")
 	case "rotate":
 		fmt.Fprint(a.Out, "Usage: asiri rotate --workspace <slug> <scope/name> --stdin|--value-file <path>\n\nAdds a new local encrypted version for an existing secret. Use short paths without the workspace prefix.\n")
 	case "rm":

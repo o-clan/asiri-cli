@@ -60,7 +60,7 @@ func TestConcurrentAddsAcrossProcessesPreserveEverySecret(t *testing.T) {
 	t.Cleanup(keystore.ClearConfiguredFileKeyStoreDir)
 	var out, errb bytes.Buffer
 	app := New(&out, &errb)
-	if code := app.Run([]string{"init", "--device", "concurrency-test"}); code != 0 {
+	if code := app.Run([]string{"init", "--device", "concurrency-test", "--workspace", "oclan-co"}); code != 0 {
 		t.Fatalf("init failed: %s", errb.String())
 	}
 
@@ -113,6 +113,9 @@ func TestLoginUsesLifecycleStateLock(t *testing.T) {
 	if !commandUsesLifecycleStateLock("login") {
 		t.Fatal("login must hold the state lock while replacing session key material")
 	}
+	if !commandUsesLifecycleStateLock("workspace") {
+		t.Fatal("workspace mutations must hold the lifecycle state lock")
+	}
 }
 
 func TestRawReadDoesNotPrintSecretWhenAuditSaveFails(t *testing.T) {
@@ -125,7 +128,7 @@ func TestRawReadDoesNotPrintSecretWhenAuditSaveFails(t *testing.T) {
 	var out, errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "do_not_print")},
 	} {
 		out.Reset()
@@ -221,7 +224,7 @@ func TestListMergesRequestedWorkspaceRemoteSecrets(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"add", "--workspace", "oclan-co", "local/asiri/PUSHED", "--value-file", testSecretFile(t, "secret_value")},
 		{"add", "--workspace", "oclan-co", "local/asiri/UNPUSHED", "--value-file", testSecretFile(t, "secret_value")},
 		{"login", "--origin", server.URL},
@@ -336,7 +339,7 @@ func TestListLocalDoesNotRequireRemoteAuth(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"login", "--origin", server.URL},
 	} {
 		out.Reset()
@@ -420,7 +423,7 @@ func TestListExplainsRewrapLocationForUnusableRemoteKeys(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"add", "--workspace", "oclan-co", "local/asiri/LOCAL_NEEDS_REWRAP", "--value-file", testSecretFile(t, "secret_value")},
 		{"login", "--origin", server.URL},
 	} {
@@ -501,7 +504,7 @@ func TestLocalWipeDoesNotCallRemoteAPIs(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
 		{"login", "--origin", server.URL},
 	} {

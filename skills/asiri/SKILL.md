@@ -11,7 +11,8 @@ Asiri is a secrets access layer. Treat it as the source of operational secrets a
 
 - Never print, paste, log, summarize, or store secret values.
 - Prefer metadata-only checks: list workspaces, list secret names, check status, inspect audit.
-- Use exactly one `--workspace <slug>` on every workspace-scoped command. Human account/device sessions never select or switch an active CLI workspace.
+- Use exactly one `--workspace <canonical-slug-or-alias>` on hosted workspace-scoped commands. Human account/device sessions never select or switch an active CLI workspace.
+- Require an explicit canonical slug or alias for local and hosted secret listing. If a fresh offline vault has no workspace, guide the user to `asiri workspace create <slug>`.
 - Use exact workspace slugs and secret paths from the user or from `asiri workspace list` / `asiri list`.
 - Prefer `asiri env` or `asiri mount` over raw reads.
 - Use raw reads only when the user explicitly asks and policy allows it; redirect verification reads to `/dev/null`.
@@ -37,6 +38,41 @@ asiri list --workspace <workspace>
 
 `asiri list --workspace <workspace>` is safe for normal inspection. It shows
 names, hashes, sync state, and write status. It does not print plaintext.
+
+## Workspace Identity
+
+Treat the canonical slug as the immutable storage, encryption, binding, and
+sync identity. Treat an alias as a user-scoped CLI shortcut. Aliases may repeat
+across users but must be unique within one user's visible workspaces.
+
+Offline users can create any valid local workspace slug:
+
+```sh
+asiri workspace create <local-slug>
+```
+
+Do not require local workspace creation before control-plane sign-in. Signup
+creates the verified-email personal workspace, which remains the account
+default and is listed first. Local workspace creation and sync never change
+that default. Continue to pass `--workspace` explicitly to every
+workspace-scoped command.
+
+On first push, Asiri assigns a canonical slug with an eight-character suffix,
+atomically re-encrypts the local workspace under it, and retains the former
+local slug as that user's alias unless the user already selected another local
+alias. If first sync fails during local migration,
+preserve the vault and key material and retry the same workspace; its stable
+local ID makes remote provisioning idempotent.
+
+Set or change the signed-in user's alias without changing canonical identity:
+
+```sh
+asiri workspace alias set --workspace <canonical-slug-or-current-alias> <new-alias>
+```
+
+Never infer workspace identity from an alias or rewrite an existing hosted
+canonical slug. New devices store canonical slugs and receive the signed-in
+user's aliases for CLI resolution.
 
 ## Use A Secret
 

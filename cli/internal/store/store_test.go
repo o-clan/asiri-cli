@@ -1008,6 +1008,56 @@ func TestRenameWorkspacePrefixReencryptsLocalSecrets(t *testing.T) {
 	}
 }
 
+func TestRegisterRemoteWorkspacePreservesLocalWorkspaceAndRejectsIdentityCollisions(t *testing.T) {
+	st := testInitializedStore(t)
+	local, err := st.CreateLocalWorkspace("xai-dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.RegisterRemoteWorkspace("personal-example-com", "personal", "personal", "org_personal"); err != nil {
+		t.Fatal(err)
+	}
+	preserved, ok := st.LocalWorkspace(local.ID)
+	if !ok || preserved.CanonicalSlug != "xai-dev" || preserved.RemoteWorkspaceID != "" {
+		t.Fatalf("local workspace was replaced by remote registration: %#v", preserved)
+	}
+	if len(st.State.Workspaces) != 2 {
+		t.Fatalf("expected separate local and remote workspaces, got %#v", st.State.Workspaces)
+	}
+	if _, err := st.RegisterRemoteWorkspace("xai-dev", "remote-xai", "custom", "org_xai"); err == nil || !strings.Contains(err.Error(), "collides") {
+		t.Fatalf("expected canonical collision, got %v", err)
+	}
+	if _, err := st.SetLocalWorkspaceAlias(local.ID, "xai"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.RegisterRemoteWorkspace("xai", "remote-alias", "custom", "org_alias"); err == nil || !strings.Contains(err.Error(), "collides") {
+		t.Fatalf("expected local alias collision, got %v", err)
+	}
+}
+
+func TestMigratedUnboundWorkspaceUsesNewCanonicalizationKind(t *testing.T) {
+	st := testInitializedStore(t)
+	st.State.Devices = append(st.State.Devices, asiri.Device{ID: "dev_test", Name: "test", Kind: "laptop", Status: asiri.DeviceTrusted})
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddSecret("xai-dev/app/API_KEY", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	st.State.Workspaces = nil
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := Load(st.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, ok := reloaded.LocalWorkspace("xai-dev")
+	if !ok || workspace.Kind != "local" || workspace.RemoteWorkspaceID != "" {
+		t.Fatalf("migrated offline workspace should use first-sync canonicalization: %#v", workspace)
+	}
+}
+
 func TestRemoveSecretKeepsDataKeyWhenSaveFails(t *testing.T) {
 	st := testInitializedStore(t)
 	st.State.Devices = append(st.State.Devices, asiri.Device{ID: "dev_test", Name: "test", Kind: "laptop", Status: asiri.DeviceTrusted})

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/o-clan/asiri/cli/internal/store"
 	"github.com/zalando/go-keyring"
 )
 
@@ -25,6 +26,26 @@ func testSecretFile(t *testing.T, value string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func linkLocalWorkspaceForTest(t *testing.T, workspace string, remoteWorkspaceID ...string) {
+	t.Helper()
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteID := ""
+	if len(remoteWorkspaceID) > 0 {
+		remoteID = remoteWorkspaceID[0]
+	} else if st.State.ControlPlane != nil {
+		remoteID = st.State.ControlPlane.WorkspaceID
+	}
+	if remoteID == "" {
+		t.Fatalf("remote workspace id is required for test workspace %s", workspace)
+	}
+	if err := st.BindWorkspacePrefix(workspace, remoteID, workspace); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func requireOrderedText(t *testing.T, value string, expected ...string) {

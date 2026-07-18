@@ -189,9 +189,18 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
 		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	linkLocalWorkspaceForTest(t, "oclan-co")
+	for _, step := range [][]string{
 		{"push", "--workspace", "oclan-co"},
 		{"push", "--workspace", "oclan-co"},
 		{"pull", "--workspace", "oclan-co"},
@@ -214,7 +223,7 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 	}
 }
 
-func TestPushDryRunFirstWorkspaceEvaluatesRemoteState(t *testing.T) {
+func TestPushDryRunLinkedWorkspaceEvaluatesRemoteState(t *testing.T) {
 	for _, tc := range []struct {
 		name                 string
 		conflict             bool
@@ -396,7 +405,7 @@ func TestPushDryRunFirstWorkspaceEvaluatesRemoteState(t *testing.T) {
 			var errb bytes.Buffer
 			app := New(&out, &errb)
 			for _, step := range [][]string{
-				{"init", "--device", "qa-laptop"},
+				{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 				{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
 				{"login", "--origin", server.URL},
 			} {
@@ -406,6 +415,7 @@ func TestPushDryRunFirstWorkspaceEvaluatesRemoteState(t *testing.T) {
 					t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
 				}
 			}
+			linkLocalWorkspaceForTest(t, "oclan-co")
 			st, err := store.LoadDefault()
 			if err != nil {
 				t.Fatal(err)
@@ -436,8 +446,8 @@ func TestPushDryRunFirstWorkspaceEvaluatesRemoteState(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, ok := reloaded.RemoteBindingForPrefix("oclan-co"); ok {
-				t.Fatal("dry-run should not persist a workspace prefix binding")
+			if binding, ok := reloaded.RemoteBindingForPrefix("oclan-co"); !ok || binding.WorkspaceID != reloaded.State.ControlPlane.WorkspaceID {
+				t.Fatalf("dry-run changed the existing workspace prefix binding: %#v", binding)
 			}
 		})
 	}
@@ -565,7 +575,7 @@ func TestPushDryRunRemoteWorkspaceDoesNotSwitchAccountSession(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "asiri-dev"},
 		{"add", "--workspace", "asiri-dev", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
 		{"login", "--origin", server.URL},
 	} {
@@ -575,6 +585,7 @@ func TestPushDryRunRemoteWorkspaceDoesNotSwitchAccountSession(t *testing.T) {
 			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
 		}
 	}
+	linkLocalWorkspaceForTest(t, "asiri-dev", "org_asiri")
 	out.Reset()
 	errb.Reset()
 	if code := app.Run([]string{"push", "--workspace", "asiri-dev", "--dry-run"}); code != 0 {
@@ -590,8 +601,8 @@ func TestPushDryRunRemoteWorkspaceDoesNotSwitchAccountSession(t *testing.T) {
 	if reloaded.State.ControlPlane == nil || reloaded.State.ControlPlane.WorkspaceID != "org_oclan" || reloaded.State.ControlPlane.WorkspaceSlug != "oclan-co" {
 		t.Fatalf("dry-run changed the account session: %#v", reloaded.State.ControlPlane)
 	}
-	if _, ok := reloaded.RemoteBindingForPrefix("asiri-dev"); ok {
-		t.Fatal("dry-run should not persist remote workspace binding")
+	if binding, ok := reloaded.RemoteBindingForPrefix("asiri-dev"); !ok || binding.WorkspaceID != "org_asiri" {
+		t.Fatalf("dry-run changed the existing remote workspace binding: %#v", binding)
 	}
 }
 
@@ -663,7 +674,7 @@ func TestPushFailsWhenTrustedDeviceDiscoveryUnavailable(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
 		{"login", "--origin", server.URL},
 	} {
@@ -674,6 +685,7 @@ func TestPushFailsWhenTrustedDeviceDiscoveryUnavailable(t *testing.T) {
 		}
 	}
 
+	linkLocalWorkspaceForTest(t, "oclan-co")
 	out.Reset()
 	errb.Reset()
 	if code := app.Run([]string{"push", "--workspace", "oclan-co"}); code == 0 {
@@ -715,7 +727,7 @@ func TestPushTargetSelectionSupportsScopesSecretsAndVersions(t *testing.T) {
 	var errb bytes.Buffer
 	app := New(&out, &errb)
 	for _, step := range [][]string{
-		{"init", "--device", "qa-laptop"},
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
 		{"add", "--workspace", "oclan-co", "local/asiri/API_KEY", "--value-file", testSecretFile(t, "secret_value")},
 		{"add", "--workspace", "oclan-co", "prod/github/SYNC_KEY", "--value-file", testSecretFile(t, "sync_value")},
 	} {

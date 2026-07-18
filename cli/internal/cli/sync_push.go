@@ -32,6 +32,13 @@ func (a App) push(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
+	pushOptions, accessToken, stop, err := a.prepareLocalWorkspacePush(st, pushOptions, accessToken)
+	if err != nil {
+		return a.fail(err)
+	}
+	if stop {
+		return 0
+	}
 	target, accessToken, err := a.pushWorkspaceTarget(st, accessToken, pushOptions.Workspace)
 	if err != nil {
 		return a.fail(err)
@@ -170,6 +177,47 @@ func (a App) push(st *store.FileStore, args []string) int {
 		fmt.Fprintf(a.Out, "✓ Rewrapped %d trusted-device key(s) across %d existing secret version(s)\n", rewrappedKeys, rewrappedSecrets)
 	}
 	return 0
+}
+
+func (a App) prepareLocalWorkspacePush(st *store.FileStore, options pushOptions, accessToken string) (pushOptions, string, bool, error) {
+	workspace, ok := st.LocalWorkspace(options.Workspace)
+	if !ok {
+		return options, accessToken, false, nil
+	}
+	if workspace.RemoteWorkspaceID != "" {
+		options.Workspace = workspace.CanonicalSlug
+		return options, accessToken, false, nil
+	}
+	desiredAlias := workspace.Alias
+	if desiredAlias == "" {
+		desiredAlias = workspace.CanonicalSlug
+	}
+	if options.DryRun {
+		fmt.Fprintf(a.Out, "Workspace %s would receive a canonical slug in the form %s-<8 characters>; alias %s would be retained.\n", workspace.CanonicalSlug, workspace.CanonicalSlug, desiredAlias)
+		return options, accessToken, true, nil
+	}
+	if err := requireHumanMemberSession(st); err != nil {
+		return options, accessToken, false, err
+	}
+	var remote remoteWorkspaceResponse
+	endpoint := strings.TrimRight(st.State.ControlPlane.Origin, "/") + "/v1/workspaces/sync"
+	body := map[string]string{"localWorkspaceId": workspace.ID, "localSlug": workspace.CanonicalSlug, "alias": desiredAlias}
+	if err := postJSONBearer(st, endpoint, accessToken, body, &remote); err != nil {
+		return options, accessToken, false, err
+	}
+	if remote.ID == "" || remote.Slug == "" {
+		return options, accessToken, false, errors.New("control plane did not return the canonical workspace identity")
+	}
+	if remote.Alias != desiredAlias {
+		return options, accessToken, false, errors.New("control plane returned a different workspace alias")
+	}
+	oldSlug := workspace.CanonicalSlug
+	if err := st.RenameWorkspacePrefix(oldSlug, remote.Slug, remote.ID); err != nil {
+		return options, accessToken, false, err
+	}
+	options.Workspace = remote.Slug
+	fmt.Fprintf(a.Out, "✓ Workspace %s synced as %s; alias %s retained\n", oldSlug, remote.Slug, desiredAlias)
+	return options, latestControlPlaneBearer(st, accessToken), false, nil
 }
 
 type pushOptions struct {

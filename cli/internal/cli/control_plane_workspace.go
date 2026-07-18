@@ -44,11 +44,11 @@ func requireRemoteWorkspace(workspaces []remoteWorkspaceResponse, requested stri
 
 func (a App) remoteWorkspaceTarget(st *store.FileStore, accessToken, requested string) (remoteWorkspaceResponse, string, error) {
 	requested = strings.TrimSpace(requested)
+	if requested == "" {
+		return remoteWorkspaceResponse{}, "", errors.New("--workspace requires a canonical slug, alias, or workspace id")
+	}
 	if err := requireServiceAccountWorkspace(st, requested); err != nil {
 		return remoteWorkspaceResponse{}, "", err
-	}
-	if _, err := localWorkspaceSlug(requested); err != nil {
-		return remoteWorkspaceResponse{}, "", errors.New("--workspace requires a workspace slug")
 	}
 	workspaceResult, err := listRemoteWorkspaceOverview(st, st.State.ControlPlane.Origin, accessToken, requested, false, false)
 	if err != nil {
@@ -72,8 +72,8 @@ func (a App) remoteWorkspaceTarget(st *store.FileStore, accessToken, requested s
 
 func (a App) pushWorkspaceTarget(st *store.FileStore, accessToken, requested string) (remoteWorkspaceResponse, string, error) {
 	requested = strings.TrimSpace(requested)
-	if _, err := localWorkspaceSlug(requested); err != nil {
-		return remoteWorkspaceResponse{}, "", errors.New("--workspace requires a workspace slug")
+	if requested == "" {
+		return remoteWorkspaceResponse{}, "", errors.New("--workspace requires a canonical slug, alias, or workspace id")
 	}
 	workspace, token, err := a.remoteWorkspaceTarget(st, accessToken, requested)
 	if err != nil {
