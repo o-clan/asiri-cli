@@ -74,6 +74,46 @@ func listRemoteDevices(st *store.FileStore, origin, orgID, accessToken string, i
 	return result.Devices, nil
 }
 
+func getRemoteWorkspaceTree(st *store.FileStore, origin, workspace, accessToken string, includeRevoked bool) (remoteWorkspaceTreeResponse, error) {
+	var result remoteWorkspaceTreeResponse
+	endpoint := fmt.Sprintf("%s/v1/workspace-tree?workspace=%s", strings.TrimRight(origin, "/"), url.QueryEscape(workspace))
+	if includeRevoked {
+		endpoint += "&includeRevoked=1"
+	}
+	if err := getJSONBearer(st, endpoint, accessToken, &result); err != nil {
+		return result, err
+	}
+	if err := validateRemoteWorkspaceTree(result, workspace, includeRevoked); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+func validateRemoteWorkspaceTree(tree remoteWorkspaceTreeResponse, workspace string, includeRevoked bool) error {
+	if tree.Workspace.ID == "" || tree.Workspace.Slug != workspace {
+		return errors.New("control plane returned a workspace tree for the wrong workspace")
+	}
+	if tree.Workspace.SecretCount < 0 {
+		return errors.New("control plane returned an invalid workspace secret count")
+	}
+	for _, user := range tree.Users {
+		if user.ID == "" || user.SecretCount < 0 || user.SecretCount > tree.Workspace.SecretCount {
+			return errors.New("control plane returned invalid workspace user counts")
+		}
+		for _, device := range user.Devices {
+			if device.ID == "" || (!includeRevoked && device.Status == "revoked") {
+				return errors.New("control plane returned invalid workspace device metadata")
+			}
+		}
+		for _, access := range user.Access {
+			if access.SecretCount < 0 || access.SecretCount > tree.Workspace.SecretCount || (access.Scope != workspace && !strings.HasPrefix(access.Scope, workspace+"/")) {
+				return errors.New("control plane returned invalid workspace access metadata")
+			}
+		}
+	}
+	return nil
+}
+
 func listRemoteWrappingDevices(st *store.FileStore, origin, orgID, scope, secretName, accessToken string) ([]remoteDeviceResponse, error) {
 	endpoint := fmt.Sprintf("%s/v1/devices?orgId=%s&scope=%s&secretName=%s", strings.TrimRight(origin, "/"), url.QueryEscape(orgID), url.QueryEscape(scope), url.QueryEscape(secretName))
 	for attempt := 0; attempt < 3; attempt++ {

@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"text/tabwriter"
 
@@ -58,11 +60,122 @@ func (a App) workspace(st *store.FileStore, args []string) int {
 			fmt.Fprintln(a.Out, "\nThis device controls pull and workspace-scoped push. Use the NEXT command to trust it where needed.")
 		}
 		return 0
+	case "tree":
+		workspaceArg, remaining, err := splitWorkspaceFlag(args[1:], "workspace tree", true)
+		if err != nil {
+			return a.fail(err)
+		}
+		includeRevoked := hasFlag(remaining, "--include-revoked")
+		jsonOutput := hasFlag(remaining, "--json")
+		if err := rejectUnknownArgs(remaining, "--include-revoked", "--json"); err != nil {
+			return a.fail(err)
+		}
+		if err := requireHumanMemberSession(st); err != nil {
+			return a.fail(err)
+		}
+		tree, err := getRemoteWorkspaceTree(st, st.State.ControlPlane.Origin, workspaceArg, accessToken, includeRevoked)
+		if err != nil {
+			return a.fail(err)
+		}
+		if jsonOutput {
+			encoder := json.NewEncoder(a.Out)
+			encoder.SetIndent("", "  ")
+			if err := encoder.Encode(tree); err != nil {
+				return a.fail(err)
+			}
+			return 0
+		}
+		printWorkspaceTree(a.Out, tree)
+		return 0
 	case "use":
 		return a.fail(errors.New("workspace use has been removed; pass --workspace <slug> to workspace-scoped commands"))
 	default:
 		return a.fail(fmt.Errorf("unknown workspace command %q", args[0]))
 	}
+}
+
+func printWorkspaceTree(out io.Writer, tree remoteWorkspaceTreeResponse) {
+	fmt.Fprintf(out, "%s · %s\n", safeMemberOutput(tree.Workspace.Slug), secretCountLabel(tree.Workspace.SecretCount))
+	for userIndex, user := range tree.Users {
+		userLast := userIndex == len(tree.Users)-1
+		userBranch := "├──"
+		userIndent := "│   "
+		if userLast {
+			userBranch = "└──"
+			userIndent = "    "
+		}
+		fmt.Fprintf(out, "%s %s · %s · %d accessible\n", userBranch, workspaceTreeUserLabel(user), safeMemberOutput(user.Role), user.SecretCount)
+		fmt.Fprintf(out, "%s├── devices\n", userIndent)
+		if len(user.Devices) == 0 {
+			fmt.Fprintf(out, "%s│   └── none\n", userIndent)
+		} else {
+			for index, device := range user.Devices {
+				branch := "├──"
+				if index == len(user.Devices)-1 {
+					branch = "└──"
+				}
+				fmt.Fprintf(out, "%s│   %s %s · %s · %s\n", userIndent, branch, safeMemberOutput(device.Name), safeMemberOutput(device.Kind), safeMemberOutput(device.Status))
+			}
+		}
+		fmt.Fprintf(out, "%s└── access\n", userIndent)
+		if len(user.Access) == 0 {
+			fmt.Fprintf(out, "%s    └── none · 0 secrets\n", userIndent)
+			continue
+		}
+		for index, access := range user.Access {
+			branch := "├──"
+			if index == len(user.Access)-1 {
+				branch = "└──"
+			}
+			fmt.Fprintf(out, "%s    %s %s · %s · %s\n", userIndent, branch, workspaceTreeAccessLabel(tree.Workspace.Slug, access), workspaceTreeAccessMode(access), secretCountLabel(access.SecretCount))
+		}
+	}
+}
+
+func workspaceTreeUserLabel(user remoteWorkspaceTreeUser) string {
+	label := strings.TrimSpace(safeMemberOutput(user.DisplayName))
+	if label == "" {
+		label = strings.TrimSpace(safeMemberOutput(user.Email))
+	}
+	if label == "" {
+		return safeMemberOutput(user.ID)
+	}
+	email := safeMemberOutput(user.Email)
+	if email != "" && !strings.EqualFold(label, email) {
+		return fmt.Sprintf("%s <%s>", label, email)
+	}
+	return label
+}
+
+func workspaceTreeAccessLabel(workspaceSlug string, access remoteWorkspaceTreeAccess) string {
+	scope := strings.TrimPrefix(access.Scope, workspaceSlug+"/")
+	if access.Scope == workspaceSlug || scope == "" {
+		scope = "/"
+	}
+	if access.TargetType == "secret" && access.SecretName != "" {
+		if scope == "/" {
+			return "/" + safeMemberOutput(access.SecretName)
+		}
+		return safeMemberOutput(scope) + "/" + safeMemberOutput(access.SecretName)
+	}
+	return safeMemberOutput(scope)
+}
+
+func workspaceTreeAccessMode(access remoteWorkspaceTreeAccess) string {
+	if access.TargetType == "secret" {
+		return "secret"
+	}
+	if access.IncludeDescendants {
+		return "recursive"
+	}
+	return "direct"
+}
+
+func secretCountLabel(count int) string {
+	if count == 1 {
+		return "1 secret"
+	}
+	return fmt.Sprintf("%d secrets", count)
 }
 
 func (a App) setup(st *store.FileStore, args []string) int {

@@ -13,6 +13,151 @@ import (
 	"github.com/o-clan/asiri/cli/internal/store"
 )
 
+func TestWorkspaceTreeUsesOneCompactRequestAndRendersTextAndJSON(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	treeRequests := 0
+	includeRevokedSeen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode": "dc_workspace_tree", "userCode": "TREE-1234",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=TREE-1234", "expiresIn": 30, "interval": 0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "approved", "orgId": "org_oclan", "workspaceSlug": "oclan-co", "userId": "usr_owner", "deviceId": "dev_owner",
+				"accessToken": "at_workspace_tree", "refreshToken": "rt_workspace_tree", "expiresIn": 3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/workspace-tree":
+			treeRequests++
+			if r.Header.Get("authorization") != "Bearer at_workspace_tree" {
+				t.Fatalf("unexpected tree auth header: %s", r.Header.Get("authorization"))
+			}
+			if r.URL.Query().Get("workspace") != "oclan-co" {
+				t.Fatalf("unexpected tree workspace: %s", r.URL.RawQuery)
+			}
+			includeRevokedSeen = r.URL.Query().Get("includeRevoked") == "1"
+			devices := []map[string]any{{"id": "dev_owner", "name": "owner-laptop", "kind": "laptop", "status": "trusted"}}
+			if includeRevokedSeen {
+				devices = append(devices, map[string]any{"id": "dev_old", "name": "old-laptop", "kind": "laptop", "status": "revoked"})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"workspace": map[string]any{"id": "org_oclan", "slug": "oclan-co", "secretCount": 3},
+				"users": []map[string]any{
+					{"id": "usr_owner", "displayName": "Owner", "email": "owner@example.com", "role": "owner", "status": "active", "accessibleSecretCount": 3, "devices": devices, "access": []map[string]any{{"targetType": "envelope", "scope": "oclan-co", "includeDescendants": true, "matchedSecretCount": 3}}},
+					{"id": "usr_member", "displayName": "Member", "email": "member@example.com", "role": "member", "status": "active", "accessibleSecretCount": 1, "devices": []map[string]any{}, "access": []map[string]any{{"grantId": "grant_1", "targetType": "secret", "scope": "oclan-co/prod/api", "secretName": "TOKEN", "matchedSecretCount": 1}}},
+				},
+			})
+		case "/v1/orgs":
+			t.Fatal("workspace tree should not require a separate workspace-list request")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{{"init", "--device", "owner-laptop"}, {"login", "--origin", server.URL}} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"workspace", "tree", "--workspace", "oclan-co"}); code != 0 {
+		t.Fatalf("workspace tree failed with code %d stderr=%s", code, errb.String())
+	}
+	for _, expected := range []string{"oclan-co · 3 secrets", "Owner <owner@example.com> · owner · 3 accessible", "owner-laptop · laptop · trusted", "/ · recursive · 3 secrets", "Member <member@example.com> · member · 1 accessible", "prod/api/TOKEN · secret · 1 secret", "none"} {
+		if !strings.Contains(out.String(), expected) {
+			t.Fatalf("workspace tree missing %q: %s", expected, out.String())
+		}
+	}
+	if treeRequests != 1 {
+		t.Fatalf("expected one tree request, got %d", treeRequests)
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"workspace", "tree", "--workspace", "oclan-co", "--json"}); code != 0 {
+		t.Fatalf("workspace tree JSON failed with code %d stderr=%s", code, errb.String())
+	}
+	var tree remoteWorkspaceTreeResponse
+	if err := json.Unmarshal(out.Bytes(), &tree); err != nil {
+		t.Fatalf("invalid workspace tree JSON: %v output=%s", err, out.String())
+	}
+	if tree.Workspace.SecretCount != 3 || len(tree.Users) != 2 || tree.Users[1].SecretCount != 1 {
+		t.Fatalf("unexpected workspace tree JSON: %#v", tree)
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"workspace", "tree", "--workspace", "oclan-co", "--include-revoked"}); code != 0 {
+		t.Fatalf("workspace tree with revoked devices failed with code %d stderr=%s", code, errb.String())
+	}
+	if !includeRevokedSeen || !strings.Contains(out.String(), "old-laptop · laptop · revoked") {
+		t.Fatalf("workspace tree did not include revoked device: %s", out.String())
+	}
+
+	requestsBeforeInvalid := treeRequests
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"workspace", "tree", "--workspace", "oclan-co", "--unexpected"}); code == 0 {
+		t.Fatal("workspace tree should reject unknown flags")
+	}
+	if treeRequests != requestsBeforeInvalid {
+		t.Fatal("workspace tree made a request before rejecting unknown flags")
+	}
+}
+
+func TestValidateRemoteWorkspaceTreeRejectsMalformedMetadata(t *testing.T) {
+	valid := remoteWorkspaceTreeResponse{
+		Workspace: remoteWorkspaceTreeWorkspace{ID: "org_1", Slug: "olom-dev", SecretCount: 2},
+		Users: []remoteWorkspaceTreeUser{{
+			ID: "usr_1", SecretCount: 1,
+			Devices: []remoteWorkspaceTreeDevice{{ID: "dev_1", Status: "trusted"}},
+			Access:  []remoteWorkspaceTreeAccess{{Scope: "olom-dev/prod", SecretCount: 1}},
+		}},
+	}
+	if err := validateRemoteWorkspaceTree(valid, "olom-dev", false); err != nil {
+		t.Fatalf("valid tree rejected: %v", err)
+	}
+	tests := []struct {
+		name string
+		edit func(*remoteWorkspaceTreeResponse)
+	}{
+		{"wrong workspace", func(tree *remoteWorkspaceTreeResponse) { tree.Workspace.Slug = "other" }},
+		{"negative total", func(tree *remoteWorkspaceTreeResponse) { tree.Workspace.SecretCount = -1 }},
+		{"impossible user count", func(tree *remoteWorkspaceTreeResponse) { tree.Users[0].SecretCount = 3 }},
+		{"foreign scope", func(tree *remoteWorkspaceTreeResponse) { tree.Users[0].Access[0].Scope = "other/prod" }},
+		{"unexpected revoked device", func(tree *remoteWorkspaceTreeResponse) { tree.Users[0].Devices[0].Status = "revoked" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := valid
+			candidate.Users = append([]remoteWorkspaceTreeUser(nil), valid.Users...)
+			candidate.Users[0].Devices = append([]remoteWorkspaceTreeDevice(nil), valid.Users[0].Devices...)
+			candidate.Users[0].Access = append([]remoteWorkspaceTreeAccess(nil), valid.Users[0].Access...)
+			test.edit(&candidate)
+			if err := validateRemoteWorkspaceTree(candidate, "olom-dev", false); err == nil {
+				t.Fatal("malformed tree accepted")
+			}
+		})
+	}
+}
+
 func TestWorkspaceListAndUseDoesNotBindLocalPrefixBeforePushOrSync(t *testing.T) {
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")

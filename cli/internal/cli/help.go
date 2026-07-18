@@ -16,7 +16,7 @@ Commands:
   setup       Diagnose local, device, workspace, and recovery setup.
   login       Link this device to the hosted control plane.
   logout      Remove the hosted control-plane session from this device.
-  workspace   List visible control-plane workspaces.
+  workspace   Inspect visible control-plane workspaces and access trees.
   member      List workspace members and manage their secret access.
   service-account
               Manage and log in as service accounts.
@@ -111,9 +111,11 @@ func (a App) helpFor(path []string) int {
 	case "whoami":
 		fmt.Fprint(a.Out, "Usage: asiri whoami\n\nShows the signed-in control-plane identity and authentication device. User sessions do not select a workspace.\n")
 	case "workspace":
-		fmt.Fprint(a.Out, "Usage: asiri workspace <command>\n\nCommands:\n  list   Show visible workspaces, role, device trust, account write access, and id.\n")
+		fmt.Fprint(a.Out, "Usage: asiri workspace <command>\n\nCommands:\n  list   Show visible workspaces, role, device trust, account write access, and id.\n  tree   Show users, trusted devices, effective access, and secret counts.\n")
 	case "workspace list":
 		fmt.Fprint(a.Out, "Usage: asiri workspace list\n\nShows visible workspaces as a table. This device controls pull and workspace-scoped push. Account write means the user owns the workspace or has effective secret-write capability.\n")
+	case "workspace tree":
+		fmt.Fprint(a.Out, "Usage: asiri workspace tree --workspace <slug> [--json] [--include-revoked]\n\nShows one compact workspace access tree for the workspace owner. Access belongs to users; devices are listed separately because trust only determines where permitted secrets can be decrypted. Secret values are never returned.\n")
 	case "member":
 		fmt.Fprint(a.Out, "Usage: asiri member <command>\n\nCommands:\n  list    List workspace members by name and email.\n  access  List, grant, or revoke member access to envelopes and secrets.\n\nRequires a trusted device linked through asiri login.\n")
 	case "member list":

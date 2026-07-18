@@ -149,6 +149,44 @@ type remoteMemberAccessGrantsResponse struct {
 	SecretAccessGrants []remoteMemberAccessGrantResponse `json:"secretAccessGrants"`
 }
 
+type remoteWorkspaceTreeResponse struct {
+	Workspace remoteWorkspaceTreeWorkspace `json:"workspace"`
+	Users     []remoteWorkspaceTreeUser    `json:"users"`
+}
+
+type remoteWorkspaceTreeWorkspace struct {
+	ID          string `json:"id"`
+	Slug        string `json:"slug"`
+	SecretCount int    `json:"secretCount"`
+}
+
+type remoteWorkspaceTreeUser struct {
+	ID          string                      `json:"id"`
+	DisplayName string                      `json:"displayName"`
+	Email       string                      `json:"email"`
+	Role        string                      `json:"role"`
+	Status      string                      `json:"status"`
+	SecretCount int                         `json:"accessibleSecretCount"`
+	Devices     []remoteWorkspaceTreeDevice `json:"devices"`
+	Access      []remoteWorkspaceTreeAccess `json:"access"`
+}
+
+type remoteWorkspaceTreeDevice struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Kind   string `json:"kind"`
+	Status string `json:"status"`
+}
+
+type remoteWorkspaceTreeAccess struct {
+	GrantID            string `json:"grantId"`
+	TargetType         string `json:"targetType"`
+	Scope              string `json:"scope"`
+	SecretName         string `json:"secretName"`
+	IncludeDescendants bool   `json:"includeDescendants"`
+	SecretCount        int    `json:"matchedSecretCount"`
+}
+
 type remoteServiceAccountResponse struct {
 	ID              string `json:"id"`
 	OrgID           string `json:"orgId"`
