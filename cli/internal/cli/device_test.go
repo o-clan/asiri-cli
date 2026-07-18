@@ -95,6 +95,35 @@ func TestDeviceNamePrintsActiveLocalDevice(t *testing.T) {
 	}
 }
 
+func TestDeviceEnrollPersistsExplicitKind(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "initial", "--kind", "laptop"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	if code := app.Run([]string{"device", "enroll", "--name", "replacement", "--kind", "agent-host"}); code != 0 {
+		t.Fatalf("device enroll failed: %s", errb.String())
+	}
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if device.Name != "replacement" || device.Kind != "agent-host" {
+		t.Fatalf("explicit device metadata was not persisted: name=%q kind=%q", device.Name, device.Kind)
+	}
+}
+
 func TestDeviceListRequiresExplicitRemoteWorkspaceWhenLinked(t *testing.T) {
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")

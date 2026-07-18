@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -243,13 +244,26 @@ func (a App) device(st *store.FileStore, args []string) int {
 		if name == "" {
 			return a.fail(errors.New("--name is required"))
 		}
+		kind, kindSet, err := optionalFlagValue(args[1:], "--kind")
+		if err != nil {
+			return a.fail(err)
+		}
+		if !kindSet {
+			kind = detectedDeviceKind(runtime.GOOS, os.Getenv, runningInContainer())
+		}
+		if err := validateDeviceKind(kind); err != nil {
+			return a.fail(err)
+		}
+		if err := rejectUnknownArgs(args[1:], "--name", "--kind"); err != nil {
+			return a.fail(err)
+		}
 		if st.State.ControlPlane != nil {
 			return a.fail(errors.New("device enroll requires no linked control-plane session; run asiri logout first, then rerun asiri device enroll --name <new-name>. The local vault and secrets are preserved"))
 		}
 		if err := rejectServiceAccountLocalMutation(st); err != nil {
 			return a.fail(err)
 		}
-		device, refs, err := createDevice(name)
+		device, refs, err := createDevice(name, kind)
 		if err != nil {
 			return a.fail(err)
 		}
@@ -422,7 +436,39 @@ func (a App) device(st *store.FileStore, args []string) int {
 	}
 }
 
-func createDevice(name string) (asiri.Device, []asiri.KeyRef, error) {
+func validateDeviceKind(kind string) error {
+	switch kind {
+	case "laptop", "server", "ci", "agent-host":
+		return nil
+	default:
+		return fmt.Errorf("invalid device kind %q; use laptop, server, ci, or agent-host", kind)
+	}
+}
+
+func detectedDeviceKind(goos string, getenv func(string) string, container bool) string {
+	for _, key := range []string{"CI", "GITHUB_ACTIONS", "GITLAB_CI", "BUILDKITE", "TF_BUILD"} {
+		value := strings.ToLower(strings.TrimSpace(getenv(key)))
+		if value == "1" || value == "true" || value == "yes" {
+			return "ci"
+		}
+	}
+	if goos == "linux" {
+		if container || getenv("SSH_CONNECTION") != "" || getenv("SSH_TTY") != "" {
+			return "server"
+		}
+		if getenv("DISPLAY") == "" && getenv("WAYLAND_DISPLAY") == "" {
+			return "server"
+		}
+	}
+	return "laptop"
+}
+
+func runningInContainer() bool {
+	_, err := os.Stat("/.dockerenv")
+	return err == nil
+}
+
+func createDevice(name, kind string) (asiri.Device, []asiri.KeyRef, error) {
 	deviceID := store.NewID("dev")
 	encryptionPrivateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -460,7 +506,7 @@ func createDevice(name string) (asiri.Device, []asiri.KeyRef, error) {
 	return asiri.Device{
 			ID:                  deviceID,
 			Name:                name,
-			Kind:                "laptop",
+			Kind:                kind,
 			Status:              asiri.DeviceTrusted,
 			EncryptionPublicKey: base64.StdEncoding.EncodeToString(encryptionPublicBytes),
 			SigningPublicKey:    base64.StdEncoding.EncodeToString(signingPublicBytes),

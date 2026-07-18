@@ -97,7 +97,7 @@ func (a App) helpFor(path []string) int {
 	topic := strings.Join(path, " ")
 	switch topic {
 	case "init":
-		fmt.Fprint(a.Out, "Usage: asiri init [--device <device>]\n\nCreates a local encrypted vault and a trusted local device. Local vaults do not have workspace slugs.\n")
+		fmt.Fprint(a.Out, "Usage: asiri init [--device <device>] [--kind <laptop|server|ci|agent-host>]\n\nCreates a local encrypted vault and a trusted local device. Kind is inferred for common CI and headless Linux environments unless set explicitly. Local vaults do not have workspace slugs.\n")
 	case "setup":
 		fmt.Fprint(a.Out, "Usage: asiri setup <command>\n\nCommands:\n  doctor  Diagnose setup readiness and print next safe steps.\n")
 	case "setup doctor":
@@ -115,7 +115,7 @@ func (a App) helpFor(path []string) int {
 	case "workspace list":
 		fmt.Fprint(a.Out, "Usage: asiri workspace list\n\nShows visible workspaces as a table. This device controls pull and workspace-scoped push. Account write means the user owns the workspace or has effective secret-write capability.\n")
 	case "workspace tree":
-		fmt.Fprint(a.Out, "Usage: asiri workspace tree --workspace <slug> [--json] [--include-revoked]\n\nShows one compact workspace access tree for the workspace owner. Access belongs to users; devices are listed separately because trust only determines where permitted secrets can be decrypted. Secret values are never returned.\n")
+		fmt.Fprint(a.Out, "Usage: asiri workspace tree --workspace <slug> [--json] [--include-revoked]\n\nShows one compact workspace access tree for the workspace owner, including active service-account sessions on trusted devices. Access belongs to users; devices are listed separately because trust only determines where permitted secrets can be decrypted. Secret values are never returned.\n")
 	case "member":
 		fmt.Fprint(a.Out, "Usage: asiri member <command>\n\nCommands:\n  list    List workspace members by name and email.\n  access  List, grant, or revoke member access to envelopes and secrets.\n\nRequires a trusted device linked through asiri login.\n")
 	case "member list":
@@ -161,7 +161,7 @@ func (a App) helpFor(path []string) int {
 	case "device name":
 		fmt.Fprint(a.Out, "Usage: asiri device name\n\nPrints the current local device name.\n")
 	case "device enroll":
-		fmt.Fprint(a.Out, "Usage: asiri device enroll --name <device>\n\nCreates a new local device keypair and local trusted-device record without changing the vault or local secrets. Log out first when replacing keys for a linked device.\n")
+		fmt.Fprint(a.Out, "Usage: asiri device enroll --name <device> [--kind <laptop|server|ci|agent-host>]\n\nCreates a new local device keypair and local trusted-device record without changing the vault or local secrets. Kind is inferred for common CI and headless Linux environments unless set explicitly. Log out first when replacing keys for a linked device.\n")
 	case "device list":
 		fmt.Fprint(a.Out, "Usage: asiri device list --remote --workspace <slug> [--include-revoked]\n       asiri device list --local [--include-revoked]\n\nLists remote devices in one explicit workspace, or this machine's local device records. Revoked devices are hidden unless --include-revoked is set.\n")
 	case "device status":

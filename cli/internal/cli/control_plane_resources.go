@@ -104,6 +104,11 @@ func validateRemoteWorkspaceTree(tree remoteWorkspaceTreeResponse, workspace str
 			if device.ID == "" || (!includeRevoked && device.Status == "revoked") {
 				return errors.New("control plane returned invalid workspace device metadata")
 			}
+			for _, account := range device.ServiceAccountAuth {
+				if account.ID == "" || account.Slug == "" {
+					return errors.New("control plane returned invalid service account authentication metadata")
+				}
+			}
 		}
 		for _, access := range user.Access {
 			if access.SecretCount < 0 || access.SecretCount > tree.Workspace.SecretCount || (access.Scope != workspace && !strings.HasPrefix(access.Scope, workspace+"/")) {

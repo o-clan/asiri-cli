@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -16,7 +17,7 @@ import (
 )
 
 func (a App) initLocal(st *store.FileStore, args []string) int {
-	deviceName, err := parseInitArgs(args)
+	deviceName, deviceKind, err := parseInitArgs(args)
 	if err != nil {
 		return a.fail(err)
 	}
@@ -41,10 +42,10 @@ func (a App) initLocal(st *store.FileStore, args []string) int {
 			return a.fail(err)
 		}
 	}
-	device, refs, err := createDevice(deviceName)
+	device, refs, err := createDevice(deviceName, deviceKind)
 	if errors.Is(err, keystore.ErrPlatformUnavailable) && keystore.FileKeyStoreDir() == "" {
 		st.UseDefaultFileKeyStore()
-		device, refs, err = createDevice(deviceName)
+		device, refs, err = createDevice(deviceName, deviceKind)
 		usedFileKeyStore = err == nil
 	}
 	if err != nil {
@@ -70,23 +71,36 @@ func (a App) initLocal(st *store.FileStore, args []string) int {
 	return 0
 }
 
-func parseInitArgs(args []string) (string, error) {
+func parseInitArgs(args []string) (string, string, error) {
 	deviceName := ""
+	deviceKind := ""
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--device":
 			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
-				return "", errors.New("--device requires a value")
+				return "", "", errors.New("--device requires a value")
 			}
 			deviceName = args[i+1]
 			i++
+		case "--kind":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return "", "", errors.New("--kind requires a value")
+			}
+			deviceKind = args[i+1]
+			i++
 		case "--workspace":
-			return "", errors.New("asiri init no longer accepts --workspace; local vaults do not have workspace slugs")
+			return "", "", errors.New("asiri init no longer accepts --workspace; local vaults do not have workspace slugs")
 		default:
-			return "", fmt.Errorf("unknown init argument %q", args[i])
+			return "", "", fmt.Errorf("unknown init argument %q", args[i])
 		}
 	}
-	return deviceName, nil
+	if deviceKind == "" {
+		deviceKind = detectedDeviceKind(runtime.GOOS, os.Getenv, runningInContainer())
+	}
+	if err := validateDeviceKind(deviceKind); err != nil {
+		return "", "", err
+	}
+	return deviceName, deviceKind, nil
 }
 
 func (a App) login(st *store.FileStore, args []string) int {

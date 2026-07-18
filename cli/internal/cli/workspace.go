@@ -114,7 +114,7 @@ func printWorkspaceTree(out io.Writer, tree remoteWorkspaceTreeResponse) {
 				if index == len(user.Devices)-1 {
 					branch = "└──"
 				}
-				fmt.Fprintf(out, "%s│   %s %s · %s · %s\n", userIndent, branch, safeMemberOutput(device.Name), safeMemberOutput(device.Kind), safeMemberOutput(device.Status))
+				fmt.Fprintf(out, "%s│   %s %s · %s · %s · service session: %s\n", userIndent, branch, safeMemberOutput(device.Name), safeMemberOutput(device.Kind), safeMemberOutput(device.Status), workspaceTreeServiceAccountAuthLabel(device.ServiceAccountAuth))
 			}
 		}
 		fmt.Fprintf(out, "%s└── access\n", userIndent)
@@ -130,6 +130,21 @@ func printWorkspaceTree(out io.Writer, tree remoteWorkspaceTreeResponse) {
 			fmt.Fprintf(out, "%s    %s %s · %s · %s\n", userIndent, branch, workspaceTreeAccessLabel(tree.Workspace.Slug, access), workspaceTreeAccessMode(access), secretCountLabel(access.SecretCount))
 		}
 	}
+}
+
+func workspaceTreeServiceAccountAuthLabel(accounts []remoteWorkspaceTreeServiceAccount) string {
+	if len(accounts) == 0 {
+		return "none"
+	}
+	labels := make([]string, 0, len(accounts))
+	for _, account := range accounts {
+		label := strings.TrimSpace(safeMemberOutput(account.Slug))
+		if label == "" {
+			label = safeMemberOutput(account.ID)
+		}
+		labels = append(labels, label)
+	}
+	return strings.Join(labels, ", ")
 }
 
 func workspaceTreeUserLabel(user remoteWorkspaceTreeUser) string {

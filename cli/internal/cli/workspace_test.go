@@ -45,7 +45,7 @@ func TestWorkspaceTreeUsesOneCompactRequestAndRendersTextAndJSON(t *testing.T) {
 				t.Fatalf("unexpected tree workspace: %s", r.URL.RawQuery)
 			}
 			includeRevokedSeen = r.URL.Query().Get("includeRevoked") == "1"
-			devices := []map[string]any{{"id": "dev_owner", "name": "owner-laptop", "kind": "laptop", "status": "trusted"}}
+			devices := []map[string]any{{"id": "dev_owner", "name": "owner-laptop", "kind": "laptop", "status": "trusted", "serviceAccountAuth": []map[string]any{{"id": "svc_runtime", "slug": "runtime", "name": "Runtime"}}}}
 			if includeRevokedSeen {
 				devices = append(devices, map[string]any{"id": "dev_old", "name": "old-laptop", "kind": "laptop", "status": "revoked"})
 			}
@@ -80,7 +80,7 @@ func TestWorkspaceTreeUsesOneCompactRequestAndRendersTextAndJSON(t *testing.T) {
 	if code := app.Run([]string{"workspace", "tree", "--workspace", "oclan-co"}); code != 0 {
 		t.Fatalf("workspace tree failed with code %d stderr=%s", code, errb.String())
 	}
-	for _, expected := range []string{"oclan-co · 3 secrets", "Owner <owner@example.com> · owner · 3 accessible", "owner-laptop · laptop · trusted", "/ · recursive · 3 secrets", "Member <member@example.com> · member · 1 accessible", "prod/api/TOKEN · secret · 1 secret", "none"} {
+	for _, expected := range []string{"oclan-co · 3 secrets", "Owner <owner@example.com> · owner · 3 accessible", "owner-laptop · laptop · trusted · service session: runtime", "/ · recursive · 3 secrets", "Member <member@example.com> · member · 1 accessible", "prod/api/TOKEN · secret · 1 secret", "none"} {
 		if !strings.Contains(out.String(), expected) {
 			t.Fatalf("workspace tree missing %q: %s", expected, out.String())
 		}
@@ -127,7 +127,7 @@ func TestValidateRemoteWorkspaceTreeRejectsMalformedMetadata(t *testing.T) {
 		Workspace: remoteWorkspaceTreeWorkspace{ID: "org_1", Slug: "olom-dev", SecretCount: 2},
 		Users: []remoteWorkspaceTreeUser{{
 			ID: "usr_1", SecretCount: 1,
-			Devices: []remoteWorkspaceTreeDevice{{ID: "dev_1", Status: "trusted"}},
+			Devices: []remoteWorkspaceTreeDevice{{ID: "dev_1", Status: "trusted", ServiceAccountAuth: []remoteWorkspaceTreeServiceAccount{{ID: "svc_1", Slug: "runtime"}}}},
 			Access:  []remoteWorkspaceTreeAccess{{Scope: "olom-dev/prod", SecretCount: 1}},
 		}},
 	}
@@ -143,12 +143,14 @@ func TestValidateRemoteWorkspaceTreeRejectsMalformedMetadata(t *testing.T) {
 		{"impossible user count", func(tree *remoteWorkspaceTreeResponse) { tree.Users[0].SecretCount = 3 }},
 		{"foreign scope", func(tree *remoteWorkspaceTreeResponse) { tree.Users[0].Access[0].Scope = "other/prod" }},
 		{"unexpected revoked device", func(tree *remoteWorkspaceTreeResponse) { tree.Users[0].Devices[0].Status = "revoked" }},
+		{"invalid service account auth", func(tree *remoteWorkspaceTreeResponse) { tree.Users[0].Devices[0].ServiceAccountAuth[0].Slug = "" }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			candidate := valid
 			candidate.Users = append([]remoteWorkspaceTreeUser(nil), valid.Users...)
 			candidate.Users[0].Devices = append([]remoteWorkspaceTreeDevice(nil), valid.Users[0].Devices...)
+			candidate.Users[0].Devices[0].ServiceAccountAuth = append([]remoteWorkspaceTreeServiceAccount(nil), valid.Users[0].Devices[0].ServiceAccountAuth...)
 			candidate.Users[0].Access = append([]remoteWorkspaceTreeAccess(nil), valid.Users[0].Access...)
 			test.edit(&candidate)
 			if err := validateRemoteWorkspaceTree(candidate, "olom-dev", false); err == nil {

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +19,46 @@ import (
 	"github.com/o-clan/asiri/cli/internal/store"
 	"github.com/zalando/go-keyring"
 )
+
+func TestDetectedDeviceKindUsesReliableRuntimeSignals(t *testing.T) {
+	tests := []struct {
+		name      string
+		goos      string
+		container bool
+		env       map[string]string
+		want      string
+	}{
+		{name: "mac laptop", goos: "darwin", want: "laptop"},
+		{name: "windows laptop", goos: "windows", want: "laptop"},
+		{name: "github actions", goos: "linux", env: map[string]string{"GITHUB_ACTIONS": "true"}, want: "ci"},
+		{name: "generic ci", goos: "linux", env: map[string]string{"CI": "1"}, want: "ci"},
+		{name: "linux container", goos: "linux", container: true, want: "server"},
+		{name: "linux ssh", goos: "linux", env: map[string]string{"SSH_CONNECTION": "client server"}, want: "server"},
+		{name: "headless linux", goos: "linux", want: "server"},
+		{name: "desktop linux", goos: "linux", env: map[string]string{"DISPLAY": ":0"}, want: "laptop"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			getenv := func(key string) string { return test.env[key] }
+			if got := detectedDeviceKind(test.goos, getenv, test.container); got != test.want {
+				t.Fatalf("detected kind %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestParseInitArgsAcceptsExplicitDeviceKind(t *testing.T) {
+	name, kind, err := parseInitArgs([]string{"--device", "octo-staging-host", "--kind", "server"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "octo-staging-host" || kind != "server" {
+		t.Fatalf("unexpected init options: name=%q kind=%q", name, kind)
+	}
+	if _, _, err := parseInitArgs([]string{"--kind", "hostname-guess"}); err == nil {
+		t.Fatal("invalid device kind accepted")
+	}
+}
 
 func TestInitFallsBackToLocalFileKeyStoreWhenPlatformKeyringUnavailable(t *testing.T) {
 	tmp := t.TempDir()
@@ -33,7 +74,7 @@ func TestInitFallsBackToLocalFileKeyStoreWhenPlatformKeyringUnavailable(t *testi
 
 	var out, errb bytes.Buffer
 	app := New(&out, &errb)
-	if code := app.Run([]string{"init", "--device", "headless-box"}); code != 0 {
+	if code := app.Run([]string{"init", "--device", "headless-box", "--kind", "server"}); code != 0 {
 		t.Fatalf("init failed: %s", errb.String())
 	}
 	if !strings.Contains(out.String(), "using local file key store") {
@@ -46,6 +87,13 @@ func TestInitFallsBackToLocalFileKeyStoreWhenPlatformKeyringUnavailable(t *testi
 	}
 	if st.State.KeyStore != store.KeyStoreFile {
 		t.Fatalf("expected file keystore state, got %q", st.State.KeyStore)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if device.Kind != "server" {
+		t.Fatalf("explicit device kind was not persisted: %q", device.Kind)
 	}
 	keyStoreDir := store.DefaultFileKeyStoreDir(statePath)
 	entries, err := os.ReadDir(keyStoreDir)
@@ -1029,6 +1077,7 @@ func TestLoginUsesDeviceCodeFlow(t *testing.T) {
 	refreshSeen := false
 	remoteRevokeSeen := false
 	logoutSeen := false
+	expectedKind := detectedDeviceKind(runtime.GOOS, os.Getenv, runningInContainer())
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "application/json")
 		switch r.URL.Path {
@@ -1038,7 +1087,7 @@ func TestLoginUsesDeviceCodeFlow(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
 			}
-			if body["localWorkspaceSlug"] != "" || body["workspaceSlug"] != "" || body["deviceName"] != "qa-laptop" || body["encryptionPublicKey"] == "" || body["signingPublicKey"] == "" {
+			if body["localWorkspaceSlug"] != "" || body["workspaceSlug"] != "" || body["deviceName"] != "qa-laptop" || body["kind"] != expectedKind || body["encryptionPublicKey"] == "" || body["signingPublicKey"] == "" {
 				t.Fatalf("unexpected start body: %#v", body)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{

@@ -172,10 +172,17 @@ type remoteWorkspaceTreeUser struct {
 }
 
 type remoteWorkspaceTreeDevice struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Kind   string `json:"kind"`
-	Status string `json:"status"`
+	ID                 string                              `json:"id"`
+	Name               string                              `json:"name"`
+	Kind               string                              `json:"kind"`
+	Status             string                              `json:"status"`
+	ServiceAccountAuth []remoteWorkspaceTreeServiceAccount `json:"serviceAccountAuth"`
+}
+
+type remoteWorkspaceTreeServiceAccount struct {
+	ID   string `json:"id"`
+	Slug string `json:"slug"`
+	Name string `json:"name"`
 }
 
 type remoteWorkspaceTreeAccess struct {
