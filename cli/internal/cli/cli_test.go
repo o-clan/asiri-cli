@@ -10,13 +10,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/o-clan/asiri/cli/internal/keystore"
 	"github.com/o-clan/asiri/cli/internal/store"
 	"github.com/zalando/go-keyring"
 )
 
 func TestMain(m *testing.M) {
 	keyring.MockInit()
-	os.Exit(m.Run())
+	restore := keystore.UseGoKeyringForTesting()
+	code := m.Run()
+	restore()
+	os.Exit(code)
 }
 
 func testSecretFile(t *testing.T, value string) string {

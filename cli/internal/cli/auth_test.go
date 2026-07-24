@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,7 +16,6 @@ import (
 	"github.com/o-clan/asiri/cli/internal/asiri"
 	"github.com/o-clan/asiri/cli/internal/keystore"
 	"github.com/o-clan/asiri/cli/internal/store"
-	"github.com/zalando/go-keyring"
 )
 
 func TestDetectedDeviceKindUsesReliableRuntimeSignals(t *testing.T) {
@@ -66,11 +64,11 @@ func TestInitFallsBackToLocalFileKeyStoreWhenPlatformKeyringUnavailable(t *testi
 	t.Cleanup(func() {
 		_ = os.Setenv("ASIRI_HOME", oldHome)
 		keystore.ClearConfiguredFileKeyStoreDir()
-		keyring.MockInit()
 	})
 	_ = os.Setenv("ASIRI_HOME", tmp)
 	keystore.ClearConfiguredFileKeyStoreDir()
-	keyring.MockInitWithError(errors.New("no platform keyring"))
+	restoreFailure := keystore.FailPlatformOperationsForTesting(keystore.ErrPlatformUnavailable, nil, nil)
+	t.Cleanup(restoreFailure)
 
 	var out, errb bytes.Buffer
 	app := New(&out, &errb)
@@ -122,6 +120,44 @@ func TestInitFallsBackToLocalFileKeyStoreWhenPlatformKeyringUnavailable(t *testi
 	}
 	if strings.TrimSpace(out.String()) != "secret_value" {
 		t.Fatalf("unexpected secret value: %q", out.String())
+	}
+}
+
+func TestInitDoesNotFallbackOnTemporaryKeychainFailures(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "authentication", err: keystore.ErrPlatformAuthentication},
+		{name: "timeout", err: keystore.ErrPlatformTimeout},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			oldHome := os.Getenv("ASIRI_HOME")
+			t.Cleanup(func() {
+				_ = os.Setenv("ASIRI_HOME", oldHome)
+				keystore.ClearConfiguredFileKeyStoreDir()
+			})
+			_ = os.Setenv("ASIRI_HOME", tmp)
+			keystore.ClearConfiguredFileKeyStoreDir()
+			restoreFailure := keystore.FailPlatformOperationsForTesting(test.err, nil, nil)
+			t.Cleanup(restoreFailure)
+
+			var out, errb bytes.Buffer
+			app := New(&out, &errb)
+			if code := app.Run([]string{"init", "--device", "mac", "--kind", "laptop"}); code == 0 {
+				t.Fatal("init unexpectedly succeeded")
+			}
+			if strings.Contains(out.String(), "file key store") || keystore.FileKeyStoreDir() != "" {
+				t.Fatalf("temporary failure triggered file-store fallback: %s", out.String())
+			}
+			if _, err := os.Stat(filepath.Join(tmp, "local-state.json")); !os.IsNotExist(err) {
+				t.Fatalf("temporary failure persisted local state: %v", err)
+			}
+			if !strings.Contains(errb.String(), "Refresh the Keychain") {
+				t.Fatalf("missing friendly recovery guidance: %s", errb.String())
+			}
+		})
 	}
 }
 

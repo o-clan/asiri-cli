@@ -17,7 +17,85 @@ import (
 
 const Service = "asiri"
 
-var ErrPlatformUnavailable = errors.New("platform key storage unavailable")
+var (
+	ErrPlatformUnavailable    = errors.New("platform key storage unavailable")
+	ErrPlatformAuthentication = errors.New("macOS denied access to the login Keychain.")
+	ErrPlatformTimeout        = errors.New("macOS Keychain did not respond in time.")
+	ErrKeyNotFound            = errors.New("key material not found")
+)
+
+type platformKeyStore interface {
+	Store(service, account, value string) error
+	Load(service, account string) (string, error)
+	Delete(service, account string) error
+}
+
+type goKeyringStore struct {
+	storeErrorsUnavailable bool
+}
+
+type failingPlatformKeyStore struct {
+	base      platformKeyStore
+	storeErr  error
+	loadErr   error
+	deleteErr error
+}
+
+func (k goKeyringStore) Store(service, account, value string) error {
+	if err := keyring.Set(service, account, value); err != nil {
+		if k.storeErrorsUnavailable || errors.Is(err, ErrPlatformUnavailable) {
+			return fmt.Errorf("%w: %v", ErrPlatformUnavailable, err)
+		}
+		return err
+	}
+	return nil
+}
+
+func (goKeyringStore) Load(service, account string) (string, error) {
+	value, err := keyring.Get(service, account)
+	if errors.Is(err, keyring.ErrNotFound) {
+		return "", ErrKeyNotFound
+	}
+	return value, err
+}
+
+func (goKeyringStore) Delete(service, account string) error {
+	err := keyring.Delete(service, account)
+	if errors.Is(err, keyring.ErrNotFound) {
+		return ErrKeyNotFound
+	}
+	return err
+}
+
+func (k failingPlatformKeyStore) Store(service, account, value string) error {
+	if k.storeErr != nil {
+		return k.storeErr
+	}
+	return k.base.Store(service, account, value)
+}
+
+func (k failingPlatformKeyStore) Load(service, account string) (string, error) {
+	if k.loadErr != nil {
+		return "", k.loadErr
+	}
+	return k.base.Load(service, account)
+}
+
+func (k failingPlatformKeyStore) Delete(service, account string) error {
+	if k.deleteErr != nil {
+		return k.deleteErr
+	}
+	return k.base.Delete(service, account)
+}
+
+var configuredPlatformKeyStore struct {
+	sync.RWMutex
+	store platformKeyStore
+}
+
+func init() {
+	configuredPlatformKeyStore.store = newPlatformKeyStore()
+}
 
 var configuredFileKeyStore struct {
 	sync.RWMutex
@@ -58,8 +136,11 @@ func Store(account, value string) error {
 		}
 		return nil
 	}
-	if err := keyring.Set(Service, account, value); err != nil {
-		return fmt.Errorf("%w: %v", ErrPlatformUnavailable, err)
+	if err := currentPlatformKeyStore().Store(Service, account, value); err != nil {
+		if errors.Is(err, ErrPlatformUnavailable) {
+			return err
+		}
+		return fmt.Errorf("platform key storage failed: %w", err)
 	}
 	return nil
 }
@@ -68,11 +149,14 @@ func Load(account string) (string, error) {
 	if dir := fileKeyStoreDir(); dir != "" {
 		value, err := os.ReadFile(fileKeyStorePath(dir, account))
 		if err != nil {
+			if os.IsNotExist(err) {
+				return "", ErrKeyNotFound
+			}
 			return "", fmt.Errorf("file key material unavailable: %w", err)
 		}
 		return string(value), nil
 	}
-	value, err := keyring.Get(Service, account)
+	value, err := currentPlatformKeyStore().Load(Service, account)
 	if err != nil {
 		return "", fmt.Errorf("platform key material unavailable: %w", err)
 	}
@@ -86,10 +170,49 @@ func Delete(account string) error {
 		}
 		return nil
 	}
-	if err := keyring.Delete(Service, account); err != nil && err != keyring.ErrNotFound {
+	if err := currentPlatformKeyStore().Delete(Service, account); err != nil && !errors.Is(err, ErrKeyNotFound) {
 		return fmt.Errorf("platform key deletion failed: %w", err)
 	}
 	return nil
+}
+
+func currentPlatformKeyStore() platformKeyStore {
+	configuredPlatformKeyStore.RLock()
+	defer configuredPlatformKeyStore.RUnlock()
+	return configuredPlatformKeyStore.store
+}
+
+// UseGoKeyringForTesting preserves the dependency's in-memory mock behavior in
+// packages that exercise keystore consumers. Production code must not call it.
+func UseGoKeyringForTesting() func() {
+	configuredPlatformKeyStore.Lock()
+	previous := configuredPlatformKeyStore.store
+	configuredPlatformKeyStore.store = goKeyringStore{}
+	configuredPlatformKeyStore.Unlock()
+	return func() {
+		configuredPlatformKeyStore.Lock()
+		configuredPlatformKeyStore.store = previous
+		configuredPlatformKeyStore.Unlock()
+	}
+}
+
+// FailPlatformOperationsForTesting injects operation-specific failures while
+// preserving the configured test store and its contents.
+func FailPlatformOperationsForTesting(storeErr, loadErr, deleteErr error) func() {
+	configuredPlatformKeyStore.Lock()
+	previous := configuredPlatformKeyStore.store
+	configuredPlatformKeyStore.store = failingPlatformKeyStore{
+		base:      previous,
+		storeErr:  storeErr,
+		loadErr:   loadErr,
+		deleteErr: deleteErr,
+	}
+	configuredPlatformKeyStore.Unlock()
+	return func() {
+		configuredPlatformKeyStore.Lock()
+		configuredPlatformKeyStore.store = previous
+		configuredPlatformKeyStore.Unlock()
+	}
 }
 
 func ConfigureFileKeyStoreDir(dir string) {

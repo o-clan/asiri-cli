@@ -24,7 +24,10 @@ import (
 
 func TestMain(m *testing.M) {
 	keyring.MockInit()
-	os.Exit(m.Run())
+	restore := keystore.UseGoKeyringForTesting()
+	code := m.Run()
+	restore()
+	os.Exit(code)
 }
 
 func TestEncryptedLocalSecretStoreDoesNotPersistPlaintext(t *testing.T) {
@@ -770,11 +773,12 @@ func TestQuarantineLocalKeysFailsClosedWhenPlatformDeletionFails(t *testing.T) {
 	if err := st.Save(); err != nil {
 		t.Fatal(err)
 	}
-	keyring.MockInitWithError(errors.New("delete failed"))
-	t.Cleanup(keyring.MockInit)
+	restoreFailure := keystore.FailPlatformOperationsForTesting(nil, nil, errors.New("delete failed"))
+	t.Cleanup(restoreFailure)
 	if err := st.QuarantineLocalKeys("remote device is no longer trusted"); err == nil {
 		t.Fatal("expected failed platform deletion")
 	}
+	restoreFailure()
 	reloaded, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
@@ -787,6 +791,37 @@ func TestQuarantineLocalKeysFailsClosedWhenPlatformDeletionFails(t *testing.T) {
 	}
 	if reloaded.State.Devices[0].Status != asiri.DeviceRevoked {
 		t.Fatalf("failed quarantine should revoke trusted devices locally: %#v", reloaded.State.Devices[0])
+	}
+}
+
+func TestAuditLedgerPropagatesTemporaryKeychainReadFailures(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	st, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InitializeLocal(); err != nil {
+		t.Fatal(err)
+	}
+	st.Audit(st.State.UserID, "test_event", "allowed", "", "", "test", nil)
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, injected := range []error{keystore.ErrPlatformAuthentication, keystore.ErrPlatformTimeout} {
+		restoreFailure := keystore.FailPlatformOperationsForTesting(nil, injected, nil)
+		_, loadErr := Load(path)
+		restoreFailure()
+		if !errors.Is(loadErr, injected) {
+			t.Fatalf("expected %v to propagate, got %v", injected, loadErr)
+		}
+		reloaded, loadErr := Load(path)
+		if loadErr != nil {
+			t.Fatalf("original audit ledger did not load after recovery: %v", loadErr)
+		}
+		if len(reloaded.State.Audit) == 0 {
+			t.Fatal("original audit ledger was lost after temporary Keychain failure")
+		}
 	}
 }
 

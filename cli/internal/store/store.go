@@ -475,6 +475,8 @@ func (s *FileStore) loadAuditFromLedger(bytes []byte) error {
 	if s.State.VaultID != "" {
 		if _, err := loadDataKey(auditLedgerDataKeyAccount(s.State.VaultID)); err == nil {
 			return errors.New("local audit ledger is missing")
+		} else if !errors.Is(err, keystore.ErrKeyNotFound) {
+			return err
 		}
 	}
 	s.State.Audit = persisted.Audit
@@ -570,7 +572,10 @@ func (s *FileStore) rebuildAuditLedger(newAuditLedgerKeyAccount *string) error {
 func (s *FileStore) decryptAuditLedger(records []asiri.AuditLedgerRecord) ([]asiri.AuditEvent, error) {
 	key, err := loadDataKey(auditLedgerDataKeyAccount(s.State.VaultID))
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrAuditLedgerKeyUnavailable, err)
+		if errors.Is(err, keystore.ErrKeyNotFound) {
+			return nil, ErrAuditLedgerKeyUnavailable
+		}
+		return nil, err
 	}
 	events := make([]asiri.AuditEvent, 0, len(records))
 	previousHash := ""
@@ -620,14 +625,18 @@ func (s *FileStore) decryptAuditLedger(records []asiri.AuditLedgerRecord) ([]asi
 
 func (s *FileStore) auditLedgerKey() ([]byte, string, error) {
 	account := auditLedgerDataKeyAccount(s.State.VaultID)
-	if key, err := loadDataKey(account); err == nil {
+	key, err := loadDataKey(account)
+	if err == nil {
 		return key, "", nil
+	}
+	if !errors.Is(err, keystore.ErrKeyNotFound) {
+		return nil, "", err
 	}
 	encoded, err := keystore.NewDataKey()
 	if err != nil {
 		return nil, "", err
 	}
-	key, err := decodeDataKey(encoded)
+	key, err = decodeDataKey(encoded)
 	if err != nil {
 		return nil, "", err
 	}

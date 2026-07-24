@@ -1,10 +1,12 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 
+	"github.com/o-clan/asiri/cli/internal/keystore"
 	"github.com/o-clan/asiri/cli/internal/store"
 )
 
@@ -125,6 +127,25 @@ func commandUsesLifecycleStateLock(command string) bool {
 }
 
 func (a App) fail(err error) int {
+	if errors.Is(err, keystore.ErrPlatformAuthentication) {
+		fmt.Fprintln(a.Err, "asiri: macOS denied access to the login Keychain.")
+		fmt.Fprintln(a.Err, "\nThis can happen when macOS leaves the Keychain in a stale state.")
+		writeKeychainRecovery(a.Err)
+		return 1
+	}
+	if errors.Is(err, keystore.ErrPlatformTimeout) {
+		fmt.Fprintln(a.Err, "asiri: macOS Keychain did not respond in time.")
+		fmt.Fprintln(a.Err, "\nAsiri could not confirm that the Keychain operation completed.")
+		writeKeychainRecovery(a.Err)
+		return 1
+	}
 	fmt.Fprintf(a.Err, "asiri: %s\n", err)
 	return 1
+}
+
+func writeKeychainRecovery(out io.Writer) {
+	fmt.Fprintln(out, "\nRefresh the Keychain:")
+	fmt.Fprintln(out, "  security lock-keychain")
+	fmt.Fprintln(out, "  security unlock-keychain")
+	fmt.Fprintln(out, "\nEnter your Mac password when prompted, then retry.")
 }
