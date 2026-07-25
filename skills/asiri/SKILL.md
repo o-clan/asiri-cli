@@ -1,6 +1,6 @@
 ---
 name: asiri
-description: "Use when an agent needs to operate Asiri CLI or Asiri-managed secrets: inspect secret metadata, run commands with scoped secrets, add or rotate operational secrets, grant local runtime access, manage human member access, push or pull encrypted records, configure service-account runtime access for CI or servers, or diagnose Asiri workspace/device state without exposing secret values. Focus on safe operational use first; use trust, recovery, rekey, revocation, member access, service-account setup, and remote policy changes only when explicitly requested."
+description: "Use when an agent needs to operate Asiri CLI or Asiri-managed secrets: inspect secret metadata, run commands with scoped secrets, add or rotate operational secrets, manage human member access, push or pull encrypted records, configure service-account runtime access for CI or servers, or diagnose Asiri workspace/device state without exposing secret values. Focus on safe operational use first; use trust, recovery, rekey, revocation, member access, service-account setup, and remote policy changes only when explicitly requested."
 ---
 
 # Asiri
@@ -15,7 +15,8 @@ Asiri is a secrets access layer. Treat it as the source of operational secrets a
 - Require an explicit canonical slug or alias for local and hosted secret listing. If a fresh offline vault has no workspace, guide the user to `asiri workspace create <slug>`.
 - Use exact workspace slugs and secret paths from the user or from `asiri workspace list` / `asiri list`.
 - Prefer `asiri env` or `asiri mount` over raw reads.
-- Use raw reads only when the user explicitly asks and policy allows it; redirect verification reads to `/dev/null`.
+- Use raw reads only when the user explicitly asks and the authenticated identity is allowed to read; redirect verification reads to `/dev/null`.
+- Treat `--label` as audit metadata only. A label never grants or denies access. `--agent` is a compatibility alias for `--label`.
 - Treat strict audit failures as hard stops. Do not retry, bypass, copy, or expose the secret through another path when Asiri says audit ack is required before release.
 - Stop before changing trust, device, recovery, rekey, or local key material unless the user explicitly asked for that repair.
 - If Asiri reports missing platform key material, keyring errors, duplicated devices, unknown trust, or recovery problems, report the state and ask before mutating anything.
@@ -94,16 +95,16 @@ Prefer temporary files for tools that read Docker-style secret files:
 asiri mount --workspace <workspace> <scope/SECRET_NAME> -- <command> <args>
 ```
 
-Use an explicit agent label when the audit/policy subject should differ from the child command name:
+Use an explicit audit label when the audit record should differ from the child command name. It never changes authorization:
 
 ```sh
-asiri env --workspace <workspace> --agent <label> <scope/SECRET_NAME> -- <command> <args>
+asiri env --workspace <workspace> --label <label> <scope/SECRET_NAME> -- <command> <args>
 ```
 
 Use argv substitution only as an escape hatch for tools that cannot read env vars or files:
 
 ```sh
-asiri run --workspace <workspace> --unsafe-argv --agent <label> <command> --token asiri://<scope/SECRET_NAME>
+asiri run --workspace <workspace> --label <label> --unsafe-argv <command> --token asiri://<scope/SECRET_NAME>
 ```
 
 Envelope audit mode applies to every secret materialization path: raw read, env injection, mount, unsafe argv, and broker value requests. Buffered envelopes can release after local encrypted audit append and sync later. Strict envelopes must receive a matching control-plane ack before Asiri releases the value. If the device is offline or the ack is missing or malformed, report the block and stop.
@@ -142,23 +143,16 @@ asiri push --workspace <workspace> --secret <scope/SECRET_NAME> --dry-run
 
 If a same-version remote record already exists and matches, push should skip it. If Asiri reports a conflict, do not overwrite blindly; inspect the local and remote metadata and ask.
 
-## Grant Access
+## Runtime Access
 
-Grant the smallest action that lets the target command work:
+Local runtime access follows the authenticated user or service-account identity on a trusted device. Command, process, app, and agent labels do not authorize secret use. The former root-level label grant and deny commands were removed; use service-account policies when a fixed machine identity needs scoped access.
 
-```sh
-asiri grant --workspace <workspace> <label> <scope/SECRET_NAME> --inject-only
-asiri grant --workspace <workspace> <label> <scope/SECRET_NAME> --mount
-asiri grant --workspace <workspace> <label> <scope/SECRET_NAME> --broker
-```
-
-Avoid `--read` for agents unless the user explicitly wants plaintext returned to that agent.
+Prefer env injection, mounts, or broker use so the value stays out of agent context. Use raw reads only when the user explicitly requests plaintext handling.
 
 Check recent activity without values:
 
 ```sh
 asiri audit tail --workspace <workspace> --limit 20
-asiri policy list --workspace <workspace>
 ```
 
 Audit mode is an envelope policy set by the workspace owner or a delegated admin. Do not change it unless the user explicitly asked for an audit-mode change.
@@ -268,7 +262,7 @@ When blocked by local key material or trust state, preserve the current state an
 
 ## Advanced Context
 
-Trusted device state is the runtime security boundary. Agent, app, process, and command names are policy and audit labels, not strong identities.
+Authenticated users and service accounts control authorization, and trusted device state is the runtime decryption boundary. Agent, app, process, and command names are audit labels only.
 
 Strict audit gives administrators visibility over Asiri-controlled secret release. It does not make a compromised trusted host safe, and it only applies after the device has synced the envelope policy.
 

@@ -77,6 +77,7 @@ type brokerClientTestConfig struct {
 	URL       string    `json:"url"`
 	Token     string    `json:"token"`
 	Workspace string    `json:"workspace"`
+	Label     string    `json:"label"`
 	Subject   string    `json:"subject"`
 	ExpiresAt time.Time `json:"expiresAt"`
 }
@@ -153,6 +154,9 @@ func waitForBrokerClientConfig(t *testing.T, path string) brokerClientTestConfig
 			}
 			if cfg.URL == "" || cfg.Token == "" {
 				t.Fatalf("broker client config missing URL or token: %s", string(data))
+			}
+			if cfg.Label == "" || cfg.Subject != cfg.Label {
+				t.Fatalf("broker client config must expose label and retain the matching legacy subject: %s", string(data))
 			}
 			return cfg
 		}

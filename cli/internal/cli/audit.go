@@ -46,7 +46,11 @@ func (a App) audit(st *store.FileStore, args []string) int {
 			continue
 		}
 		syncStatus := auditSyncStatus(st, event)
-		fmt.Fprintf(a.Out, "%s\t%s\t%s\t%s\t%s\t%s\n", event.CreatedAt.Format(time.RFC3339), event.Actor, event.Action, event.Result, syncStatus, event.Reason)
+		label := "-"
+		if event.Metadata != nil && event.Metadata["runtimeLabel"] != "" {
+			label = event.Metadata["runtimeLabel"]
+		}
+		fmt.Fprintf(a.Out, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", event.CreatedAt.Format(time.RFC3339), event.Actor, label, event.Action, event.Result, syncStatus, event.Reason)
 		printed++
 	}
 	return 0
@@ -334,25 +338,44 @@ func isRuntimeAuditAction(action string) bool {
 	}
 }
 
-func runtimeLabelType(agentExplicit bool) string {
-	if agentExplicit {
-		return "agent"
+type runtimeAccessContext struct {
+	Actor     string
+	Label     string
+	LabelType string
+}
+
+func runtimeLabelType(labelExplicit bool) string {
+	if labelExplicit {
+		return "explicit"
 	}
 	return "process"
 }
 
-func runtimeSubject(st *store.FileStore, current, fallback string, agentExplicit bool) (string, string, error) {
-	if st != nil && st.State.ControlPlane != nil && st.State.ControlPlane.Source == "service-account" {
-		serviceAccount := store.ServiceAccountRuntimeSubject(st.State.ControlPlane.ServiceAccountID)
-		if serviceAccount == "" {
-			return "", "", errors.New("service account session is missing service account identity")
+func runtimeAccess(st *store.FileStore, currentLabel, fallbackLabel string, labelExplicit bool) (runtimeAccessContext, error) {
+	if st == nil {
+		return runtimeAccessContext{}, errors.New("runtime state is required")
+	}
+	actor := st.State.UserID
+	if st.State.ControlPlane != nil && st.State.ControlPlane.Source != "service-account" && st.State.ControlPlane.UserID != "" {
+		actor = st.State.ControlPlane.UserID
+	}
+	if st.State.ControlPlane != nil && st.State.ControlPlane.Source == "service-account" {
+		actor = store.ServiceAccountRuntimeSubject(st.State.ControlPlane.ServiceAccountID)
+		if actor == "" {
+			return runtimeAccessContext{}, errors.New("service account session is missing service account identity")
 		}
-		return serviceAccount, "service", nil
 	}
-	if current == "" {
-		current = fallback
+	if currentLabel == "" {
+		currentLabel = fallbackLabel
 	}
-	return store.NormalizeSubjectLabel(current), runtimeLabelType(agentExplicit), nil
+	if currentLabel == "" && st.State.ControlPlane != nil && st.State.ControlPlane.Source == "service-account" {
+		currentLabel = st.State.ControlPlane.ServiceAccountSlug
+	}
+	return runtimeAccessContext{
+		Actor:     actor,
+		Label:     store.NormalizeSubjectLabel(currentLabel),
+		LabelType: runtimeLabelType(labelExplicit),
+	}, nil
 }
 
 func runtimeAuditMetadata(st *store.FileStore, scope, label, labelType string, extra map[string]string) map[string]string {

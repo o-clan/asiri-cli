@@ -86,7 +86,6 @@ func TestRuntimeAuditSyncReportsRuntimeLabelMetadata(t *testing.T) {
 	for _, step := range [][]string{
 		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")},
-		{"grant", "--workspace", "qa", "wrangler", "cloudflare/WRANGLER_SECRET", "--inject-only"},
 	} {
 		out.Reset()
 		errb.Reset()
@@ -205,7 +204,6 @@ func TestRuntimeAuditSyncFailureDoesNotBlockLocalUse(t *testing.T) {
 	for _, step := range [][]string{
 		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")},
-		{"grant", "--workspace", "qa", "wrangler", "cloudflare/WRANGLER_SECRET", "--inject-only"},
 	} {
 		out.Reset()
 		errb.Reset()
@@ -437,7 +435,6 @@ func TestStrictEnvelopeAuditAckGatesRuntimeRelease(t *testing.T) {
 			for _, step := range [][]string{
 				{"init", "--device", "qa-laptop", "--workspace", "qa"},
 				{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")},
-				{"grant", "--workspace", "qa", "wrangler", "cloudflare/WRANGLER_SECRET", "--inject-only"},
 			} {
 				out.Reset()
 				errb.Reset()
@@ -588,8 +585,6 @@ func TestStrictEnvelopeAuditAckRequiresCompleteBatchBeforeRuntimeRelease(t *test
 		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "app/ONE", "--value-file", testSecretFile(t, "one")},
 		{"add", "--workspace", "qa", "app/TWO", "--value-file", testSecretFile(t, "two")},
-		{"grant", "--workspace", "qa", "sh", "app/ONE", "--inject-only"},
-		{"grant", "--workspace", "qa", "sh", "app/TWO", "--inject-only"},
 	} {
 		out.Reset()
 		errb.Reset()
@@ -705,8 +700,6 @@ func TestStrictEnvelopeAuditAckFailureDoesNotAuditBufferedPeers(t *testing.T) {
 		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "strict/ONE", "--value-file", testSecretFile(t, "one")},
 		{"add", "--workspace", "qa", "buffered/TWO", "--value-file", testSecretFile(t, "two")},
-		{"grant", "--workspace", "qa", "sh", "strict/ONE", "--inject-only"},
-		{"grant", "--workspace", "qa", "sh", "buffered/TWO", "--inject-only"},
 	} {
 		out.Reset()
 		errb.Reset()
@@ -797,7 +790,7 @@ func TestStrictEnvelopeAuditAckAllowsDirectHumanRead(t *testing.T) {
 				if event.OrgID != "org_runtime" {
 					t.Fatalf("strict human read uploaded to wrong workspace: %#v", event)
 				}
-				if event.Metadata["runtimeLabel"] == "" || event.Metadata["runtimeLabelType"] != "user" || event.Metadata["workspaceId"] != "org_runtime" {
+				if event.Metadata["runtimeLabel"] != "get" || event.Metadata["runtimeLabelType"] != "process" || event.Metadata["workspaceId"] != "org_runtime" {
 					t.Fatalf("strict human read metadata missing: %#v", event.Metadata)
 				}
 				response.Acks = append(response.Acks, runtimeAuditAck{

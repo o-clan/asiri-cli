@@ -164,6 +164,17 @@ func TestRunRejectsNonLoopbackHTTP(t *testing.T) {
 	}
 }
 
+func TestOptionsUseLabelAsCanonicalLegacySubject(t *testing.T) {
+	got := (Options{Label: "audit-label", Subject: "conflicting-subject"}).withDefaults()
+	if got.Label != "audit-label" || got.Subject != got.Label {
+		t.Fatalf("broker label compatibility fields diverged: %#v", got)
+	}
+	legacy := (Options{Subject: "legacy-label"}).withDefaults()
+	if legacy.Label != "legacy-label" || legacy.Subject != legacy.Label {
+		t.Fatalf("legacy broker subject was not promoted to label: %#v", legacy)
+	}
+}
+
 func TestRunRejectsExistingClientFile(t *testing.T) {
 	clientFile := filepath.Join(t.TempDir(), "client.json")
 	if err := os.WriteFile(clientFile, []byte("do not overwrite"), 0o600); err != nil {

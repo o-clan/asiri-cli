@@ -577,7 +577,7 @@ func TestLegacyOidcControlPlaneSessionIsRemovedOnLoad(t *testing.T) {
 	}
 }
 
-func TestAgentRawReadRequiresExplicitPolicy(t *testing.T) {
+func TestRuntimeAccessUsesAuthenticatedIdentityInsteadOfLabels(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	st, err := Load(path)
 	if err != nil {
@@ -590,20 +590,17 @@ func TestAgentRawReadRequiresExplicitPolicy(t *testing.T) {
 	if _, err := st.AddSecret("qa/openai/api_key", "secret"); err != nil {
 		t.Fatal(err)
 	}
-	allowed, reason := st.CheckPolicy("codex", "qa/openai/api_key", "read")
-	if allowed || !strings.Contains(reason, "explicit policy") {
-		t.Fatalf("expected denied raw read, got allowed=%v reason=%q", allowed, reason)
-	}
-	if _, err := st.Grant("codex", "qa/openai/api_key", []string{"inject"}); err != nil {
-		t.Fatal(err)
+	allowed, reason := st.CheckPolicy(st.State.UserID, "qa/openai/api_key", "read")
+	if !allowed || !strings.Contains(reason, "authenticated user") {
+		t.Fatalf("expected authenticated user read, got allowed=%v reason=%q", allowed, reason)
 	}
 	allowed, reason = st.CheckPolicy("codex", "qa/openai/api_key", "inject")
-	if !allowed {
-		t.Fatalf("expected inject allowed, got %q", reason)
+	if allowed || !strings.Contains(reason, "not authenticated") {
+		t.Fatalf("audit label must not authorize runtime access, got allowed=%v reason=%q", allowed, reason)
 	}
 }
 
-func TestReservedHumanSubjectCannotImpersonateHuman(t *testing.T) {
+func TestAuthenticatedControlPlaneUserCanUseLocalRuntime(t *testing.T) {
 	st := testInitializedStore(t)
 	device := testDevice(t, "test")
 	st.State.Devices = append(st.State.Devices, device)
@@ -615,29 +612,20 @@ func TestReservedHumanSubjectCannotImpersonateHuman(t *testing.T) {
 		t.Fatal(err)
 	}
 	allowed, reason := st.CheckPolicy(st.State.UserID, "oclan-co/local/asiri/API_KEY", "read")
-	if allowed || !strings.Contains(reason, "reserved") {
-		t.Fatalf("expected reserved human subject denial, got allowed=%v reason=%q", allowed, reason)
-	}
-	if _, err := st.Grant(st.State.UserID, "oclan-co/local/asiri/API_KEY", []string{"read"}); err == nil || !strings.Contains(err.Error(), "reserved") {
-		t.Fatalf("expected reserved human grant rejection, got %v", err)
-	}
-	if _, err := st.Grant(st.State.UserID+" ", "oclan-co/local/asiri/API_KEY", []string{"read"}); err == nil || !strings.Contains(err.Error(), "reserved") {
-		t.Fatalf("expected whitespace-spoofed human grant rejection, got %v", err)
-	}
-	if _, err := st.Deny(st.State.UserID, "oclan-co/local/asiri/*"); err == nil || !strings.Contains(err.Error(), "reserved") {
-		t.Fatalf("expected reserved human deny rejection, got %v", err)
+	if !allowed || !strings.Contains(reason, "authenticated user") {
+		t.Fatalf("expected local authenticated user access, got allowed=%v reason=%q", allowed, reason)
 	}
 	expires := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
 	if err := st.LinkControlPlaneForDevice("http://control.test", "org_oclan", "oclan-co", "usr_owner", "dev_remote", device.ID, "at", "rt", 3600, expires); err != nil {
 		t.Fatal(err)
 	}
 	allowed, reason = st.CheckPolicy("usr_owner", "oclan-co/local/asiri/API_KEY", "inject")
-	if allowed || !strings.Contains(reason, "reserved") {
-		t.Fatalf("expected reserved remote human subject denial, got allowed=%v reason=%q", allowed, reason)
+	if !allowed || !strings.Contains(reason, "authenticated user") {
+		t.Fatalf("expected linked authenticated user access, got allowed=%v reason=%q", allowed, reason)
 	}
 	allowed, reason = st.CheckPolicy("usr_owner ", "oclan-co/local/asiri/API_KEY", "inject")
-	if allowed || !strings.Contains(reason, "reserved") {
-		t.Fatalf("expected whitespace-spoofed remote human subject denial, got allowed=%v reason=%q", allowed, reason)
+	if !allowed || !strings.Contains(reason, "authenticated user") {
+		t.Fatalf("expected normalized linked user access, got allowed=%v reason=%q", allowed, reason)
 	}
 }
 

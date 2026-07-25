@@ -11,9 +11,20 @@ import (
 	"testing"
 	"time"
 
-	"github.com/o-clan/asiri/cli/internal/asiri"
 	"github.com/o-clan/asiri/cli/internal/store"
 )
+
+func TestEnvRejectsMultipleAuditLabels(t *testing.T) {
+	_, _, _, err := parseSecretCommandArgs("env", []string{
+		"--label", "deploy",
+		"--agent", "legacy",
+		"prod/api/KEY",
+		"--", "true",
+	}, false)
+	if err == nil || !strings.Contains(err.Error(), "accepts only one --label or --agent value") {
+		t.Fatalf("expected duplicate label error, got %v", err)
+	}
+}
 
 func TestEnvSingleSecretExport(t *testing.T) {
 	tmp := t.TempDir()
@@ -25,7 +36,6 @@ func TestEnvSingleSecretExport(t *testing.T) {
 	for _, step := range [][]string{
 		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")},
-		{"grant", "--workspace", "qa", "sh", "cloudflare/WRANGLER_SECRET", "--inject-only"},
 		{"env", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--", "sh", "-c", "test \"$WRANGLER_SECRET\" = env_secret"},
 	} {
 		out.Reset()
@@ -51,8 +61,6 @@ func TestEnvDirectScopeExport(t *testing.T) {
 		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")},
 		{"add", "--workspace", "qa", "cloudflare/CLOUDFLARE_ACCOUNT_ID", "--value-file", testSecretFile(t, "acct_123")},
 		{"add", "--workspace", "qa", "cloudflare/nested/IGNORED", "--value-file", testSecretFile(t, "ignored")},
-		{"grant", "--workspace", "qa", "sh", "cloudflare/WRANGLER_SECRET", "--inject-only"},
-		{"grant", "--workspace", "qa", "sh", "cloudflare/CLOUDFLARE_ACCOUNT_ID", "--inject-only"},
 		{"env", "--workspace", "qa", "cloudflare", "--", "sh", "-c", "test \"$WRANGLER_SECRET\" = env_secret && test \"$CLOUDFLARE_ACCOUNT_ID\" = acct_123 && test -z \"${IGNORED:-}\""},
 	}
 	for _, step := range steps {
@@ -64,7 +72,7 @@ func TestEnvDirectScopeExport(t *testing.T) {
 	}
 }
 
-func TestEnvRemoteHintFallsBackToSlashyScopeSelection(t *testing.T) {
+func TestEnvRemoteHintIgnoresAuditLabels(t *testing.T) {
 	tmp := t.TempDir()
 	oldHome := os.Getenv("ASIRI_HOME")
 	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", oldHome) })
@@ -149,87 +157,28 @@ func TestEnvRemoteHintFallsBackToSlashyScopeSelection(t *testing.T) {
 	if code := app.Run([]string{"env", "--workspace", "oclan-co", "prod/github", "--", "sh", "-c", "true"}); code == 0 {
 		t.Fatal("expected remote-only scope selection to fail before execution")
 	}
-	if overviewSeen {
-		t.Fatal("remote lookup should not run without an inject grant")
+	if !overviewSeen {
+		t.Fatal("expected remote metadata lookup for authenticated user")
 	}
-	if !strings.Contains(errb.String(), "no exact secret or direct child secrets found") {
-		t.Fatalf("unexpected ungranted stderr: %s", errb.String())
-	}
-
-	st, err = store.LoadDefault()
-	if err != nil {
-		t.Fatal(err)
-	}
-	st.State.Policies = append(st.State.Policies, asiri.Policy{
-		ID:            "pol_remote_scope_hint",
-		Subject:       "sh",
-		ScopePattern:  "oclan-co/prod/github",
-		SecretPattern: "*",
-		Actions:       []string{"inject"},
-		ApprovalMode:  "none",
-		CreatedAt:     time.Now().UTC(),
-	}, asiri.Policy{
-		ID:            "pol_remote_scope_hint_denied",
-		Subject:       "sh",
-		ScopePattern:  "oclan-co/prod/github",
-		SecretPattern: "DENIED_KEY",
-		Actions:       []string{"deny"},
-		ApprovalMode:  "require-owner",
-		CreatedAt:     time.Now().UTC(),
-	})
-	if err := st.Save(); err != nil {
-		t.Fatal(err)
+	if !strings.Contains(errb.String(), "2 direct child secret(s) exist remotely under oclan-co/prod/github") {
+		t.Fatalf("unexpected remote hint: %s", errb.String())
 	}
 
 	overviewSeen = false
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"env", "--workspace", "oclan-co", "prod/github", "--", "sh", "-c", "true"}); code == 0 {
+	if code := app.Run([]string{"env", "--workspace", "oclan-co", "--label", "deployment", "prod/github", "--", "sh", "-c", "true"}); code == 0 {
 		t.Fatal("expected remote-only scope selection to fail before execution")
 	}
 	if !overviewSeen {
-		t.Fatal("expected remote metadata lookup")
+		t.Fatal("audit label suppressed remote metadata lookup")
 	}
-	for _, expected := range []string{
-		"1 direct child secret(s) exist remotely under oclan-co/prod/github",
-		"not locally usable on this device",
-		"asiri rewrap --workspace oclan-co",
-		"asiri pull --workspace oclan-co",
-	} {
-		if !strings.Contains(errb.String(), expected) {
-			t.Fatalf("missing %q in stderr: %s", expected, errb.String())
-		}
-	}
-	if strings.Contains(errb.String(), "2 direct child") {
-		t.Fatalf("denied remote child should not be counted in hint: %s", errb.String())
-	}
-
-	remoteVisibleSecrets = []map[string]any{{
-		"id":                     "sec_denied_child",
-		"orgId":                  "org_runtime",
-		"workspaceSlug":          "oclan-co",
-		"scope":                  "oclan-co/prod/github",
-		"name":                   "DENIED_KEY",
-		"version":                1,
-		"status":                 "active",
-		"canWrite":               true,
-		"wrappedToCurrentDevice": false,
-	}}
-	overviewSeen = false
-	out.Reset()
-	errb.Reset()
-	if code := app.Run([]string{"env", "--workspace", "oclan-co", "prod/github", "--", "sh", "-c", "true"}); code == 0 {
-		t.Fatal("expected denied-only remote scope selection to fail before execution")
-	}
-	if !overviewSeen {
-		t.Fatal("expected remote metadata lookup for denied-only scope")
-	}
-	if !strings.Contains(errb.String(), "no exact secret or direct child secrets found") || strings.Contains(errb.String(), "direct child secret(s) exist remotely") {
-		t.Fatalf("denied-only remote children should not produce inventory hint: %s", errb.String())
+	if !strings.Contains(errb.String(), "2 direct child secret(s) exist remotely under oclan-co/prod/github") {
+		t.Fatalf("audit label changed remote hint: %s", errb.String())
 	}
 }
 
-func TestEnvInvalidNameAndMissingGrantDoNotExecute(t *testing.T) {
+func TestEnvInvalidNameBlocksButAuditLabelDoesNot(t *testing.T) {
 	tmp := t.TempDir()
 	oldHome := os.Getenv("ASIRI_HOME")
 	oldPath := os.Getenv("PATH")
@@ -244,7 +193,7 @@ func TestEnvInvalidNameAndMissingGrantDoNotExecute(t *testing.T) {
 	_ = os.Setenv("PATH", binDir+string(os.PathListSeparator)+oldPath)
 	var out, errb bytes.Buffer
 	app := New(&out, &errb)
-	setup := [][]string{{"init", "--device", "qa-laptop", "--workspace", "qa"}, {"add", "--workspace", "qa", "cloudflare/BAD-NAME", "--value-file", testSecretFile(t, "bad_secret")}, {"grant", "--workspace", "qa", "tool", "cloudflare/BAD-NAME", "--inject-only"}, {"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")}}
+	setup := [][]string{{"init", "--device", "qa-laptop", "--workspace", "qa"}, {"add", "--workspace", "qa", "cloudflare/BAD-NAME", "--value-file", testSecretFile(t, "bad_secret")}, {"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")}}
 	for _, step := range setup {
 		out.Reset()
 		errb.Reset()
@@ -262,14 +211,11 @@ func TestEnvInvalidNameAndMissingGrantDoNotExecute(t *testing.T) {
 	}
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"env", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--", "tool"}); code == 0 {
-		t.Fatal("expected missing grant failure")
+	if code := app.Run([]string{"env", "--workspace", "qa", "--label", "arbitrary", "cloudflare/WRANGLER_SECRET", "--", "tool"}); code != 0 {
+		t.Fatalf("audit label changed env authorization: %s", errb.String())
 	}
-	if !strings.Contains(errb.String(), "tool cannot inject qa/cloudflare/WRANGLER_SECRET") {
-		t.Fatalf("unexpected missing-grant stderr=%s", errb.String())
-	}
-	if _, err := os.Stat(marker); !os.IsNotExist(err) {
-		t.Fatalf("child executed despite env preflight failure: %v", err)
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("child did not execute for authenticated runtime: %v", err)
 	}
 	if strings.Contains(out.String(), "env_secret") || strings.Contains(errb.String(), "env_secret") {
 		t.Fatalf("env failure leaked secret stdout=%q stderr=%q", out.String(), errb.String())
@@ -288,7 +234,6 @@ func TestMountSingleSecretFileAndCleanup(t *testing.T) {
 	steps := [][]string{
 		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "mounted_secret")},
-		{"grant", "--workspace", "qa", "sh", "cloudflare/WRANGLER_SECRET", "--mount"},
 		{"mount", "--workspace", "qa", "--dir", mountDir, "cloudflare/WRANGLER_SECRET", "--", "sh", "-c", "test \"$(cat \"$ASIRI_SECRETS_DIR/WRANGLER_SECRET\")\" = mounted_secret && (stat -c %a \"$ASIRI_SECRETS_DIR/WRANGLER_SECRET\" 2>/dev/null || stat -f %Lp \"$ASIRI_SECRETS_DIR/WRANGLER_SECRET\") > '" + modeFile + "'"},
 	}
 	for _, step := range steps {
@@ -320,7 +265,6 @@ func TestMountChildDirArgumentDoesNotChangeMountDirectory(t *testing.T) {
 	steps := [][]string{
 		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "mounted_secret")},
-		{"grant", "--workspace", "qa", "sh", "cloudflare/WRANGLER_SECRET", "--mount"},
 		{"mount", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--", "sh", "-c", "test \"$ASIRI_SECRETS_DIR\" != \"$1\" && test \"$(cat \"$ASIRI_SECRETS_DIR/WRANGLER_SECRET\")\" = mounted_secret", "sh", childDir, "--dir", childDir},
 	}
 	for _, step := range steps {
@@ -346,8 +290,6 @@ func TestMountDirectScopeFiles(t *testing.T) {
 		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "mounted_secret")},
 		{"add", "--workspace", "qa", "cloudflare/CLOUDFLARE_ACCOUNT_ID", "--value-file", testSecretFile(t, "acct_123")},
-		{"grant", "--workspace", "qa", "sh", "cloudflare/WRANGLER_SECRET", "--mount"},
-		{"grant", "--workspace", "qa", "sh", "cloudflare/CLOUDFLARE_ACCOUNT_ID", "--mount"},
 		{"mount", "--workspace", "qa", "cloudflare", "--", "sh", "-c", "test \"$(cat \"$ASIRI_SECRETS_DIR/WRANGLER_SECRET\")\" = mounted_secret && test \"$(cat \"$ASIRI_SECRETS_DIR/CLOUDFLARE_ACCOUNT_ID\")\" = acct_123"},
 	}
 	for _, step := range steps {
@@ -359,7 +301,7 @@ func TestMountDirectScopeFiles(t *testing.T) {
 	}
 }
 
-func TestMountMissingGrantAndUnsafeDestinationDoNotExecute(t *testing.T) {
+func TestMountAuditLabelDoesNotAuthorizeAndUnsafeDestinationDoesNotExecute(t *testing.T) {
 	tmp := t.TempDir()
 	oldHome := os.Getenv("ASIRI_HOME")
 	oldPath := os.Getenv("PATH")
@@ -383,16 +325,14 @@ func TestMountMissingGrantAndUnsafeDestinationDoNotExecute(t *testing.T) {
 	}
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"mount", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--", "tool"}); code == 0 {
-		t.Fatal("expected missing mount grant failure")
+	if code := app.Run([]string{"mount", "--workspace", "qa", "--label", "arbitrary", "cloudflare/WRANGLER_SECRET", "--", "tool"}); code != 0 {
+		t.Fatalf("audit label changed mount authorization: %s", errb.String())
 	}
-	if !strings.Contains(errb.String(), "tool cannot mount qa/cloudflare/WRANGLER_SECRET") {
-		t.Fatalf("unexpected missing-grant stderr=%s", errb.String())
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("child did not execute for authenticated runtime: %v", err)
 	}
-	out.Reset()
-	errb.Reset()
-	if code := app.Run([]string{"grant", "--workspace", "qa", "tool", "cloudflare/WRANGLER_SECRET", "--mount"}); code != 0 {
-		t.Fatalf("grant failed: %s", errb.String())
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
 	}
 	out.Reset()
 	errb.Reset()

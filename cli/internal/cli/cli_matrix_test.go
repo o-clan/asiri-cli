@@ -61,11 +61,9 @@ func TestCLICommandMatrix(t *testing.T) {
 		{[]string{"add", "--help"}, []string{"--workspace <slug>", "short paths"}},
 		{[]string{"rotate", "--help"}, []string{"--workspace <slug>", "short paths"}},
 		{[]string{"rm", "--help"}, []string{"--workspace <slug>", "short paths", "--remote"}},
-		{[]string{"grant", "--help"}, []string{"--workspace <slug>", "short paths"}},
-		{[]string{"deny", "--help"}, []string{"--workspace <slug>", "short paths"}},
-		{[]string{"run", "--help"}, []string{"--workspace <slug>", "short paths"}},
-		{[]string{"env", "--help"}, []string{"--workspace <slug>", "short paths"}},
-		{[]string{"mount", "--help"}, []string{"--workspace <slug>", "short paths"}},
+		{[]string{"run", "--help"}, []string{"--workspace <slug>", "--label", "short paths"}},
+		{[]string{"env", "--help"}, []string{"--workspace <slug>", "--label", "short paths"}},
+		{[]string{"mount", "--help"}, []string{"--workspace <slug>", "--label", "short paths"}},
 	} {
 		help := expectOK(check.args...)
 		for _, want := range check.want {
@@ -85,8 +83,6 @@ func TestCLICommandMatrix(t *testing.T) {
 		{"rotate", "openai/missing", "--value-file", testSecretFile(t, "value")},
 		{"rm", "openai/missing"},
 		{"secret", "delete", "openai/missing"},
-		{"grant", "codex", "openai/missing", "--inject-only"},
-		{"deny", "codex", "openai/*"},
 		{"run", "--env", "API_KEY=openai/missing", "--", "sh", "-c", "true"},
 		{"env", "openai/missing", "--", "sh", "-c", "true"},
 		{"mount", "openai/missing", "--", "sh", "-c", "true"},
@@ -121,25 +117,19 @@ func TestCLICommandMatrix(t *testing.T) {
 	if value := expectOK("get", "--workspace", "qa", "openai/api_key"); strings.TrimSpace(value) != "qa_secret_value" {
 		t.Fatalf("human get returned %q", value)
 	}
-	expectFail("reserved for human identity", "get", "--workspace", "qa", "openai/api_key", "--agent", "local-human")
-	expectFail("reserved for human identity", "grant", "--workspace", "qa", "local-human", "openai/api_key", "--read")
-	expectOK("grant", "--workspace", "qa", "codex", "openai/api_key", "--inject-only")
-	expectFail("raw read requires", "get", "--workspace", "qa", "openai/api_key", "--agent", "codex")
-	expectOK("grant", "--workspace", "qa", "analyst", "openai/api_key", "--read")
-	if value := expectOK("get", "--workspace", "qa", "openai/api_key", "--agent", "analyst"); strings.TrimSpace(value) != "qa_secret_value" {
-		t.Fatalf("explicit agent read grant failed: %q", value)
+	if value := expectOK("get", "--workspace", "qa", "openai/api_key", "--label", "local-human"); strings.TrimSpace(value) != "qa_secret_value" {
+		t.Fatalf("audit label changed human read authorization: %q", value)
 	}
-	expectOK("deny", "--workspace", "qa", "prod-bot", "prod/*")
-	expectOK("grant", "--workspace", "qa", "prod-bot", "openai/api_key", "--inject-only")
-	expectOK("deny", "--workspace", "qa", "blocked-bot", "openai/*")
-	expectOK("grant", "--workspace", "qa", "blocked-bot", "openai/api_key", "--inject-only")
-	expectFail("access denied by owner policy", "run", "--workspace", "qa", "--agent", "blocked-bot", "--env", "OPENAI_API_KEY=openai/api_key", "--", "sh", "-c", "true")
+	if value := expectOK("get", "--workspace", "qa", "openai/api_key", "--agent", "legacy-agent-label"); strings.TrimSpace(value) != "qa_secret_value" {
+		t.Fatalf("legacy --agent alias changed human read authorization: %q", value)
+	}
+	expectFail("unknown command", "grant", "--workspace", "qa", "codex", "openai/api_key", "--inject-only")
+	expectFail("unknown command", "deny", "--workspace", "qa", "blocked-bot", "openai/*")
+	expectOK("run", "--workspace", "qa", "--label", "blocked-bot", "--env", "OPENAI_API_KEY=openai/api_key", "--", "sh", "-c", "true")
 	expectFail("requires --workspace", "run", "--agent", "codex", "sh", "-c", "test asiri://openai/api_key = qa_secret_value")
 	expectFail("argument substitution is disabled", "run", "--workspace", "qa", "--agent", "codex", "sh", "-c", "test asiri://openai/api_key = qa_secret_value")
-	expectOK("run", "--workspace", "qa", "--agent", "codex", "--unsafe-argv", "sh", "-c", "test $1 = qa_secret_value", "sh", "asiri://openai/api_key")
-	if policies := expectOK("policy", "list", "--workspace", "qa"); !strings.Contains(policies, "codex") || !strings.Contains(policies, "analyst") || !strings.Contains(policies, "prod-bot") {
-		t.Fatalf("policy list missing grants/denies: %s", policies)
-	}
+	expectOK("run", "--workspace", "qa", "--label", "codex", "--unsafe-argv", "sh", "-c", "test $1 = qa_secret_value", "sh", "asiri://openai/api_key")
+	expectOK("policy", "list", "--workspace", "qa")
 	expectOK("run", "--workspace", "qa", "--agent", "codex", "--env", "OPENAI_API_KEY=openai/api_key", "--", "sh", "-c", "test \"$OPENAI_API_KEY\" = qa_secret_value")
 	expectFail("requires --workspace", "broker", "start", "--once")
 	expectOK("rotate", "--workspace", "qa", "openai/api_key", "--value-file", testSecretFile(t, "qa_rotated_value"))

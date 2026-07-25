@@ -239,7 +239,6 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 	if err := st.Save(); err != nil {
 		t.Fatal(err)
 	}
-	childName := filepath.Base(os.Args[0])
 	oldCompareHelper := os.Getenv("ASIRI_MOUNT_BYTE_COMPARE_HELPER")
 	t.Cleanup(func() { _ = os.Setenv("ASIRI_MOUNT_BYTE_COMPARE_HELPER", oldCompareHelper) })
 	if err := os.Setenv("ASIRI_MOUNT_BYTE_COMPARE_HELPER", "1"); err != nil {
@@ -248,7 +247,6 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 	for _, step := range [][]string{
 		{"pull", "--workspace", "oclan-co"},
 		{"rewrap", "--workspace", "oclan-co"},
-		{"grant", "--workspace", "oclan-co", childName, "local/asiri/API_KEY", "--mount"},
 		{"mount", "--workspace", "oclan-co", "local/asiri/API_KEY:" + mountedPath, "--", os.Args[0], "-test.run=^TestPushAndPullUseBearerAccessToken$", "--", mountedPath, sourcePath},
 	} {
 		out.Reset()

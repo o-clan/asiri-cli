@@ -1048,116 +1048,40 @@ func (s *FileStore) RemoveSecret(fullPath string) error {
 	return nil
 }
 
-func (s *FileStore) Grant(subject, fullPath string, actions []string) (asiri.Policy, error) {
-	if err := s.RequireInitialized(); err != nil {
-		return asiri.Policy{}, err
-	}
-	subject = NormalizeSubjectLabel(subject)
-	if err := s.ValidateSubjectLabel(subject); err != nil {
-		return asiri.Policy{}, err
-	}
-	scope, name, err := ParseSecretPath(fullPath)
-	if err != nil {
-		return asiri.Policy{}, err
-	}
-	policy := asiri.Policy{ID: NewID("pol"), Subject: subject, ScopePattern: scope, SecretPattern: name, Actions: actions, ApprovalMode: "none", CreatedAt: time.Now().UTC()}
-	s.State.Policies = append(s.State.Policies, policy)
-	s.Audit(s.State.UserID, "policy_changed", "allowed", scope, HashSecretName(scope, name), "grant created", map[string]string{"subject": subject, "actions": strings.Join(actions, ",")})
-	return policy, s.Save()
-}
-
-func (s *FileStore) Deny(subject, pattern string) (asiri.Policy, error) {
-	if err := s.RequireInitialized(); err != nil {
-		return asiri.Policy{}, err
-	}
-	subject = NormalizeSubjectLabel(subject)
-	if err := s.ValidateSubjectLabel(subject); err != nil {
-		return asiri.Policy{}, err
-	}
-	scope := pattern
-	name := "*"
-	if strings.Contains(pattern, "/") {
-		parts := strings.Split(pattern, "/")
-		if len(parts) > 1 {
-			name = parts[len(parts)-1]
-			scope = strings.Join(parts[:len(parts)-1], "/")
-		}
-	}
-	policy := asiri.Policy{ID: NewID("pol"), Subject: subject, ScopePattern: scope, SecretPattern: name, Actions: []string{"deny"}, ApprovalMode: "require-owner", CreatedAt: time.Now().UTC()}
-	s.State.Policies = append(s.State.Policies, policy)
-	s.Audit(s.State.UserID, "policy_changed", "allowed", scope, "", "deny policy created", map[string]string{"subject": subject})
-	return policy, s.Save()
-}
-
-func (s *FileStore) CheckPolicy(subject, fullPath, action string) (bool, string) {
-	subject = NormalizeSubjectLabel(subject)
+func (s *FileStore) CheckPolicy(actor, fullPath, action string) (bool, string) {
+	actor = NormalizeSubjectLabel(actor)
 	scope, name, err := ParseSecretPath(fullPath)
 	if err != nil {
 		return false, err.Error()
 	}
+	if actor == s.State.UserID || (s.State.ControlPlane != nil && s.State.ControlPlane.Source != "service-account" && actor == s.State.ControlPlane.UserID) {
+		return true, "authenticated user on trusted device"
+	}
+	if !strings.HasPrefix(actor, "service-account:") {
+		return false, "runtime identity is not authenticated"
+	}
 	now := time.Now().UTC()
-	if subject != "" && s.isReservedSubjectLabel(subject) {
-		return false, "subject label is reserved for human identity"
-	}
-	if subject != "" {
-		for _, policy := range s.State.Policies {
-			if policyExpired(policy, now) {
-				continue
-			}
-			if policy.Subject == subject && MatchPattern(policy.ScopePattern, scope) && MatchPattern(policy.SecretPattern, name) && contains(policy.Actions, "deny") {
-				return false, "access denied by owner policy"
-			}
+	for _, policy := range s.State.Policies {
+		if policyExpired(policy, now) {
+			continue
 		}
-	}
-	if action == "read" && subject != "" {
-		for _, policy := range s.State.Policies {
-			if policyExpired(policy, now) {
-				continue
-			}
-			if policy.Subject == subject && policy.ApprovalMode == "none" && MatchPattern(policy.ScopePattern, scope) && MatchPattern(policy.SecretPattern, name) && contains(policy.Actions, "read") {
-				return true, "explicit raw read grant"
-			}
+		if policy.Subject == actor && MatchPattern(policy.ScopePattern, scope) && MatchPattern(policy.SecretPattern, name) && contains(policy.Actions, "deny") {
+			return false, "access denied by service account policy"
 		}
-		return false, "agent raw read requires explicit policy"
-	}
-	if subject == "" {
-		return true, "human local runtime access"
 	}
 	for _, policy := range s.State.Policies {
 		if policyExpired(policy, now) {
 			continue
 		}
-		if policy.Subject == subject && policy.ApprovalMode == "none" && MatchPattern(policy.ScopePattern, scope) && MatchPattern(policy.SecretPattern, name) && contains(policy.Actions, action) {
-			return true, "policy allowed"
+		if policy.Subject == actor && policy.ApprovalMode == "none" && MatchPattern(policy.ScopePattern, scope) && MatchPattern(policy.SecretPattern, name) && contains(policy.Actions, action) {
+			return true, "service account policy allowed"
 		}
 	}
-	return false, "no matching policy"
+	return false, "service account has no matching policy"
 }
 
 func policyExpired(policy asiri.Policy, now time.Time) bool {
 	return policy.ExpiresAt != nil && !policy.ExpiresAt.After(now)
-}
-
-func (s *FileStore) ValidateSubjectLabel(subject string) error {
-	subject = NormalizeSubjectLabel(subject)
-	if subject == "" {
-		return errors.New("subject label is required")
-	}
-	if s.isReservedSubjectLabel(subject) {
-		return errors.New("subject label is reserved for human identity")
-	}
-	return nil
-}
-
-func (s *FileStore) isReservedSubjectLabel(subject string) bool {
-	subject = NormalizeSubjectLabel(subject)
-	if subject == "" {
-		return false
-	}
-	if s.State.UserID != "" && subject == s.State.UserID {
-		return true
-	}
-	return s.State.ControlPlane != nil && s.State.ControlPlane.UserID != "" && subject == s.State.ControlPlane.UserID
 }
 
 func NormalizeSubjectLabel(subject string) string {

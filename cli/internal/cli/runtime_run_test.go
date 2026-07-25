@@ -39,7 +39,6 @@ func TestRunDirectAsiriRefUsesCommandBasenamePolicy(t *testing.T) {
 	steps := [][]string{
 		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "cloudflare/prod-token", "--value-file", testSecretFile(t, "cf_prod_token")},
-		{"grant", "--workspace", "qa", "wrangler", "cloudflare/prod-token", "--inject-only"},
 	}
 	for _, step := range steps {
 		out.Reset()
@@ -136,7 +135,6 @@ func TestRunExplicitEnvMappingUsesCommandBasenamePolicy(t *testing.T) {
 	steps := [][]string{
 		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "cloudflare/WRANGLER_SECRET", "--value-file", testSecretFile(t, "env_secret")},
-		{"grant", "--workspace", "qa", "wrangler", "cloudflare/WRANGLER_SECRET", "--inject-only"},
 		{"run", "--workspace", "qa", "--env", "WRANGLER_SECRET=cloudflare/WRANGLER_SECRET", "--", "wrangler", "deploy"},
 	}
 	for _, step := range steps {
@@ -162,7 +160,7 @@ func TestRunExplicitEnvMappingUsesCommandBasenamePolicy(t *testing.T) {
 	}
 }
 
-func TestRunExplicitEnvMappingDeniesMissingDerivedCommandGrant(t *testing.T) {
+func TestRunExplicitEnvMappingUsesCommandNameOnlyForAudit(t *testing.T) {
 	tmp := t.TempDir()
 	oldHome := os.Getenv("ASIRI_HOME")
 	oldPath := os.Getenv("PATH")
@@ -198,14 +196,11 @@ func TestRunExplicitEnvMappingDeniesMissingDerivedCommandGrant(t *testing.T) {
 	}
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"run", "--workspace", "qa", "--env", "WRANGLER_SECRET=cloudflare/WRANGLER_SECRET", "--", "wrangler", "deploy"}); code == 0 {
-		t.Fatalf("expected explicit env mapping denial, stdout=%s", out.String())
+	if code := app.Run([]string{"run", "--workspace", "qa", "--env", "WRANGLER_SECRET=cloudflare/WRANGLER_SECRET", "--", "wrangler", "deploy"}); code != 0 {
+		t.Fatalf("command basename changed authorization: %s", errb.String())
 	}
-	if !strings.Contains(errb.String(), "wrangler cannot inject qa/cloudflare/WRANGLER_SECRET") {
-		t.Fatalf("missing clear denial stderr: %s", errb.String())
-	}
-	if _, err := os.Stat(marker); !os.IsNotExist(err) {
-		t.Fatalf("denied explicit env mapping executed child command; marker err=%v", err)
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("authenticated runtime did not execute child command: %v", err)
 	}
 	if strings.Contains(out.String(), "env_secret") || strings.Contains(errb.String(), "env_secret") {
 		t.Fatalf("denial leaked secret stdout=%q stderr=%q", out.String(), errb.String())
@@ -215,8 +210,8 @@ func TestRunExplicitEnvMappingDeniesMissingDerivedCommandGrant(t *testing.T) {
 	if code := app.Run([]string{"audit", "tail", "--workspace", "qa", "--limit", "5"}); code != 0 {
 		t.Fatalf("audit failed: %s", errb.String())
 	}
-	if !strings.Contains(out.String(), "wrangler") || !strings.Contains(out.String(), "secret_injected") || !strings.Contains(out.String(), "denied") {
-		t.Fatalf("audit missing explicit env mapping denial event: %s", out.String())
+	if !strings.Contains(out.String(), "wrangler") || !strings.Contains(out.String(), "secret_injected") || !strings.Contains(out.String(), "allowed") {
+		t.Fatalf("audit missing command-name label: %s", out.String())
 	}
 }
 
@@ -247,7 +242,6 @@ func TestRunDirectAsiriRefSupportsExplicitAgentAndEmbeddedRefs(t *testing.T) {
 	steps := [][]string{
 		{"init", "--device", "qa-laptop", "--workspace", "org"},
 		{"add", "--workspace", "org", "team/cloudflare/prod-token", "--value-file", testSecretFile(t, "embedded_token")},
-		{"grant", "--workspace", "org", "release-bot", "team/cloudflare/prod-token", "--inject-only"},
 	}
 	for _, step := range steps {
 		out.Reset()
@@ -294,7 +288,7 @@ func TestRunDirectAsiriRefSupportsExplicitAgentAndEmbeddedRefs(t *testing.T) {
 	}
 }
 
-func TestRunDirectAsiriRefDeniesMissingGrantBeforeExecuting(t *testing.T) {
+func TestRunDirectAsiriRefLabelDoesNotRequireGrant(t *testing.T) {
 	tmp := t.TempDir()
 	oldHome := os.Getenv("ASIRI_HOME")
 	oldPath := os.Getenv("PATH")
@@ -330,14 +324,11 @@ func TestRunDirectAsiriRefDeniesMissingGrantBeforeExecuting(t *testing.T) {
 	}
 	out.Reset()
 	errb.Reset()
-	if code := app.Run([]string{"run", "--workspace", "qa", "--unsafe-argv", "wrangler", "deploy", "--token", "asiri://cloudflare/prod-token"}); code == 0 {
-		t.Fatalf("expected direct run denial, stdout=%s", out.String())
+	if code := app.Run([]string{"run", "--workspace", "qa", "--label", "release", "--unsafe-argv", "wrangler", "deploy", "--token", "asiri://cloudflare/prod-token"}); code != 0 {
+		t.Fatalf("audit label changed authorization: %s", errb.String())
 	}
-	if !strings.Contains(errb.String(), "wrangler cannot inject qa/cloudflare/prod-token") {
-		t.Fatalf("missing clear denial stderr: %s", errb.String())
-	}
-	if _, err := os.Stat(marker); !os.IsNotExist(err) {
-		t.Fatalf("denied direct run executed child command; marker err=%v", err)
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("authenticated runtime did not execute child command: %v", err)
 	}
 	if strings.Contains(out.String(), "cf_prod_token") || strings.Contains(errb.String(), "cf_prod_token") {
 		t.Fatalf("denial leaked secret stdout=%q stderr=%q", out.String(), errb.String())

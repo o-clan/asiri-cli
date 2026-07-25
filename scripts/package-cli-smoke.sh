@@ -65,6 +65,12 @@ test -f "$skill_extract_dir/asiri/SKILL.md"
 test -f "$skill_extract_dir/asiri/agents/openai.yaml"
 grep -q '^name: asiri$' "$skill_extract_dir/asiri/SKILL.md"
 grep -q '^description: ' "$skill_extract_dir/asiri/SKILL.md"
+grep -q -- '--label' "$skill_extract_dir/asiri/SKILL.md"
+grep -q 'audit metadata only' "$skill_extract_dir/asiri/SKILL.md"
+if grep -Eq 'asiri (grant|deny)( |$)' "$skill_extract_dir/asiri/SKILL.md"; then
+  echo "packaged skill still references removed root label policy commands" >&2
+  exit 1
+fi
 grep -q '^interface:$' "$skill_extract_dir/asiri/agents/openai.yaml"
 
 test -f "$OUT_DIR/SHA256SUMS"

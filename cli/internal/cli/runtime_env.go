@@ -27,8 +27,8 @@ func (a App) env(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	agentExplicit := hasFlag(remaining, "--agent")
-	agent, pathSpec, commandArgs, err := parseSecretCommandArgs("env", remaining, false)
+	labelExplicit := hasFlag(remaining, "--label") || hasFlag(remaining, "--agent")
+	label, pathSpec, commandArgs, err := parseSecretCommandArgs("env", remaining, false)
 	if err != nil {
 		return a.fail(err)
 	}
@@ -36,11 +36,11 @@ func (a App) env(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	agent, runtimeType, err := runtimeSubject(st, agent, filepath.Base(commandArgs[0]), agentExplicit)
+	runtime, err := runtimeAccess(st, label, filepath.Base(commandArgs[0]), labelExplicit)
 	if err != nil {
 		return a.fail(err)
 	}
-	paths, err := a.selectedSecretPaths(st, pathSpec, agent, "inject")
+	paths, err := a.selectedSecretPaths(st, pathSpec, runtime.Actor, "inject")
 	if err != nil {
 		return a.fail(err)
 	}
@@ -58,7 +58,7 @@ func (a App) env(st *store.FileStore, args []string) int {
 			return a.fail(fmt.Errorf("environment variable %s would collide", secret.Name))
 		}
 		envAdds[secret.Name] = ""
-		release, err := a.prepareSecretRelease(st, agent, runtimeType, "inject", "secret_env_exported", path, "inject materialization", map[string]string{"mode": "inject"})
+		release, err := a.prepareSecretRelease(st, runtime, "inject", "secret_env_exported", path, "inject materialization", map[string]string{"mode": "inject"})
 		if err != nil {
 			_ = st.Save()
 			a.syncRuntimeAuditBestEffort(st)
@@ -66,13 +66,13 @@ func (a App) env(st *store.FileStore, args []string) int {
 		}
 		prepared = append(prepared, release)
 	}
-	if err := a.gatePreparedSecretReleases(st, agent, prepared); err != nil {
+	if err := a.gatePreparedSecretReleases(st, runtime.Actor, prepared); err != nil {
 		return a.fail(err)
 	}
 	for _, release := range prepared {
 		value, secret, err := st.GetSecret(release.Path)
 		if err != nil {
-			a.auditFailedPreparedRelease(st, agent, release, "secret release failed after audit gate: "+err.Error())
+			a.auditFailedPreparedRelease(st, runtime.Actor, release, "secret release failed after audit gate: "+err.Error())
 			_ = st.Save()
 			a.syncRuntimeAuditBestEffort(st)
 			return a.fail(err)
@@ -101,12 +101,12 @@ func (a App) mount(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	agentExplicit := hasFlag(remaining, "--agent")
-	agent, pathSpec, commandArgs, err := parseSecretCommandArgs("mount", remaining, true)
+	labelExplicit := hasFlag(remaining, "--label") || hasFlag(remaining, "--agent")
+	label, pathSpec, commandArgs, err := parseSecretCommandArgs("mount", remaining, true)
 	if err != nil {
 		return a.fail(err)
 	}
-	agent, runtimeType, err := runtimeSubject(st, agent, filepath.Base(commandArgs[0]), agentExplicit)
+	runtime, err := runtimeAccess(st, label, filepath.Base(commandArgs[0]), labelExplicit)
 	if err != nil {
 		return a.fail(err)
 	}
@@ -115,7 +115,7 @@ func (a App) mount(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	paths, err := a.selectedSecretPaths(st, pathPart, agent, "mount")
+	paths, err := a.selectedSecretPaths(st, pathPart, runtime.Actor, "mount")
 	if err != nil {
 		return a.fail(err)
 	}
@@ -137,7 +137,7 @@ func (a App) mount(st *store.FileStore, args []string) int {
 	}()
 	seenTargets := map[string]bool{}
 	for _, path := range paths {
-		release, err := a.prepareSecretRelease(st, agent, runtimeType, "mount", "secret_mounted", path, "mount materialization", map[string]string{"mode": "mount"})
+		release, err := a.prepareSecretRelease(st, runtime, "mount", "secret_mounted", path, "mount materialization", map[string]string{"mode": "mount"})
 		if err != nil {
 			_ = st.Save()
 			a.syncRuntimeAuditBestEffort(st)
@@ -206,19 +206,19 @@ func (a App) mount(st *store.FileStore, args []string) int {
 	for _, target := range reservedTargets {
 		preparedReleases = append(preparedReleases, target.release)
 	}
-	if err := a.gatePreparedSecretReleases(st, agent, preparedReleases); err != nil {
+	if err := a.gatePreparedSecretReleases(st, runtime.Actor, preparedReleases); err != nil {
 		return a.fail(err)
 	}
 	for index := range reservedTargets {
 		value, _, err := st.GetSecretBytes(reservedTargets[index].release.Path)
 		if err != nil {
-			a.auditFailedPreparedRelease(st, agent, reservedTargets[index].release, "secret release failed after audit gate: "+err.Error())
+			a.auditFailedPreparedRelease(st, runtime.Actor, reservedTargets[index].release, "secret release failed after audit gate: "+err.Error())
 			_ = st.Save()
 			a.syncRuntimeAuditBestEffort(st)
 			return a.fail(err)
 		}
 		if err := writeReservedSecretFile(reservedTargets[index].file, value); err != nil {
-			a.auditFailedPreparedRelease(st, agent, reservedTargets[index].release, "secret file write failed after audit gate: "+err.Error())
+			a.auditFailedPreparedRelease(st, runtime.Actor, reservedTargets[index].release, "secret file write failed after audit gate: "+err.Error())
 			_ = st.Save()
 			a.syncRuntimeAuditBestEffort(st)
 			return a.fail(err)
@@ -237,16 +237,21 @@ func (a App) mount(st *store.FileStore, args []string) int {
 }
 
 func parseSecretCommandArgs(command string, args []string, allowDir bool) (string, string, []string, error) {
-	agent := ""
+	label := ""
+	labelSeen := false
 	pathSpec := ""
 	cmdIndex := -1
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
-		case "--agent":
-			if i+1 >= len(args) {
-				return "", "", nil, errors.New("--agent requires a subject")
+		case "--label", "--agent":
+			if labelSeen {
+				return "", "", nil, fmt.Errorf("%s accepts only one --label or --agent value", command)
 			}
-			agent = store.NormalizeSubjectLabel(args[i+1])
+			if i+1 >= len(args) {
+				return "", "", nil, fmt.Errorf("%s requires a label", args[i])
+			}
+			labelSeen = true
+			label = store.NormalizeSubjectLabel(args[i+1])
 			i++
 		case "--dir":
 			if !allowDir {
@@ -276,7 +281,7 @@ func parseSecretCommandArgs(command string, args []string, allowDir bool) (strin
 	if cmdIndex < 0 || cmdIndex >= len(args) {
 		return "", "", nil, fmt.Errorf("%s requires -- <command...>", command)
 	}
-	return store.NormalizeSubjectLabel(agent), pathSpec, args[cmdIndex:], nil
+	return store.NormalizeSubjectLabel(label), pathSpec, args[cmdIndex:], nil
 }
 
 func mountDirFromArgs(args []string) string {
@@ -291,14 +296,14 @@ func mountDirFromArgs(args []string) string {
 	return ""
 }
 
-func (a App) resolveSecretSelection(st *store.FileStore, pathSpec, agent, runtimeType, action, auditAction string) ([]resolvedSecret, error) {
-	paths, err := a.selectedSecretPaths(st, pathSpec, agent, action)
+func (a App) resolveSecretSelection(st *store.FileStore, pathSpec string, runtime runtimeAccessContext, action, auditAction string) ([]resolvedSecret, error) {
+	paths, err := a.selectedSecretPaths(st, pathSpec, runtime.Actor, action)
 	if err != nil {
 		return nil, err
 	}
 	resolved := make([]resolvedSecret, 0, len(paths))
 	for _, path := range paths {
-		item, err := a.resolveOneSecret(st, agent, runtimeType, action, auditAction, path)
+		item, err := a.resolveOneSecret(st, runtime, action, auditAction, path)
 		if err != nil {
 			return nil, err
 		}
@@ -307,7 +312,7 @@ func (a App) resolveSecretSelection(st *store.FileStore, pathSpec, agent, runtim
 	return resolved, nil
 }
 
-func (a App) selectedSecretPaths(st *store.FileStore, pathSpec, agent, action string) ([]string, error) {
+func (a App) selectedSecretPaths(st *store.FileStore, pathSpec, actor, action string) ([]string, error) {
 	pathSpec = strings.Trim(pathSpec, "/")
 	if pathSpec == "" {
 		return nil, errors.New("secret path or scope is required")
@@ -325,8 +330,8 @@ func (a App) selectedSecretPaths(st *store.FileStore, pathSpec, agent, action st
 		}
 	}
 	if len(keys) == 0 {
-		if allowHint, allowScopeHint := remoteHintPolicy(st, pathSpec, agent, action); allowHint {
-			if hint := a.remoteSelectionHint(st, pathSpec, agent, action, allowScopeHint); hint != "" {
+		if allowHint, allowScopeHint := remoteHintPolicy(st, pathSpec, actor, action); allowHint {
+			if hint := a.remoteSelectionHint(st, pathSpec, actor, action, allowScopeHint); hint != "" {
 				return nil, errors.New(hint)
 			}
 		}
@@ -341,28 +346,28 @@ func (a App) selectedSecretPaths(st *store.FileStore, pathSpec, agent, action st
 	return paths, nil
 }
 
-func remoteHintPolicy(st *store.FileStore, pathSpec, agent, action string) (bool, bool) {
-	if agent == "" {
+func remoteHintPolicy(st *store.FileStore, pathSpec, actor, action string) (bool, bool) {
+	if !strings.HasPrefix(actor, "service-account:") {
 		return true, true
 	}
-	if allowed, _ := st.CheckPolicy(agent, pathSpec, action); allowed {
+	if allowed, _ := st.CheckPolicy(actor, pathSpec, action); allowed {
 		return true, false
 	}
-	if remoteScopeHintPolicyAllowed(st, pathSpec, agent, action) {
+	if remoteScopeHintPolicyAllowed(st, pathSpec, actor, action) {
 		return true, true
 	}
 	return false, false
 }
 
-func remoteScopeHintPolicyAllowed(st *store.FileStore, pathSpec, agent, action string) bool {
-	agent = store.NormalizeSubjectLabel(agent)
+func remoteScopeHintPolicyAllowed(st *store.FileStore, pathSpec, actor, action string) bool {
+	actor = store.NormalizeSubjectLabel(actor)
 	pathSpec = strings.Trim(pathSpec, "/")
 	now := time.Now().UTC()
 	for _, policy := range st.State.Policies {
 		if policy.ExpiresAt != nil && !policy.ExpiresAt.After(now) {
 			continue
 		}
-		if policy.Subject == agent && store.MatchPattern(policy.ScopePattern, pathSpec) && policy.SecretPattern == "*" && cliStringSliceContains(policy.Actions, "deny") {
+		if policy.Subject == actor && store.MatchPattern(policy.ScopePattern, pathSpec) && policy.SecretPattern == "*" && cliStringSliceContains(policy.Actions, "deny") {
 			return false
 		}
 	}
@@ -370,7 +375,7 @@ func remoteScopeHintPolicyAllowed(st *store.FileStore, pathSpec, agent, action s
 		if policy.ExpiresAt != nil && !policy.ExpiresAt.After(now) {
 			continue
 		}
-		if policy.Subject == agent && policy.ApprovalMode == "none" && store.MatchPattern(policy.ScopePattern, pathSpec) && policy.SecretPattern == "*" && cliStringSliceContains(policy.Actions, action) {
+		if policy.Subject == actor && policy.ApprovalMode == "none" && store.MatchPattern(policy.ScopePattern, pathSpec) && policy.SecretPattern == "*" && cliStringSliceContains(policy.Actions, action) {
 			return true
 		}
 	}
@@ -386,7 +391,7 @@ func cliStringSliceContains(values []string, want string) bool {
 	return false
 }
 
-func (a App) remoteSelectionHint(st *store.FileStore, pathSpec, agent, action string, allowScopeHint bool) string {
+func (a App) remoteSelectionHint(st *store.FileStore, pathSpec, actor, action string, allowScopeHint bool) string {
 	if st.State.ControlPlane == nil || st.State.ControlPlane.Origin == "" {
 		return ""
 	}
@@ -406,7 +411,7 @@ func (a App) remoteSelectionHint(st *store.FileStore, pathSpec, agent, action st
 	exactMatch := false
 	if scope, name, err := store.ParseSecretPath(pathSpec); err == nil {
 		for _, secret := range secrets {
-			if secret.Status == "active" && secret.Scope == scope && secret.Name == name && remoteHintSecretAllowed(st, secret, agent, action) {
+			if secret.Status == "active" && secret.Scope == scope && secret.Name == name && remoteHintSecretAllowed(st, secret, actor, action) {
 				matches = append(matches, secret)
 			}
 		}
@@ -414,7 +419,7 @@ func (a App) remoteSelectionHint(st *store.FileStore, pathSpec, agent, action st
 	}
 	if len(matches) == 0 && allowScopeHint {
 		for _, secret := range secrets {
-			if secret.Status == "active" && secret.Scope == pathSpec && remoteHintSecretAllowed(st, secret, agent, action) {
+			if secret.Status == "active" && secret.Scope == pathSpec && remoteHintSecretAllowed(st, secret, actor, action) {
 				matches = append(matches, secret)
 			}
 		}
@@ -439,8 +444,8 @@ func (a App) remoteSelectionHint(st *store.FileStore, pathSpec, agent, action st
 	return fmt.Sprintf("%d direct child secret(s) exist remotely under %s in workspace %s, but are not locally usable on this device; run `asiri rewrap --workspace %s` from a device that can use them, then run `asiri pull --workspace %s` here", len(matches), pathSpec, workspace, workspace, workspace)
 }
 
-func remoteHintSecretAllowed(st *store.FileStore, secret visibleRemoteSecretRecord, agent, action string) bool {
-	allowed, _ := st.CheckPolicy(agent, store.SecretKey(secret.Scope, secret.Name), action)
+func remoteHintSecretAllowed(st *store.FileStore, secret visibleRemoteSecretRecord, actor, action string) bool {
+	allowed, _ := st.CheckPolicy(actor, store.SecretKey(secret.Scope, secret.Name), action)
 	return allowed
 }
 
@@ -453,21 +458,21 @@ func allVisibleMatchesWrappedToCurrentDevice(secrets []visibleRemoteSecretRecord
 	return true
 }
 
-func (a App) resolveOneSecret(st *store.FileStore, agent, runtimeType, action, auditAction, fullPath string) (resolvedSecret, error) {
-	allowed, reason := st.CheckPolicy(agent, fullPath, action)
+func (a App) resolveOneSecret(st *store.FileStore, runtime runtimeAccessContext, action, auditAction, fullPath string) (resolvedSecret, error) {
+	allowed, reason := st.CheckPolicy(runtime.Actor, fullPath, action)
 	scope, name, parseErr := store.ParseSecretPath(fullPath)
 	metadataScope := ""
 	if parseErr == nil {
 		metadataScope = scope
 	}
-	metadata := runtimeAuditMetadata(st, metadataScope, agent, runtimeType, map[string]string{"mode": action})
+	metadata := runtimeAuditMetadata(st, metadataScope, runtime.Label, runtime.LabelType, map[string]string{"mode": action})
 	if !allowed {
 		if parseErr == nil {
-			st.Audit(agent, auditAction, "denied", scope, store.HashSecretName(scope, name), reason, metadata)
+			st.Audit(runtime.Actor, auditAction, "denied", scope, store.HashSecretName(scope, name), reason, metadata)
 		} else {
-			st.Audit(agent, auditAction, "denied", "", "", reason, metadata)
+			st.Audit(runtime.Actor, auditAction, "denied", "", "", reason, metadata)
 		}
-		return resolvedSecret{}, fmt.Errorf("%s: %s cannot %s %s", reason, agent, action, fullPath)
+		return resolvedSecret{}, fmt.Errorf("%s: authenticated runtime cannot %s %s", reason, action, fullPath)
 	}
 	secret, err := st.SecretMetadata(fullPath)
 	if err != nil {
@@ -480,7 +485,7 @@ func (a App) resolveOneSecret(st *store.FileStore, agent, runtimeType, action, a
 	if action == "mount" {
 		auditReason = "mount materialization"
 	}
-	if err := a.gateSecretRelease(st, agent, auditAction, secret.Scope, secret.NameHash, auditReason, metadata); err != nil {
+	if err := a.gateSecretRelease(st, runtime.Actor, auditAction, secret.Scope, secret.NameHash, auditReason, metadata); err != nil {
 		return resolvedSecret{}, err
 	}
 	value, secret, err := st.GetSecret(fullPath)

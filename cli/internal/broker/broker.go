@@ -26,7 +26,9 @@ const (
 )
 
 type Options struct {
-	Workspace    string
+	Workspace string
+	Label     string
+	// Subject is the legacy name for Label. It is retained for API compatibility.
 	Subject      string
 	SocketPath   string
 	ListenAddr   string
@@ -45,8 +47,10 @@ type Summary struct {
 	Address    string
 	ClientFile string
 	Workspace  string
-	Subject    string
-	ExpiresAt  time.Time
+	Label      string
+	// Subject is the legacy name for Label. It is retained for API compatibility.
+	Subject   string
+	ExpiresAt time.Time
 }
 
 type Event struct {
@@ -59,8 +63,10 @@ type Event struct {
 type ValueRequest struct {
 	RequestID string `json:"requestId,omitempty"`
 	Workspace string `json:"workspace,omitempty"`
-	Subject   string `json:"subject,omitempty"`
-	Path      string `json:"path"`
+	Label     string `json:"label,omitempty"`
+	// Subject is a legacy audit-label field. Neither field authorizes the request.
+	Subject string `json:"subject,omitempty"`
+	Path    string `json:"path"`
 }
 
 type ValueResponse struct {
@@ -84,12 +90,14 @@ func (e *Error) Error() string {
 type Handler func(context.Context, ValueRequest) (ValueResponse, error)
 
 type clientConfig struct {
-	Version   int       `json:"version"`
-	Mode      string    `json:"mode"`
-	Address   string    `json:"address"`
-	URL       string    `json:"url,omitempty"`
-	Token     string    `json:"token"`
-	Workspace string    `json:"workspace"`
+	Version   int    `json:"version"`
+	Mode      string `json:"mode"`
+	Address   string `json:"address"`
+	URL       string `json:"url,omitempty"`
+	Token     string `json:"token"`
+	Workspace string `json:"workspace"`
+	Label     string `json:"label"`
+	// Subject duplicates Label for older broker clients.
 	Subject   string    `json:"subject"`
 	ExpiresAt time.Time `json:"expiresAt"`
 }
@@ -124,6 +132,7 @@ func Run(ctx context.Context, options Options, handler Handler) (Summary, error)
 		Address:    address,
 		ClientFile: clientFile,
 		Workspace:  options.Workspace,
+		Label:      options.Label,
 		Subject:    options.Subject,
 		ExpiresAt:  expiresAt,
 	}
@@ -263,6 +272,11 @@ func Run(ctx context.Context, options Options, handler Handler) (Summary, error)
 }
 
 func (options Options) withDefaults() Options {
+	if strings.TrimSpace(options.Label) == "" {
+		options.Label = strings.TrimSpace(options.Subject)
+	}
+	// Label is canonical. Subject mirrors it only for older clients.
+	options.Subject = options.Label
 	if options.TokenTTL == 0 {
 		options.TokenTTL = defaultTokenTTL
 	}
@@ -282,8 +296,8 @@ func (options Options) validate() error {
 	if strings.TrimSpace(options.Workspace) == "" {
 		return errors.New("broker requires a workspace")
 	}
-	if strings.TrimSpace(options.Subject) == "" {
-		return errors.New("broker requires a subject")
+	if strings.TrimSpace(options.Label) == "" && strings.TrimSpace(options.Subject) == "" {
+		return errors.New("broker requires an audit label")
 	}
 	if options.SocketPath != "" && options.ListenAddr != "" {
 		return errors.New("broker accepts either --socket or --listen, not both")
@@ -413,6 +427,7 @@ func writeClientConfig(summary Summary, token string) error {
 		URL:       url,
 		Token:     token,
 		Workspace: summary.Workspace,
+		Label:     summary.Label,
 		Subject:   summary.Subject,
 		ExpiresAt: summary.ExpiresAt,
 	}, "", "  ")

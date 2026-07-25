@@ -60,7 +60,7 @@ func (a App) get(st *store.FileStore, args []string) int {
 	if len(remaining) == 0 {
 		return a.fail(errors.New("get requires scope/name"))
 	}
-	if err := rejectUnknownArgs(remaining[1:], "--agent"); err != nil {
+	if err := rejectUnknownArgs(remaining[1:], "--label", "--agent"); err != nil {
 		return a.fail(err)
 	}
 	target, err := a.workspacePathTarget(st, workspaceArg, "get")
@@ -71,58 +71,55 @@ func (a App) get(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	agentExplicit := hasFlag(remaining[1:], "--agent")
-	agent, _, err := optionalFlagValue(remaining[1:], "--agent")
+	labelExplicit := hasFlag(remaining[1:], "--label") || hasFlag(remaining[1:], "--agent")
+	if hasFlag(remaining[1:], "--label") && hasFlag(remaining[1:], "--agent") {
+		return a.fail(errors.New("get accepts only one --label or --agent value"))
+	}
+	label, _, err := optionalFlagValue(remaining[1:], "--label")
 	if err != nil {
 		return a.fail(err)
 	}
-	agent, runtimeType, err := runtimeSubject(st, agent, "", agentExplicit)
+	if label == "" {
+		label, _, err = optionalFlagValue(remaining[1:], "--agent")
+	}
 	if err != nil {
 		return a.fail(err)
 	}
-	if agent != "" {
-		allowed, reason := st.CheckPolicy(agent, fullPath, "read")
-		if !allowed {
-			secret, err := st.SecretMetadata(fullPath)
-			if err == nil {
-				metadata := runtimeAuditMetadata(st, secret.Scope, agent, runtimeType, nil)
-				st.Audit(agent, "secret_read", "denied", secret.Scope, secret.NameHash, reason, metadata)
-			} else {
-				metadata := runtimeAuditMetadata(st, "", agent, runtimeType, nil)
-				st.Audit(agent, "secret_read", "denied", "", "", reason, metadata)
-			}
-			_ = st.Save()
-			a.syncRuntimeAuditBestEffort(st)
-			return a.fail(errors.New(reason))
+	runtime, err := runtimeAccess(st, label, "get", labelExplicit)
+	if err != nil {
+		return a.fail(err)
+	}
+	allowed, reason := st.CheckPolicy(runtime.Actor, fullPath, "read")
+	if !allowed {
+		secret, err := st.SecretMetadata(fullPath)
+		if err == nil {
+			metadata := runtimeAuditMetadata(st, secret.Scope, runtime.Label, runtime.LabelType, nil)
+			st.Audit(runtime.Actor, "secret_read", "denied", secret.Scope, secret.NameHash, reason, metadata)
+		} else {
+			metadata := runtimeAuditMetadata(st, "", runtime.Label, runtime.LabelType, nil)
+			st.Audit(runtime.Actor, "secret_read", "denied", "", "", reason, metadata)
 		}
+		_ = st.Save()
+		a.syncRuntimeAuditBestEffort(st)
+		return a.fail(errors.New(reason))
 	}
 	secret, err := st.SecretMetadata(fullPath)
 	if err != nil {
 		return a.fail(err)
 	}
-	actor := st.State.UserID
-	if agent != "" {
-		actor = agent
-	}
-	auditLabel := agent
-	auditLabelType := runtimeType
-	if auditLabel == "" {
-		auditLabel = actor
-		auditLabelType = "user"
-	}
-	metadata := runtimeAuditMetadata(st, secret.Scope, auditLabel, auditLabelType, nil)
+	metadata := runtimeAuditMetadata(st, secret.Scope, runtime.Label, runtime.LabelType, nil)
 	if err := st.CheckSecretReadable(fullPath); err != nil {
-		st.Audit(actor, "secret_read", "failed", secret.Scope, secret.NameHash, "secret not locally usable: "+err.Error(), metadata)
+		st.Audit(runtime.Actor, "secret_read", "failed", secret.Scope, secret.NameHash, "secret not locally usable: "+err.Error(), metadata)
 		_ = st.Save()
 		a.syncRuntimeAuditBestEffort(st)
 		return a.fail(err)
 	}
-	if err := a.gateSecretRelease(st, actor, "secret_read", secret.Scope, secret.NameHash, "raw read", metadata); err != nil {
+	if err := a.gateSecretRelease(st, runtime.Actor, "secret_read", secret.Scope, secret.NameHash, "raw read", metadata); err != nil {
 		return a.fail(err)
 	}
 	value, _, err := st.GetSecret(fullPath)
 	if err != nil {
-		st.Audit(actor, "secret_read", "failed", secret.Scope, secret.NameHash, "secret release failed after audit gate: "+err.Error(), metadata)
+		st.Audit(runtime.Actor, "secret_read", "failed", secret.Scope, secret.NameHash, "secret release failed after audit gate: "+err.Error(), metadata)
 		_ = st.Save()
 		a.syncRuntimeAuditBestEffort(st)
 		return a.fail(err)

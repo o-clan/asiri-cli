@@ -2,7 +2,7 @@
 
 Stop copying secrets everywhere.
 
-Asiri CLI is the local runtime for Asiri secrets. It gives you an encrypted local vault, policy checks, command injection, temporary secret files, broker access, and encrypted sync when you choose to use the hosted control plane.
+Asiri CLI is the local runtime for Asiri secrets. It gives you an encrypted local vault, identity-based access checks, command injection, temporary secret files, broker access, and encrypted sync when you choose to use the hosted control plane.
 
 You can use it entirely locally. An Asiri account is only needed when you want hosted sync, device approval, recovery, or workspace sharing.
 
@@ -17,8 +17,9 @@ This CLI is open source so teams can inspect how secrets are decrypted, injected
 The public source includes an installable Asiri agent skill at `skills/asiri`.
 Ask a compatible agent harness to install that skill when you want it to use
 Asiri safely. The skill focuses on operational use first: inspect metadata, run
-commands with scoped secrets, track new secrets, grant narrow runtime access,
-and stop before changing trust or key material.
+commands with scoped secrets as an authenticated identity, track new secrets,
+and stop before changing trust or key material. Optional runtime labels are
+audit metadata only.
 
 Release builds also attach the skill as a GitHub release asset:
 
@@ -54,11 +55,10 @@ Add a secret without putting the value in shell history:
 printf '%s\n' "$API_KEY" | asiri add --workspace personal dev/API_KEY --stdin
 ```
 
-Grant a local tool or agent label permission to receive that secret, then run a command with the secret injected:
+Run a command with the secret injected. The authenticated user or service account controls access; the optional label only annotates audit events:
 
 ```bash
-asiri grant --workspace personal local-script dev/API_KEY --inject-only
-asiri env --workspace personal --agent local-script dev/API_KEY -- ./deploy.sh
+asiri env --workspace personal --label local-script dev/API_KEY -- ./deploy.sh
 ```
 
 For tools that read files instead of environment variables, use `asiri mount` to create temporary secret files for the child process.

@@ -30,23 +30,21 @@ Commands:
   local       Manage local machine state.
   whoami      Show the signed-in control-plane user.
   add         Add a local secret from stdin or a value file.
-  get         Read a local secret if policy allows raw read.
+  get         Read a local secret as the authenticated runtime identity.
   list        Show local and visible remote secret metadata.
   rotate      Add a new local version for an existing secret.
   rm          Mark a local secret as deleted, or explicitly soft-delete a remote secret.
-  grant       Allow a subject to use a secret through policy.
-  deny        Deny a subject at a scope.
-  policy      List local policy rules.
+  policy      List stored service-account and legacy policy records.
   run         Run a command with injected secrets.
   env         Run a command with one scope or secret injected.
   mount       Run a command with temporary secret files.
-  broker      Start the local broker. Example: asiri broker start --workspace qa --agent app.
+  broker      Start the local broker. Example: asiri broker start --workspace qa --label app.
   audit       Read local audit events.
   cache       Wipe local Asiri cache and control-plane keys.
 
 Run "asiri <command> --help" for command-specific help.
 
-Secrets are encrypted locally. Device trust is the security boundary; agent and process names are policy labels.
+Secrets are encrypted locally. Authenticated identities and trusted devices control access. Runtime labels are audit metadata only.
 `)
 }
 
@@ -187,31 +185,27 @@ func (a App) helpFor(path []string) int {
 	case "add":
 		fmt.Fprint(a.Out, "Usage: asiri add --workspace <slug> <scope/name> --stdin|--value-file <path>\n\nAdds a local encrypted secret. Use short paths without the workspace prefix. File and stdin input are stored byte-for-byte, including final newlines and empty input.\n")
 	case "get":
-		fmt.Fprint(a.Out, "Usage: asiri get --workspace <slug> <scope/name> [--agent <agent>]\n\nReads a local secret when policy allows raw read for the human user or named agent label. Use short paths without the workspace prefix.\n")
+		fmt.Fprint(a.Out, "Usage: asiri get --workspace <slug> <scope/name> [--label <audit-label>]\n\nReads a local secret as the authenticated user or service account. Labels only annotate audit events. --agent remains a compatibility alias for --label. Use short paths without the workspace prefix.\n")
 	case "list":
 		fmt.Fprint(a.Out, "Usage: asiri list --workspace <canonical-slug-or-alias> [filter] [--local|--remote] [--status <status>] [--include-inactive]\n\nShows metadata for one explicit local or hosted workspace. A fresh offline vault will suggest creating a workspace first. Values are never printed.\n")
 	case "rotate":
 		fmt.Fprint(a.Out, "Usage: asiri rotate --workspace <slug> <scope/name> --stdin|--value-file <path>\n\nAdds a new local encrypted version for an existing secret. Use short paths without the workspace prefix. File and stdin input are stored byte-for-byte.\n")
 	case "rm":
 		fmt.Fprint(a.Out, "Usage: asiri rm --workspace <slug> <scope/name>\n       asiri rm --remote --workspace <slug> <scope/name> [--dry-run|--confirm-token <token>]\n       asiri rm --remote --workspace <slug> --where remote-only [--dry-run|--confirm-token <token>]\n\nMarks a local secret as deleted by default. With --remote, soft-deletes active remote secret versions in the control plane. Use short paths without the workspace prefix.\n")
-	case "grant":
-		fmt.Fprint(a.Out, "Usage: asiri grant --workspace <slug> <subject-label> <scope/name> --inject-only|--read|--mount|--broker\n\nAdds a local policy rule allowing a non-human subject label to use a secret. Use short paths without the workspace prefix.\n")
-	case "deny":
-		fmt.Fprint(a.Out, "Usage: asiri deny --workspace <slug> <subject-label> <scope/*>\n\nAdds a local policy rule denying a subject label at a scope. Use short paths without the workspace prefix.\n")
 	case "policy":
-		fmt.Fprint(a.Out, "Usage: asiri policy list --workspace <slug>\n\nLists local policy rules for one explicit workspace.\n")
+		fmt.Fprint(a.Out, "Usage: asiri policy list --workspace <slug>\n\nLists stored service-account policies and legacy local label records for one explicit workspace. Legacy label records are not enforced.\n")
 	case "policy list":
-		fmt.Fprint(a.Out, "Usage: asiri policy list --workspace <slug>\n\nLists local allow and deny policy rules for one explicit workspace.\n")
+		fmt.Fprint(a.Out, "Usage: asiri policy list --workspace <slug>\n\nLists stored service-account policies and legacy local label records for one explicit workspace. Legacy label records are not enforced.\n")
 	case "run":
-		fmt.Fprint(a.Out, "Usage: asiri run --workspace <slug> [--agent <subject-label>] --env NAME=<scope/name> -- <command...>\n       asiri run --workspace <slug> [--agent <subject-label>] --unsafe-argv <command... asiri://scope/name>\n\nRuns a command with secrets injected through environment variables or explicit unsafe argument substitution. Use short paths without the workspace prefix.\n")
+		fmt.Fprint(a.Out, "Usage: asiri run --workspace <slug> [--label <audit-label>] --env NAME=<scope/name> -- <command...>\n       asiri run --workspace <slug> [--label <audit-label>] --unsafe-argv <command... asiri://scope/name>\n\nRuns a command with secrets authorized for the authenticated user or service account. Labels only annotate audit events. --agent remains a compatibility alias for --label. Use short paths without the workspace prefix.\n")
 	case "env":
-		fmt.Fprint(a.Out, "Usage: asiri env --workspace <slug> [--agent <subject-label>] <scope-or-secret> -- <command...>\n\nRuns a command with secrets from one scope or one secret injected into the environment. Use short paths without the workspace prefix.\n")
+		fmt.Fprint(a.Out, "Usage: asiri env --workspace <slug> [--label <audit-label>] <scope-or-secret> -- <command...>\n\nRuns a command with secrets from one scope or one secret injected into the environment. Labels only annotate audit events. --agent remains a compatibility alias for --label. Use short paths without the workspace prefix.\n")
 	case "mount":
-		fmt.Fprint(a.Out, "Usage: asiri mount --workspace <slug> [--agent <subject-label>] [--dir <dir>] <scope-or-secret[:dest]> -- <command...>\n\nRuns a command with temporary secret files mounted under a private directory. Use short paths without the workspace prefix.\n")
+		fmt.Fprint(a.Out, "Usage: asiri mount --workspace <slug> [--label <audit-label>] [--dir <dir>] <scope-or-secret[:dest]> -- <command...>\n\nRuns a command with temporary secret files mounted under a private directory. Labels only annotate audit events. --agent remains a compatibility alias for --label. Use short paths without the workspace prefix.\n")
 	case "broker":
-		fmt.Fprint(a.Out, "Usage: asiri broker start --workspace <slug> --agent <subject-label> [--socket <path>|--listen <addr>] [--client-file <path>] [--token-ttl <duration>] [--idle-timeout <duration>] [--max-runtime <duration>] [--once]\n\nStarts a local broker for approved per-request secret access. Defaults to a Unix socket when supported and loopback HTTP otherwise.\n")
+		fmt.Fprint(a.Out, "Usage: asiri broker start --workspace <slug> [--label <audit-label>] [--socket <path>|--listen <addr>] [--client-file <path>] [--token-ttl <duration>] [--idle-timeout <duration>] [--max-runtime <duration>] [--once]\n\nStarts a local broker for token-authenticated requests. Labels only annotate audit events. --agent remains a compatibility alias for --label. Defaults to a Unix socket when supported and loopback HTTP otherwise.\n")
 	case "broker start":
-		fmt.Fprint(a.Out, "Usage: asiri broker start --workspace <slug> --agent <subject-label> [--socket <path>|--listen <addr>] [--client-file <path>] [--token-ttl <duration>] [--idle-timeout <duration>] [--max-runtime <duration>] [--once]\n\nStarts the local broker. With --once, handles one request and exits.\n")
+		fmt.Fprint(a.Out, "Usage: asiri broker start --workspace <slug> [--label <audit-label>] [--socket <path>|--listen <addr>] [--client-file <path>] [--token-ttl <duration>] [--idle-timeout <duration>] [--max-runtime <duration>] [--once]\n\nStarts the local broker. Labels only annotate audit events. --agent remains a compatibility alias for --label. With --once, handles one request and exits.\n")
 	case "audit":
 		fmt.Fprint(a.Out, "Usage: asiri audit tail --workspace <slug> [--limit N]\n\nShows recent local audit events for one explicit workspace.\n")
 	case "audit tail":

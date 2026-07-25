@@ -168,7 +168,7 @@ func rejectUnknownArgs(args []string, allowedFlags ...string) error {
 			return fmt.Errorf("unknown option %q", arg)
 		}
 		switch arg {
-		case "--value-file", "--key-file", "--output-file", "--agent", "--dir", "--limit", "--scope", "--secret", "--version", "--where", "--confirm-token":
+		case "--value-file", "--key-file", "--output-file", "--label", "--agent", "--dir", "--limit", "--scope", "--secret", "--version", "--where", "--confirm-token":
 			i++
 		}
 	}

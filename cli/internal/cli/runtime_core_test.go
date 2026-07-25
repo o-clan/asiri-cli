@@ -29,8 +29,6 @@ func TestCLIEndToEndLocalRuntime(t *testing.T) {
 	steps := [][]string{
 		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "openai/api_key", "--value-file", testSecretFile(t, "qa_secret_value")},
-		{"grant", "--workspace", "qa", "codex", "openai/api_key", "--inject-only"},
-		{"grant", "--workspace", "qa", "codex", "openai/api_key", "--broker"},
 		{"run", "--workspace", "qa", "--agent", "codex", "--env", "OPENAI_API_KEY=openai/api_key", "--", "sh", "-c", "test \"$OPENAI_API_KEY\" = qa_secret_value"},
 	}
 	for _, step := range steps {
@@ -42,7 +40,6 @@ func TestCLIEndToEndLocalRuntime(t *testing.T) {
 	resp, payload := runBrokerValueRequest(t, brokerApp, map[string]string{
 		"requestId": "req_allowed",
 		"workspace": "qa",
-		"subject":   "codex",
 		"path":      "openai/api_key",
 	}, "")
 	if resp.StatusCode != http.StatusOK {
@@ -67,11 +64,13 @@ func TestCLIEndToEndLocalRuntime(t *testing.T) {
 	if strings.Contains(out.String(), "qa_secret_value") {
 		t.Fatalf("asiri output leaked secret: %s", out.String())
 	}
-	if code := app.Run([]string{"get", "--workspace", "qa", "openai/api_key", "--agent", "codex"}); code == 0 {
-		t.Fatalf("agent raw read should be denied without explicit --read grant")
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"get", "--workspace", "qa", "openai/api_key", "--label", "codex"}); code != 0 {
+		t.Fatalf("audit label changed human read authorization: %s", errb.String())
 	}
-	if !strings.Contains(errb.String(), "raw read requires") {
-		t.Fatalf("expected raw read denial, got stderr=%s", errb.String())
+	if strings.TrimSpace(out.String()) != "qa_secret_value" {
+		t.Fatalf("labeled human read returned wrong value")
 	}
 }
 
@@ -88,7 +87,6 @@ func TestEnvExportInvalidNameDoesNotAuditMaterialization(t *testing.T) {
 	for _, step := range [][]string{
 		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "app/api-key", "--value-file", testSecretFile(t, "env_secret")},
-		{"grant", "--workspace", "qa", "sh", "app/api-key", "--inject-only"},
 	} {
 		out.Reset()
 		errb.Reset()
@@ -127,8 +125,6 @@ func TestMountExplicitDestinationScopeDoesNotAuditMaterialization(t *testing.T) 
 		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "app/ONE", "--value-file", testSecretFile(t, "one")},
 		{"add", "--workspace", "qa", "app/TWO", "--value-file", testSecretFile(t, "two")},
-		{"grant", "--workspace", "qa", "sh", "app/ONE", "--mount"},
-		{"grant", "--workspace", "qa", "sh", "app/TWO", "--mount"},
 	} {
 		out.Reset()
 		errb.Reset()
@@ -157,37 +153,32 @@ func TestMountExplicitDestinationScopeDoesNotAuditMaterialization(t *testing.T) 
 func TestRuntimePreflightBlocksPartialMaterialization(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
-		grant       []string
 		run         func(marker string) []string
 		auditAction string
 	}{
 		{
-			name:  "explicit env mapping",
-			grant: []string{"grant", "--workspace", "qa", "sh", "app/ONE", "--inject-only"},
+			name: "explicit env mapping",
 			run: func(marker string) []string {
 				return []string{"run", "--workspace", "qa", "--env", "ONE=app/ONE", "--env", "TWO=app/TWO", "--", "sh", "-c", "touch " + marker}
 			},
 			auditAction: "secret_injected",
 		},
 		{
-			name:  "env export",
-			grant: []string{"grant", "--workspace", "qa", "sh", "app/ONE", "--inject-only"},
+			name: "env export",
 			run: func(marker string) []string {
 				return []string{"env", "--workspace", "qa", "app", "--", "sh", "-c", "touch " + marker}
 			},
 			auditAction: "secret_env_exported",
 		},
 		{
-			name:  "unsafe argv",
-			grant: []string{"grant", "--workspace", "qa", "sh", "app/ONE", "--inject-only"},
+			name: "unsafe argv",
 			run: func(marker string) []string {
 				return []string{"run", "--workspace", "qa", "--unsafe-argv", "--", "sh", "-c", "test asiri://app/ONE = one && test asiri://app/TWO = two && touch " + marker}
 			},
 			auditAction: "secret_unsafe_argv_injected",
 		},
 		{
-			name:  "mount scope",
-			grant: []string{"grant", "--workspace", "qa", "sh", "app/ONE", "--mount"},
+			name: "mount scope",
 			run: func(marker string) []string {
 				return []string{"mount", "--workspace", "qa", "--dir", filepath.Join(filepath.Dir(marker), "mount-dir"), "app", "--", "sh", "-c", "touch " + marker}
 			},
@@ -208,13 +199,23 @@ func TestRuntimePreflightBlocksPartialMaterialization(t *testing.T) {
 				{"init", "--device", "qa-laptop", "--workspace", "qa"},
 				{"add", "--workspace", "qa", "app/ONE", "--value-file", testSecretFile(t, "one")},
 				{"add", "--workspace", "qa", "app/TWO", "--value-file", testSecretFile(t, "two")},
-				tc.grant,
 			} {
 				out.Reset()
 				errb.Reset()
 				if code := app.Run(step); code != 0 {
 					t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
 				}
+			}
+			st, err := store.LoadDefault()
+			if err != nil {
+				t.Fatal(err)
+			}
+			unusable := st.State.Secrets[store.SecretKey("qa/app", "TWO")]
+			if len(unusable.Versions) == 0 || unusable.Versions[0].DataKeyAccount == "" {
+				t.Fatalf("test secret missing data key account: %#v", unusable)
+			}
+			if err := keystore.Delete(unusable.Versions[0].DataKeyAccount); err != nil {
+				t.Fatal(err)
 			}
 
 			marker := filepath.Join(tmp, "ran")
@@ -226,7 +227,7 @@ func TestRuntimePreflightBlocksPartialMaterialization(t *testing.T) {
 			if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("child command executed after failed preflight: %v", err)
 			}
-			st, err := store.LoadDefault()
+			st, err = store.LoadDefault()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -339,7 +340,6 @@ func TestBrokerReloadsLocalStateBetweenRequests(t *testing.T) {
 	for _, step := range [][]string{
 		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "openai/api_key", "--value-file", testSecretFile(t, "old_secret")},
-		{"grant", "--workspace", "qa", "codex", "openai/api_key", "--broker"},
 	} {
 		if code := app.Run(step); code != 0 {
 			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
@@ -404,7 +404,7 @@ func TestBrokerReloadsLocalStateBetweenRequests(t *testing.T) {
 	}
 }
 
-func TestBrokerRequiresExplicitBrokerGrant(t *testing.T) {
+func TestBrokerUsesAuthenticatedRuntimeRegardlessOfLabelGrant(t *testing.T) {
 	tmp := t.TempDir()
 	old := os.Getenv("ASIRI_HOME")
 	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
@@ -417,7 +417,6 @@ func TestBrokerRequiresExplicitBrokerGrant(t *testing.T) {
 	for _, step := range [][]string{
 		{"init", "--device", "qa-laptop", "--workspace", "qa"},
 		{"add", "--workspace", "qa", "openai/api_key", "--value-file", testSecretFile(t, "qa_secret_value")},
-		{"grant", "--workspace", "qa", "codex", "openai/api_key", "--inject-only"},
 	} {
 		if code := app.Run(step); code != 0 {
 			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
@@ -426,21 +425,21 @@ func TestBrokerRequiresExplicitBrokerGrant(t *testing.T) {
 	resp, payload := runBrokerValueRequest(t, New(io.Discard, io.Discard), map[string]string{
 		"requestId": "req_no_broker_grant",
 		"workspace": "qa",
-		"subject":   "codex",
+		"subject":   "pretend-authorized-label",
 		"path":      "openai/api_key",
 	}, "")
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("broker without grant returned status=%d body=%s", resp.StatusCode, payload)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("broker label changed authenticated access: status=%d body=%s", resp.StatusCode, payload)
 	}
-	if strings.Contains(payload, "qa_secret_value") {
-		t.Fatalf("broker denial leaked secret: %s", payload)
+	if !strings.Contains(payload, "qa_secret_value") {
+		t.Fatalf("broker did not return secret to authenticated runtime: %s", payload)
 	}
 	out.Reset()
 	if audit := app.Run([]string{"audit", "tail", "--workspace", "qa", "--limit", "10"}); audit != 0 {
 		t.Fatalf("audit tail failed")
 	}
-	if !strings.Contains(out.String(), "secret_brokered") {
-		t.Fatalf("audit tail missing broker denial: %s", out.String())
+	if !strings.Contains(out.String(), "secret_brokered") || !strings.Contains(out.String(), "codex") {
+		t.Fatalf("audit tail missing broker label: %s", out.String())
 	}
 }
 

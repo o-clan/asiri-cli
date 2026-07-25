@@ -31,15 +31,9 @@ func (a App) broker(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	if options.Agent == "" && (st.State.ControlPlane == nil || st.State.ControlPlane.Source != "service-account") {
-		return a.fail(errors.New("broker start requires --agent"))
-	}
-	subject, runtimeType, err := runtimeSubject(st, options.Agent, "", options.Agent != "")
+	runtime, err := runtimeAccess(st, options.Label, "broker", options.Label != "")
 	if err != nil {
 		return a.fail(err)
-	}
-	if subject == "" {
-		return a.fail(errors.New("broker start requires a subject"))
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -52,7 +46,7 @@ func (a App) broker(st *store.FileStore, args []string) int {
 	}()
 	brokerOptions := broker.Options{
 		Workspace:   target.Slug,
-		Subject:     subject,
+		Label:       runtime.Label,
 		SocketPath:  options.SocketPath,
 		ListenAddr:  options.ListenAddr,
 		ClientFile:  options.ClientFile,
@@ -62,14 +56,14 @@ func (a App) broker(st *store.FileStore, args []string) int {
 		Once:        options.Once,
 		OnReady: func(summary broker.Summary) {
 			mu.Lock()
-			_ = runtimeStore.audit(subject, "broker_started", "allowed", "", "", "local broker started", target.Slug, subject, runtimeType, "", map[string]string{"mode": summary.Mode})
+			_ = runtimeStore.audit(runtime.Actor, "broker_started", "allowed", "", "", "local broker started", target.Slug, runtime.Label, runtime.LabelType, "", map[string]string{"mode": summary.Mode})
 			requestAuditSync()
 			mu.Unlock()
-			fmt.Fprintf(a.Out, "asiri broker ready\nmode\t%s\naddress\t%s\nclient\t%s\nworkspace\t%s\nsubject\t%s\nexpires\t%s\n", summary.Mode, summary.Address, summary.ClientFile, summary.Workspace, summary.Subject, summary.ExpiresAt.Format(time.RFC3339))
+			fmt.Fprintf(a.Out, "asiri broker ready\nmode\t%s\naddress\t%s\nclient\t%s\nworkspace\t%s\nlabel\t%s\nexpires\t%s\n", summary.Mode, summary.Address, summary.ClientFile, summary.Workspace, summary.Label, summary.ExpiresAt.Format(time.RFC3339))
 		},
 		OnEvent: func(event broker.Event) {
 			mu.Lock()
-			_ = runtimeStore.audit(subject, event.Action, event.Result, "", "", event.Reason, target.Slug, subject, runtimeType, event.RequestID, nil)
+			_ = runtimeStore.audit(runtime.Actor, event.Action, event.Result, "", "", event.Reason, target.Slug, runtime.Label, runtime.LabelType, event.RequestID, nil)
 			requestAuditSync()
 			mu.Unlock()
 		},
@@ -77,7 +71,7 @@ func (a App) broker(st *store.FileStore, args []string) int {
 	_, runErr := broker.Run(ctx, brokerOptions, func(requestCtx context.Context, request broker.ValueRequest) (broker.ValueResponse, error) {
 		mu.Lock()
 		defer mu.Unlock()
-		return a.handleBrokerValueRequest(requestCtx, &runtimeStore, target, subject, runtimeType, request, requestAuditSync)
+		return a.handleBrokerValueRequest(requestCtx, &runtimeStore, target, runtime, request, requestAuditSync)
 	})
 	mu.Lock()
 	result := "allowed"
@@ -86,7 +80,7 @@ func (a App) broker(st *store.FileStore, args []string) int {
 		result = "failed"
 		reason = runErr.Error()
 	}
-	_ = runtimeStore.audit(subject, "broker_stopped", result, "", "", reason, target.Slug, subject, runtimeType, "", nil)
+	_ = runtimeStore.audit(runtime.Actor, "broker_stopped", result, "", "", reason, target.Slug, runtime.Label, runtime.LabelType, "", nil)
 	a.syncRuntimeAuditBestEffort(runtimeStore.currentStore())
 	mu.Unlock()
 	if runErr != nil {
@@ -196,7 +190,7 @@ func (a App) syncRuntimeAuditBestEffortFromPath(path string, mu *sync.Mutex) {
 
 type brokerStartOptions struct {
 	Workspace   string
-	Agent       string
+	Label       string
 	SocketPath  string
 	ListenAddr  string
 	ClientFile  string
@@ -219,11 +213,14 @@ func parseBrokerStartArgs(args []string) (brokerStartOptions, error) {
 			}
 			options.Workspace = args[i+1]
 			i++
-		case "--agent":
+		case "--label", "--agent":
 			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
-				return options, errors.New("--agent requires a subject")
+				return options, fmt.Errorf("%s requires a label", args[i])
 			}
-			options.Agent = store.NormalizeSubjectLabel(args[i+1])
+			if options.Label != "" {
+				return options, errors.New("broker start accepts only one --label or --agent value")
+			}
+			options.Label = store.NormalizeSubjectLabel(args[i+1])
 			i++
 		case "--socket":
 			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
@@ -288,7 +285,7 @@ func parseBrokerDurationFlag(args []string, index *int, flag string) (time.Durat
 	return value, nil
 }
 
-func (a App) handleBrokerValueRequest(requestCtx context.Context, runtimeStore *brokerRuntimeStore, target workspacePathTarget, subject, runtimeType string, request broker.ValueRequest, requestAuditSync func()) (broker.ValueResponse, error) {
+func (a App) handleBrokerValueRequest(requestCtx context.Context, runtimeStore *brokerRuntimeStore, target workspacePathTarget, runtime runtimeAccessContext, request broker.ValueRequest, requestAuditSync func()) (broker.ValueResponse, error) {
 	if err := requestCtx.Err(); err != nil {
 		return broker.ValueResponse{}, &broker.Error{Status: http.StatusUnauthorized, Code: "token_expired", Message: "broker token expired"}
 	}
@@ -298,59 +295,54 @@ func (a App) handleBrokerValueRequest(requestCtx context.Context, runtimeStore *
 	}
 	requestID := strings.TrimSpace(request.RequestID)
 	if requestID == "" || len(requestID) > 128 {
-		_ = runtimeStore.audit(subject, "broker_request", "denied", "", "", "invalid broker request id", target.Slug, subject, runtimeType, "", nil)
+		_ = runtimeStore.audit(runtime.Actor, "broker_request", "denied", "", "", "invalid broker request id", target.Slug, runtime.Label, runtime.LabelType, "", nil)
 		requestAuditSync()
 		return broker.ValueResponse{}, &broker.Error{Status: http.StatusBadRequest, Code: "invalid_request_id", Message: "broker request requires a short requestId"}
 	}
 	if strings.TrimSpace(request.Workspace) != target.Slug {
-		_ = runtimeStore.audit(subject, "broker_request", "denied", "", "", "broker workspace mismatch", target.Slug, subject, runtimeType, requestID, nil)
+		_ = runtimeStore.audit(runtime.Actor, "broker_request", "denied", "", "", "broker workspace mismatch", target.Slug, runtime.Label, runtime.LabelType, requestID, nil)
 		requestAuditSync()
 		return broker.ValueResponse{}, &broker.Error{Status: http.StatusForbidden, Code: "workspace_mismatch", Message: "broker workspace mismatch"}
 	}
-	if store.NormalizeSubjectLabel(request.Subject) != subject {
-		_ = runtimeStore.audit(subject, "broker_request", "denied", "", "", "broker subject mismatch", target.Slug, subject, runtimeType, requestID, nil)
-		requestAuditSync()
-		return broker.ValueResponse{}, &broker.Error{Status: http.StatusForbidden, Code: "subject_mismatch", Message: "broker subject mismatch"}
-	}
 	shortPath := strings.TrimSpace(request.Path)
 	if shortPath == "" {
-		_ = runtimeStore.audit(subject, "broker_request", "denied", "", "", "missing broker secret path", target.Slug, subject, runtimeType, requestID, nil)
+		_ = runtimeStore.audit(runtime.Actor, "broker_request", "denied", "", "", "missing broker secret path", target.Slug, runtime.Label, runtime.LabelType, requestID, nil)
 		requestAuditSync()
 		return broker.ValueResponse{}, &broker.Error{Status: http.StatusBadRequest, Code: "missing_path", Message: "broker request requires a secret path"}
 	}
 	fullPath, err := workspacePrefixedPath(target, shortPath, "broker")
 	if err != nil {
-		_ = runtimeStore.audit(subject, "broker_request", "denied", "", "", "invalid broker secret path", target.Slug, subject, runtimeType, requestID, nil)
+		_ = runtimeStore.audit(runtime.Actor, "broker_request", "denied", "", "", "invalid broker secret path", target.Slug, runtime.Label, runtime.LabelType, requestID, nil)
 		requestAuditSync()
 		return broker.ValueResponse{}, &broker.Error{Status: http.StatusBadRequest, Code: "invalid_path", Message: err.Error()}
 	}
-	allowed, reason := st.CheckPolicy(subject, fullPath, "broker")
+	allowed, reason := st.CheckPolicy(runtime.Actor, fullPath, "broker")
 	scope, name, parseErr := store.ParseSecretPath(fullPath)
 	hash := ""
 	if parseErr == nil {
 		hash = store.HashSecretName(scope, name)
 	}
 	if !allowed {
-		_ = runtimeStore.audit(subject, "secret_brokered", "denied", scope, hash, reason, target.Slug, subject, runtimeType, requestID, map[string]string{"mode": "broker"})
+		_ = runtimeStore.audit(runtime.Actor, "secret_brokered", "denied", scope, hash, reason, target.Slug, runtime.Label, runtime.LabelType, requestID, map[string]string{"mode": "broker"})
 		requestAuditSync()
 		return broker.ValueResponse{}, &broker.Error{Status: http.StatusForbidden, Code: "policy_denied", Message: reason}
 	}
 	secretMetadata, err := st.SecretMetadata(fullPath)
 	if err != nil {
 		message := err.Error()
-		if hint := a.remoteSelectionHint(st, fullPath, subject, "broker", false); hint != "" {
+		if hint := a.remoteSelectionHint(st, fullPath, runtime.Actor, "broker", false); hint != "" {
 			message = hint
 		}
-		_ = runtimeStore.audit(subject, "secret_brokered", "failed", scope, hash, "secret not locally usable", target.Slug, subject, runtimeType, requestID, map[string]string{"mode": "broker"})
+		_ = runtimeStore.audit(runtime.Actor, "secret_brokered", "failed", scope, hash, "secret not locally usable", target.Slug, runtime.Label, runtime.LabelType, requestID, map[string]string{"mode": "broker"})
 		requestAuditSync()
 		return broker.ValueResponse{}, &broker.Error{Status: http.StatusNotFound, Code: "secret_not_local", Message: message}
 	}
 	if err := st.CheckSecretReadable(fullPath); err != nil {
-		_ = runtimeStore.audit(subject, "secret_brokered", "failed", scope, hash, "secret not locally usable", target.Slug, subject, runtimeType, requestID, map[string]string{"mode": "broker"})
+		_ = runtimeStore.audit(runtime.Actor, "secret_brokered", "failed", scope, hash, "secret not locally usable", target.Slug, runtime.Label, runtime.LabelType, requestID, map[string]string{"mode": "broker"})
 		requestAuditSync()
 		return broker.ValueResponse{}, &broker.Error{Status: http.StatusNotFound, Code: "secret_not_local", Message: err.Error()}
 	}
-	if err := a.gateSecretRelease(st, subject, "secret_brokered", secretMetadata.Scope, secretMetadata.NameHash, "broker value request", brokerRuntimeAuditMetadata(st, target.Slug, subject, runtimeType, requestID, map[string]string{"mode": "broker"})); err != nil {
+	if err := a.gateSecretRelease(st, runtime.Actor, "secret_brokered", secretMetadata.Scope, secretMetadata.NameHash, "broker value request", brokerRuntimeAuditMetadata(st, target.Slug, runtime.Label, runtime.LabelType, requestID, map[string]string{"mode": "broker"})); err != nil {
 		runtimeStore.current = st
 		return broker.ValueResponse{}, err
 	}
@@ -358,10 +350,10 @@ func (a App) handleBrokerValueRequest(requestCtx context.Context, runtimeStore *
 	value, _, err := st.GetSecret(fullPath)
 	if err != nil {
 		message := err.Error()
-		if hint := a.remoteSelectionHint(st, fullPath, subject, "broker", false); hint != "" {
+		if hint := a.remoteSelectionHint(st, fullPath, runtime.Actor, "broker", false); hint != "" {
 			message = hint
 		}
-		_ = runtimeStore.audit(subject, "secret_brokered", "failed", scope, hash, "secret not locally usable", target.Slug, subject, runtimeType, requestID, map[string]string{"mode": "broker"})
+		_ = runtimeStore.audit(runtime.Actor, "secret_brokered", "failed", scope, hash, "secret not locally usable", target.Slug, runtime.Label, runtime.LabelType, requestID, map[string]string{"mode": "broker"})
 		requestAuditSync()
 		return broker.ValueResponse{}, &broker.Error{Status: http.StatusNotFound, Code: "secret_not_local", Message: message}
 	}

@@ -622,18 +622,31 @@ func TestServiceAccountRuntimeUsesSyncedServicePolicies(t *testing.T) {
 		ExpiresAt:     &validUntil,
 	}})
 
-	subject, labelType, err := runtimeSubject(st, "other-agent", "process-name", true)
+	runtime, err := runtimeAccess(st, "deployment", "process-name", true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if subject != store.ServiceAccountRuntimeSubject("svc_prod") || labelType != "service" {
-		t.Fatalf("service account runtime subject mismatch: subject=%s type=%s", subject, labelType)
+	if runtime.Actor != store.ServiceAccountRuntimeSubject("svc_prod") || runtime.Label != "deployment" || runtime.LabelType != "explicit" {
+		t.Fatalf("service account runtime context mismatch: %#v", runtime)
 	}
-	if allowed, _ := st.CheckPolicy(subject, "prod/api/DATABASE_URL", "read"); allowed {
+	if allowed, _ := st.CheckPolicy(runtime.Actor, "prod/api/DATABASE_URL", "read"); allowed {
 		t.Fatal("synced inject-only service account policy should not allow raw read")
 	}
-	if allowed, reason := st.CheckPolicy(subject, "prod/api/DATABASE_URL", "inject"); !allowed {
+	if allowed, reason := st.CheckPolicy(runtime.Actor, "prod/api/DATABASE_URL", "inject"); !allowed {
 		t.Fatalf("synced service account policy should allow inject: %s", reason)
+	}
+	otherRuntime, err := runtimeAccess(st, "unrelated-audit-label", "other-process", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if otherRuntime.Actor != runtime.Actor || otherRuntime.Label == runtime.Label {
+		t.Fatalf("audit labels must vary without changing service identity: first=%#v second=%#v", runtime, otherRuntime)
+	}
+	if allowed, reason := st.CheckPolicy(otherRuntime.Actor, "prod/api/DATABASE_URL", "inject"); !allowed {
+		t.Fatalf("arbitrary audit label changed allowed service action: %s", reason)
+	}
+	if allowed, _ := st.CheckPolicy(otherRuntime.Actor, "prod/api/DATABASE_URL", "read"); allowed {
+		t.Fatal("arbitrary audit label changed denied service action")
 	}
 	var syncedInject *asiri.Policy
 	for i := range st.State.Policies {

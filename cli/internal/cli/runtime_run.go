@@ -66,7 +66,7 @@ func runHasLeadingOption(args []string, targets ...string) bool {
 			return true
 		}
 		switch arg {
-		case "--agent", "--env", "--map", "--workspace", "-w":
+		case "--label", "--agent", "--env", "--map", "--workspace", "-w":
 			i++
 		case "--unsafe-argv":
 		default:
@@ -78,8 +78,8 @@ func runHasLeadingOption(args []string, targets ...string) bool {
 
 func (a App) runWithEnvMappings(st *store.FileStore, target workspacePathTarget, remaining []string) int {
 	var mappings []string
-	var agent string
-	agentExplicit := false
+	var label string
+	labelExplicit := false
 	cmdIndex := -1
 	for i := 0; i < len(remaining); i++ {
 		switch remaining[i] {
@@ -89,12 +89,15 @@ func (a App) runWithEnvMappings(st *store.FileStore, target workspacePathTarget,
 			}
 			mappings = append(mappings, remaining[i+1])
 			i++
-		case "--agent":
+		case "--label", "--agent":
 			if i+1 >= len(remaining) {
-				return a.fail(errors.New("--agent requires a subject"))
+				return a.fail(fmt.Errorf("%s requires a label", remaining[i]))
 			}
-			agentExplicit = true
-			agent = remaining[i+1]
+			if labelExplicit {
+				return a.fail(errors.New("run accepts only one --label or --agent value"))
+			}
+			labelExplicit = true
+			label = remaining[i+1]
 			i++
 		case "--":
 			cmdIndex = i + 1
@@ -111,7 +114,7 @@ func (a App) runWithEnvMappings(st *store.FileStore, target workspacePathTarget,
 	if cmdIndex < 0 || cmdIndex >= len(remaining) {
 		return a.fail(errors.New("run requires -- <command...>"))
 	}
-	agent, runtimeType, err := runtimeSubject(st, agent, filepath.Base(remaining[cmdIndex]), agentExplicit)
+	runtime, err := runtimeAccess(st, label, filepath.Base(remaining[cmdIndex]), labelExplicit)
 	if err != nil {
 		return a.fail(err)
 	}
@@ -126,7 +129,7 @@ func (a App) runWithEnvMappings(st *store.FileStore, target workspacePathTarget,
 		if err != nil {
 			return a.fail(err)
 		}
-		release, err := a.prepareSecretRelease(st, agent, runtimeType, "inject", "secret_injected", fullPath, "explicit env mapping", map[string]string{"env": name})
+		release, err := a.prepareSecretRelease(st, runtime, "inject", "secret_injected", fullPath, "explicit env mapping", map[string]string{"env": name})
 		if err != nil {
 			_ = st.Save()
 			a.syncRuntimeAuditBestEffort(st)
@@ -138,13 +141,13 @@ func (a App) runWithEnvMappings(st *store.FileStore, target workspacePathTarget,
 	for _, item := range prepared {
 		preparedReleases = append(preparedReleases, item.preparedSecretRelease)
 	}
-	if err := a.gatePreparedSecretReleases(st, agent, preparedReleases); err != nil {
+	if err := a.gatePreparedSecretReleases(st, runtime.Actor, preparedReleases); err != nil {
 		return a.fail(err)
 	}
 	for _, item := range prepared {
 		value, _, err := st.GetSecret(item.Path)
 		if err != nil {
-			a.auditFailedPreparedRelease(st, agent, item.preparedSecretRelease, "secret release failed after audit gate: "+err.Error())
+			a.auditFailedPreparedRelease(st, runtime.Actor, item.preparedSecretRelease, "secret release failed after audit gate: "+err.Error())
 			_ = st.Save()
 			a.syncRuntimeAuditBestEffort(st)
 			return a.fail(err)
@@ -158,11 +161,11 @@ func (a App) runWithEnvMappings(st *store.FileStore, target workspacePathTarget,
 }
 
 func (a App) runWithUnsafeArgv(st *store.FileStore, target workspacePathTarget, remaining []string) int {
-	agent, agentExplicit, commandArgs, err := parseUnsafeArgvArgs(remaining)
+	label, labelExplicit, commandArgs, err := parseUnsafeArgvArgs(remaining)
 	if err != nil {
 		return a.fail(err)
 	}
-	agent, runtimeType, err := runtimeSubject(st, agent, filepath.Base(commandArgs[0]), agentExplicit)
+	runtime, err := runtimeAccess(st, label, filepath.Base(commandArgs[0]), labelExplicit)
 	if err != nil {
 		return a.fail(err)
 	}
@@ -173,14 +176,14 @@ func (a App) runWithUnsafeArgv(st *store.FileStore, target workspacePathTarget, 
 	}
 	prepared := []preparedSecretRelease{}
 	for i, arg := range commandArgs[1:] {
-		if err := a.prepareUnsafeArgvArg(st, target, agent, runtimeType, arg, &prepared); err != nil {
+		if err := a.prepareUnsafeArgvArg(st, target, runtime, arg, &prepared); err != nil {
 			_ = st.Save()
 			a.syncRuntimeAuditBestEffort(st)
 			return a.fail(err)
 		}
 		resolvedArgs[i+1] = arg
 	}
-	if err := a.gatePreparedSecretReleases(st, agent, prepared); err != nil {
+	if err := a.gatePreparedSecretReleases(st, runtime.Actor, prepared); err != nil {
 		return a.fail(err)
 	}
 	values := map[string]string{}
@@ -190,7 +193,7 @@ func (a App) runWithUnsafeArgv(st *store.FileStore, target workspacePathTarget, 
 		}
 		value, _, err := st.GetSecret(release.Path)
 		if err != nil {
-			a.auditFailedPreparedRelease(st, agent, release, "secret release failed after audit gate: "+err.Error())
+			a.auditFailedPreparedRelease(st, runtime.Actor, release, "secret release failed after audit gate: "+err.Error())
 			_ = st.Save()
 			a.syncRuntimeAuditBestEffort(st)
 			return a.fail(err)
@@ -211,19 +214,22 @@ func (a App) runWithUnsafeArgv(st *store.FileStore, target workspacePathTarget, 
 }
 
 func parseUnsafeArgvArgs(args []string) (string, bool, []string, error) {
-	agent := ""
-	agentExplicit := false
+	label := ""
+	labelExplicit := false
 	unsafe := false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--unsafe-argv":
 			unsafe = true
-		case "--agent":
+		case "--label", "--agent":
 			if i+1 >= len(args) {
-				return "", false, nil, errors.New("--agent requires a subject")
+				return "", false, nil, fmt.Errorf("%s requires a label", args[i])
 			}
-			agent = store.NormalizeSubjectLabel(args[i+1])
-			agentExplicit = true
+			if labelExplicit {
+				return "", false, nil, errors.New("run accepts only one --label or --agent value")
+			}
+			label = store.NormalizeSubjectLabel(args[i+1])
+			labelExplicit = true
 			i++
 		case "--":
 			if i+1 >= len(args) {
@@ -232,7 +238,7 @@ func parseUnsafeArgvArgs(args []string) (string, bool, []string, error) {
 			if !unsafe {
 				return "", false, nil, errors.New("--unsafe-argv is required for argument substitution")
 			}
-			return agent, agentExplicit, args[i+1:], nil
+			return label, labelExplicit, args[i+1:], nil
 		default:
 			if strings.HasPrefix(args[i], "--") {
 				return "", false, nil, fmt.Errorf("unknown run option %s", args[i])
@@ -240,13 +246,13 @@ func parseUnsafeArgvArgs(args []string) (string, bool, []string, error) {
 			if !unsafe {
 				return "", false, nil, errors.New("--unsafe-argv is required for argument substitution")
 			}
-			return agent, agentExplicit, args[i:], nil
+			return label, labelExplicit, args[i:], nil
 		}
 	}
 	return "", false, nil, errors.New("run requires a command")
 }
 
-func (a App) resolveUnsafeArgvArg(st *store.FileStore, target workspacePathTarget, agent, runtimeType, arg string, resolvedSecrets *[]resolvedSecret) (string, error) {
+func (a App) resolveUnsafeArgvArg(st *store.FileStore, target workspacePathTarget, runtime runtimeAccessContext, arg string, resolvedSecrets *[]resolvedSecret) (string, error) {
 	if !strings.Contains(arg, "asiri://") {
 		return arg, nil
 	}
@@ -277,7 +283,7 @@ func (a App) resolveUnsafeArgvArg(st *store.FileStore, target workspacePathTarge
 		if resolveErr != nil {
 			return ref
 		}
-		value, err := a.resolveUnsafeArgvSecret(st, target, agent, runtimeType, strings.TrimPrefix(ref, "asiri://"), resolvedSecrets)
+		value, err := a.resolveUnsafeArgvSecret(st, target, runtime, strings.TrimPrefix(ref, "asiri://"), resolvedSecrets)
 		if err != nil {
 			resolveErr = err
 			return ref
@@ -290,7 +296,7 @@ func (a App) resolveUnsafeArgvArg(st *store.FileStore, target workspacePathTarge
 	return resolved, nil
 }
 
-func (a App) prepareUnsafeArgvArg(st *store.FileStore, target workspacePathTarget, agent, runtimeType, arg string, releases *[]preparedSecretRelease) error {
+func (a App) prepareUnsafeArgvArg(st *store.FileStore, target workspacePathTarget, runtime runtimeAccessContext, arg string, releases *[]preparedSecretRelease) error {
 	refs, err := unsafeArgvRefs(arg)
 	if err != nil {
 		return err
@@ -300,7 +306,7 @@ func (a App) prepareUnsafeArgvArg(st *store.FileStore, target workspacePathTarge
 		if err != nil {
 			return err
 		}
-		release, err := a.prepareSecretRelease(st, agent, runtimeType, "inject", "secret_unsafe_argv_injected", fullPath, "unsafe argv materialization", map[string]string{"mode": "unsafe-argv"})
+		release, err := a.prepareSecretRelease(st, runtime, "inject", "secret_unsafe_argv_injected", fullPath, "unsafe argv materialization", map[string]string{"mode": "unsafe-argv"})
 		if err != nil {
 			return err
 		}
@@ -365,55 +371,55 @@ func replaceUnsafeArgvValues(target workspacePathTarget, arg string, values map[
 	return resolved, nil
 }
 
-func (a App) resolveUnsafeArgvSecret(st *store.FileStore, target workspacePathTarget, agent, runtimeType, shortPath string, resolvedSecrets *[]resolvedSecret) (string, error) {
+func (a App) resolveUnsafeArgvSecret(st *store.FileStore, target workspacePathTarget, runtime runtimeAccessContext, shortPath string, resolvedSecrets *[]resolvedSecret) (string, error) {
 	fullPath, err := workspacePrefixedPath(target, shortPath, "run")
 	if err != nil {
 		return "", err
 	}
-	allowed, reason := st.CheckPolicy(agent, fullPath, "inject")
+	allowed, reason := st.CheckPolicy(runtime.Actor, fullPath, "inject")
 	scope, name, parseErr := store.ParseSecretPath(fullPath)
 	metadataScope := ""
 	if parseErr == nil {
 		metadataScope = scope
 	}
-	metadata := runtimeAuditMetadata(st, metadataScope, agent, runtimeType, map[string]string{"mode": "unsafe-argv"})
+	metadata := runtimeAuditMetadata(st, metadataScope, runtime.Label, runtime.LabelType, map[string]string{"mode": "unsafe-argv"})
 	if !allowed {
 		if parseErr == nil {
-			st.Audit(agent, "secret_unsafe_argv_injected", "denied", scope, store.HashSecretName(scope, name), reason, metadata)
+			st.Audit(runtime.Actor, "secret_unsafe_argv_injected", "denied", scope, store.HashSecretName(scope, name), reason, metadata)
 		} else {
-			st.Audit(agent, "secret_unsafe_argv_injected", "denied", "", "", reason, metadata)
+			st.Audit(runtime.Actor, "secret_unsafe_argv_injected", "denied", "", "", reason, metadata)
 		}
-		return "", fmt.Errorf("%s: %s cannot inject %s", reason, agent, fullPath)
+		return "", fmt.Errorf("%s: authenticated runtime cannot inject %s", reason, fullPath)
 	}
 	secret, err := st.SecretMetadata(fullPath)
 	if err != nil {
 		return "", err
 	}
 	if err := st.CheckSecretReadable(fullPath); err != nil {
-		st.Audit(agent, "secret_unsafe_argv_injected", "failed", secret.Scope, secret.NameHash, "secret not locally usable: "+err.Error(), metadata)
+		st.Audit(runtime.Actor, "secret_unsafe_argv_injected", "failed", secret.Scope, secret.NameHash, "secret not locally usable: "+err.Error(), metadata)
 		return "", err
 	}
-	if err := a.gateSecretRelease(st, agent, "secret_unsafe_argv_injected", secret.Scope, secret.NameHash, "unsafe argv materialization", metadata); err != nil {
+	if err := a.gateSecretRelease(st, runtime.Actor, "secret_unsafe_argv_injected", secret.Scope, secret.NameHash, "unsafe argv materialization", metadata); err != nil {
 		return "", err
 	}
 	value, _, err := st.GetSecret(fullPath)
 	if err != nil {
-		st.Audit(agent, "secret_unsafe_argv_injected", "failed", secret.Scope, secret.NameHash, "secret release failed after audit gate: "+err.Error(), metadata)
+		st.Audit(runtime.Actor, "secret_unsafe_argv_injected", "failed", secret.Scope, secret.NameHash, "secret release failed after audit gate: "+err.Error(), metadata)
 		return "", err
 	}
 	*resolvedSecrets = append(*resolvedSecrets, resolvedSecret{Path: fullPath, Scope: secret.Scope, Name: secret.Name, Hash: secret.NameHash, Value: value})
 	return value, nil
 }
 
-func (a App) auditDeniedSecretUse(st *store.FileStore, agent, runtimeType, fullPath, reason string) {
+func (a App) auditDeniedSecretUse(st *store.FileStore, runtime runtimeAccessContext, fullPath, reason string) {
 	scope, name, err := store.ParseSecretPath(fullPath)
 	if err != nil {
-		metadata := runtimeAuditMetadata(st, "", agent, runtimeType, nil)
-		st.Audit(agent, "secret_injected", "denied", "", "", reason, metadata)
+		metadata := runtimeAuditMetadata(st, "", runtime.Label, runtime.LabelType, nil)
+		st.Audit(runtime.Actor, "secret_injected", "denied", "", "", reason, metadata)
 		return
 	}
-	metadata := runtimeAuditMetadata(st, scope, agent, runtimeType, nil)
-	st.Audit(agent, "secret_injected", "denied", scope, store.HashSecretName(scope, name), reason, metadata)
+	metadata := runtimeAuditMetadata(st, scope, runtime.Label, runtime.LabelType, nil)
+	st.Audit(runtime.Actor, "secret_injected", "denied", scope, store.HashSecretName(scope, name), reason, metadata)
 }
 
 func (a App) execChild(name string, args []string, env []string) int {
@@ -449,28 +455,28 @@ type envPreparedSecret struct {
 	EnvName string
 }
 
-func (a App) prepareSecretRelease(st *store.FileStore, agent, runtimeType, action, auditAction, fullPath, auditReason string, extra map[string]string) (preparedSecretRelease, error) {
-	allowed, reason := st.CheckPolicy(agent, fullPath, action)
+func (a App) prepareSecretRelease(st *store.FileStore, runtime runtimeAccessContext, action, auditAction, fullPath, auditReason string, extra map[string]string) (preparedSecretRelease, error) {
+	allowed, reason := st.CheckPolicy(runtime.Actor, fullPath, action)
 	scope, name, parseErr := store.ParseSecretPath(fullPath)
 	metadataScope := ""
 	if parseErr == nil {
 		metadataScope = scope
 	}
-	metadata := runtimeAuditMetadata(st, metadataScope, agent, runtimeType, extra)
+	metadata := runtimeAuditMetadata(st, metadataScope, runtime.Label, runtime.LabelType, extra)
 	if !allowed {
 		if parseErr == nil {
-			st.Audit(agent, auditAction, "denied", scope, store.HashSecretName(scope, name), reason, metadata)
+			st.Audit(runtime.Actor, auditAction, "denied", scope, store.HashSecretName(scope, name), reason, metadata)
 		} else {
-			st.Audit(agent, auditAction, "denied", "", "", reason, metadata)
+			st.Audit(runtime.Actor, auditAction, "denied", "", "", reason, metadata)
 		}
-		return preparedSecretRelease{}, fmt.Errorf("%s: %s cannot %s %s", reason, agent, action, fullPath)
+		return preparedSecretRelease{}, fmt.Errorf("%s: authenticated runtime cannot %s %s", reason, action, fullPath)
 	}
 	secret, err := st.SecretMetadata(fullPath)
 	if err != nil {
 		return preparedSecretRelease{}, err
 	}
 	if err := st.CheckSecretReadable(fullPath); err != nil {
-		st.Audit(agent, auditAction, "failed", secret.Scope, secret.NameHash, "secret not locally usable: "+err.Error(), metadata)
+		st.Audit(runtime.Actor, auditAction, "failed", secret.Scope, secret.NameHash, "secret not locally usable: "+err.Error(), metadata)
 		return preparedSecretRelease{}, err
 	}
 	if auditReason == "" {
