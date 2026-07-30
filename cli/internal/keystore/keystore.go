@@ -31,7 +31,7 @@ type platformKeyStore interface {
 }
 
 type goKeyringStore struct {
-	storeErrorsUnavailable bool
+	operationErrorsUnavailable bool
 }
 
 type failingPlatformKeyStore struct {
@@ -43,7 +43,7 @@ type failingPlatformKeyStore struct {
 
 func (k goKeyringStore) Store(service, account, value string) error {
 	if err := keyring.Set(service, account, value); err != nil {
-		if k.storeErrorsUnavailable || errors.Is(err, ErrPlatformUnavailable) {
+		if k.operationErrorsUnavailable || errors.Is(err, ErrPlatformUnavailable) {
 			return fmt.Errorf("%w: %v", ErrPlatformUnavailable, err)
 		}
 		return err
@@ -51,18 +51,24 @@ func (k goKeyringStore) Store(service, account, value string) error {
 	return nil
 }
 
-func (goKeyringStore) Load(service, account string) (string, error) {
+func (k goKeyringStore) Load(service, account string) (string, error) {
 	value, err := keyring.Get(service, account)
 	if errors.Is(err, keyring.ErrNotFound) {
 		return "", ErrKeyNotFound
 	}
+	if err != nil && (k.operationErrorsUnavailable || errors.Is(err, ErrPlatformUnavailable)) {
+		return "", fmt.Errorf("%w: %v", ErrPlatformUnavailable, err)
+	}
 	return value, err
 }
 
-func (goKeyringStore) Delete(service, account string) error {
+func (k goKeyringStore) Delete(service, account string) error {
 	err := keyring.Delete(service, account)
 	if errors.Is(err, keyring.ErrNotFound) {
 		return ErrKeyNotFound
+	}
+	if err != nil && (k.operationErrorsUnavailable || errors.Is(err, ErrPlatformUnavailable)) {
+		return fmt.Errorf("%w: %v", ErrPlatformUnavailable, err)
 	}
 	return err
 }

@@ -3,5 +3,5 @@
 package keystore
 
 func newPlatformKeyStore() platformKeyStore {
-	return goKeyringStore{storeErrorsUnavailable: true}
+	return goKeyringStore{operationErrorsUnavailable: true}
 }

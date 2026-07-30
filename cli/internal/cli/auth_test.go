@@ -123,6 +123,43 @@ func TestInitFallsBackToLocalFileKeyStoreWhenPlatformKeyringUnavailable(t *testi
 	}
 }
 
+func TestInitFallsBackToLocalFileKeyStoreWhenInitialKeyLoadIsUnavailable(t *testing.T) {
+	tmp := t.TempDir()
+	oldHome := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() {
+		_ = os.Setenv("ASIRI_HOME", oldHome)
+		keystore.ClearConfiguredFileKeyStoreDir()
+	})
+	_ = os.Setenv("ASIRI_HOME", tmp)
+	keystore.ClearConfiguredFileKeyStoreDir()
+	restoreFailure := keystore.FailPlatformOperationsForTesting(nil, keystore.ErrPlatformUnavailable, nil)
+	t.Cleanup(restoreFailure)
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	if code := app.Run([]string{"init", "--device", "headless-box", "--kind", "server"}); code != 0 {
+		t.Fatalf("init failed: %s", errb.String())
+	}
+	if !strings.Contains(out.String(), "using local file key store") {
+		t.Fatalf("init did not explain file keystore fallback: %s", out.String())
+	}
+
+	st, err := store.Load(filepath.Join(tmp, "local-state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State.KeyStore != store.KeyStoreFile {
+		t.Fatalf("expected file keystore state, got %q", st.State.KeyStore)
+	}
+	entries, err := os.ReadDir(store.DefaultFileKeyStoreDir(st.Path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected device private keys and audit ledger key in file keystore, got %d entries", len(entries))
+	}
+}
+
 func TestInitDoesNotFallbackOnTemporaryKeychainFailures(t *testing.T) {
 	for _, test := range []struct {
 		name string
