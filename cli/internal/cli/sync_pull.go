@@ -49,12 +49,15 @@ func (a App) pullOneWorkspaceWithBundle(st *store.FileStore, accessToken string,
 	if workspace.ID == "" || workspace.Slug == "" || workspace.CurrentDeviceID == "" {
 		return 0, 0, "", syncBundleResponse{}, errors.New("pull requires a trusted target workspace device")
 	}
-	if _, err := st.RegisterRemoteWorkspace(workspace.Slug, workspace.Alias, workspace.Kind, workspace.ID); err != nil {
-		return 0, 0, "", syncBundleResponse{}, err
-	}
 	var bundle syncBundleResponse
 	endpoint := fmt.Sprintf("%s/v1/sync?orgId=%s&deviceId=%s", strings.TrimRight(st.State.ControlPlane.Origin, "/"), url.QueryEscape(workspace.ID), url.QueryEscape(workspace.CurrentDeviceID))
 	if err := getJSONBearer(st, endpoint, accessToken, &bundle); err != nil {
+		return 0, 0, "", bundle, err
+	}
+	if err := validateSyncBundleTarget(bundle, workspace); err != nil {
+		return 0, 0, "", bundle, err
+	}
+	if err := registerPullWorkspace(st, workspace); err != nil {
 		return 0, 0, "", bundle, err
 	}
 	imported, err := a.importRemoteVersions(st, workspace, bundle.EncryptedSecrets, force)
@@ -75,6 +78,26 @@ func (a App) pullOneWorkspaceWithBundle(st *store.FileStore, accessToken string,
 		return 0, 0, "", bundle, err
 	}
 	return imported, len(bundle.EncryptedSecrets), "", bundle, nil
+}
+
+func validateSyncBundleTarget(bundle syncBundleResponse, workspace remoteWorkspaceResponse) error {
+	if bundle.OrgID == "" || bundle.DeviceID == "" {
+		return errors.New("control plane returned incomplete sync bundle identity")
+	}
+	if bundle.OrgID != workspace.ID || bundle.DeviceID != workspace.CurrentDeviceID {
+		return errors.New("control plane returned a sync bundle for a different workspace or device")
+	}
+	return nil
+}
+
+func registerPullWorkspace(st *store.FileStore, workspace remoteWorkspaceResponse) error {
+	local, ok := st.LocalWorkspace(workspace.Slug)
+	if ok && local.CanonicalSlug == workspace.Slug && local.RemoteWorkspaceID == "" {
+		_, err := st.AdoptRemoteWorkspace(workspace.Slug, workspace.Alias, workspace.Kind, workspace.ID)
+		return err
+	}
+	_, err := st.RegisterRemoteWorkspace(workspace.Slug, workspace.Alias, workspace.Kind, workspace.ID)
+	return err
 }
 
 type pullOptions struct {

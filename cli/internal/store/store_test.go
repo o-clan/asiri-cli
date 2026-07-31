@@ -1058,6 +1058,99 @@ func TestRegisterRemoteWorkspacePreservesLocalWorkspaceAndRejectsIdentityCollisi
 	}
 }
 
+func TestAdoptRemoteWorkspaceBindsExactCanonicalSlug(t *testing.T) {
+	st := testInitializedStore(t)
+	device := testDevice(t, "source")
+	st.State.Devices = append(st.State.Devices, device)
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+	local, err := st.CreateLocalWorkspace("testamy-com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddSecret("testamy-com/common/API_KEY", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	oldAAD := st.State.Secrets[SecretKey("testamy-com/common", "API_KEY")].Versions[0].AAD
+
+	workspace, err := st.AdoptRemoteWorkspace("testamy-com", "testamy", "domain", "org_testamy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workspace.ID != local.ID || workspace.RemoteWorkspaceID != "org_testamy" || workspace.Alias != "testamy" || workspace.Kind != "domain" {
+		t.Fatalf("unexpected adopted workspace: %#v", workspace)
+	}
+	binding, ok := st.RemoteBindingForPrefix("testamy-com")
+	if !ok || binding.WorkspaceID != "org_testamy" {
+		t.Fatalf("workspace prefix was not bound to remote identity: %#v", binding)
+	}
+	version := st.State.Secrets[SecretKey("testamy-com/common", "API_KEY")].Versions[0]
+	if version.AAD == oldAAD || !strings.HasPrefix(version.AAD, "org_testamy:") {
+		t.Fatalf("local secret was not rebound to remote identity: %#v", version)
+	}
+	value, _, err := st.GetSecret("testamy-com/common/API_KEY")
+	if err != nil || value != "secret" {
+		t.Fatalf("adopted local secret did not remain decryptable: value=%q err=%v", value, err)
+	}
+}
+
+func TestAdoptRemoteWorkspaceRejectsAnotherWorkspaceAliasBeforeBinding(t *testing.T) {
+	st := testInitializedStore(t)
+	device := testDevice(t, "source")
+	st.State.Devices = append(st.State.Devices, device)
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateLocalWorkspace("testamy-com"); err != nil {
+		t.Fatal(err)
+	}
+	other, err := st.CreateLocalWorkspace("other-com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SetLocalWorkspaceAlias(other.ID, "testamy"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.AdoptRemoteWorkspace("testamy-com", "testamy", "domain", "org_testamy"); err == nil || !strings.Contains(err.Error(), "collides") {
+		t.Fatalf("expected alias collision, got %v", err)
+	}
+	workspace, ok := st.LocalWorkspace("testamy-com")
+	if !ok || workspace.RemoteWorkspaceID != "" {
+		t.Fatalf("failed adoption changed local workspace identity: %#v", workspace)
+	}
+	if _, ok := st.RemoteBindingForPrefix("testamy-com"); ok {
+		t.Fatal("failed adoption bound the local prefix")
+	}
+}
+
+func TestAdoptRemoteWorkspaceRejectsAlreadyRegisteredRemoteIDBeforeBinding(t *testing.T) {
+	st := testInitializedStore(t)
+	device := testDevice(t, "source")
+	st.State.Devices = append(st.State.Devices, device)
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateLocalWorkspace("testamy-com"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.RegisterRemoteWorkspace("other-com", "", "domain", "org_testamy"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.AdoptRemoteWorkspace("testamy-com", "", "domain", "org_testamy"); err == nil || !strings.Contains(err.Error(), "already registered") {
+		t.Fatalf("expected registered remote id collision, got %v", err)
+	}
+	workspace, ok := st.LocalWorkspace("testamy-com")
+	if !ok || workspace.RemoteWorkspaceID != "" {
+		t.Fatalf("failed adoption changed local workspace identity: %#v", workspace)
+	}
+	if _, ok := st.RemoteBindingForPrefix("testamy-com"); ok {
+		t.Fatal("failed adoption bound the local prefix")
+	}
+}
+
 func TestMigratedUnboundWorkspaceUsesNewCanonicalizationKind(t *testing.T) {
 	st := testInitializedStore(t)
 	st.State.Devices = append(st.State.Devices, asiri.Device{ID: "dev_test", Name: "test", Kind: "laptop", Status: asiri.DeviceTrusted})
@@ -1661,6 +1754,75 @@ func TestImportRemoteSecretRequiresWorkspaceID(t *testing.T) {
 	versions[0].OrgID = ""
 	if _, err := st.ImportRemoteSecretVersions("org_oclan", "oclan-co", "dev_source", versions, true); err == nil || !strings.Contains(err.Error(), "missing workspace id") {
 		t.Fatalf("expected missing workspace id rejection, got %v", err)
+	}
+}
+
+func TestImportRemoteSecretAcceptsEqualLocalValueWithDifferentEnvelope(t *testing.T) {
+	const (
+		workspaceID   = "org_oclan"
+		workspaceSlug = "oclan-co"
+		secretPath    = "oclan-co/local/asiri/API_KEY"
+	)
+	expires := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
+
+	source := testInitializedStore(t)
+	sourceDevice := testDevice(t, "source")
+	source.State.Devices = append(source.State.Devices, sourceDevice)
+	if err := source.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.AddSecret(secretPath, "shared-secret"); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.LinkControlPlane("http://control.test", workspaceID, workspaceSlug, "usr_owner", "dev_source", "at_source", "rt_source", 3600, expires); err != nil {
+		t.Fatal(err)
+	}
+	bindPrefixForTest(t, source, workspaceSlug, workspaceID)
+	versions, err := source.RemoteSecretVersionsForPrefix(workspaceID, workspaceSlug, "dev_source", workspaceSlug)
+	if err != nil || len(versions) != 1 {
+		t.Fatalf("unexpected source versions: count=%d err=%v", len(versions), err)
+	}
+
+	target := testInitializedStore(t)
+	targetDevice := testDevice(t, "target")
+	target.State.Devices = append(target.State.Devices, targetDevice)
+	if err := target.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := target.AddSecret(secretPath, "shared-secret"); err != nil {
+		t.Fatal(err)
+	}
+	if err := target.LinkControlPlane("http://control.test", workspaceID, workspaceSlug, "usr_owner", "dev_target", "at_target", "rt_target", 3600, expires); err != nil {
+		t.Fatal(err)
+	}
+	bindPrefixForTest(t, target, workspaceSlug, workspaceID)
+	localBefore := target.State.Secrets[SecretKey("oclan-co/local/asiri", "API_KEY")].Versions[0]
+	if localBefore.Ciphertext == versions[0].Ciphertext {
+		t.Fatal("test requires independently encrypted local and remote envelopes")
+	}
+	wrapped, err := source.RemoteWrappedKeyForSecretVersionPublicKey(workspaceID, versions[0].Scope, versions[0].Name, versions[0].Version, "dev_target", targetDevice.EncryptionPublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	versions[0].WrappedKeys = []RemoteWrappedKey{wrapped}
+
+	imported, err := target.ImportRemoteSecretVersions(workspaceID, workspaceSlug, "dev_target", versions, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imported != 1 {
+		t.Fatalf("expected one reconciled remote version, got %d", imported)
+	}
+	active := activeSecretVersion(target.State.Secrets[SecretKey("oclan-co/local/asiri", "API_KEY")])
+	if active == nil || active.AAD != versions[0].AAD || active.Ciphertext != versions[0].Ciphertext {
+		t.Fatalf("equal local value did not adopt the remote envelope: %#v", active)
+	}
+	if active.DataKeyAccount != localBefore.DataKeyAccount {
+		t.Fatal("equal-value reconciliation should reuse the existing local data-key account")
+	}
+	value, _, err := target.GetSecret(secretPath)
+	if err != nil || value != "shared-secret" {
+		t.Fatalf("reconciled secret is not usable: value=%q err=%v", value, err)
 	}
 }
 

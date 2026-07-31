@@ -1502,15 +1502,29 @@ func (s *FileStore) importRemoteSecretVersions(workspaceID, workspaceSlug string
 		if !include {
 			continue
 		}
-		if _, err := decryptWithKey(dataKey, remote.Nonce, remote.Ciphertext, []byte(remote.AAD)); err != nil {
+		remotePlaintext, err := decryptWithKey(dataKey, remote.Nonce, remote.Ciphertext, []byte(remote.AAD))
+		if err != nil {
 			partial.add(remote, fmt.Errorf("cannot be decrypted by this data key: %w", err))
 			continue
 		}
 		key := SecretKey(remote.Scope, remote.Name)
+		reusedDataKeyAccount := ""
 		if secret := s.State.Secrets[key]; secret.Scope != "" && !force {
-			if active := activeSecretVersion(secret); active == nil || active.Version != remote.Version || active.AAD != remote.AAD || active.Ciphertext != remote.Ciphertext {
+			active := activeSecretVersion(secret)
+			if active == nil || active.Version != remote.Version {
 				return 0, fmt.Errorf("remote secret %s/%s conflicts with a local active version; rerun with --force only if you intend to replace it", remote.Scope, remote.Name)
 			}
+			sameEnvelope := active.Algorithm == remote.Algorithm && active.Nonce == remote.Nonce && active.AAD == remote.AAD && active.Ciphertext == remote.Ciphertext
+			if !sameEnvelope {
+				localPlaintext, err := s.decryptSecretVersion(*active)
+				if err != nil {
+					return 0, fmt.Errorf("cannot compare remote secret %s/%s with the local active version: %w", remote.Scope, remote.Name, err)
+				}
+				if !hmac.Equal(localPlaintext, remotePlaintext) {
+					return 0, fmt.Errorf("remote secret %s/%s conflicts with a local active version; rerun with --force only if you intend to replace it", remote.Scope, remote.Name)
+				}
+			}
+			reusedDataKeyAccount = active.DataKeyAccount
 		}
 		accountWorkspaceID := s.State.VaultID
 		if remote.OrgID != "" {
@@ -1520,9 +1534,12 @@ func (s *FileStore) importRemoteSecretVersions(workspaceID, workspaceSlug string
 			}
 			accountWorkspaceID = remote.OrgID
 		}
-		account, err := newSecretDataKeyAccount(accountWorkspaceID)
-		if err != nil {
-			return 0, err
+		account := reusedDataKeyAccount
+		if account == "" {
+			account, err = newSecretDataKeyAccount(accountWorkspaceID)
+			if err != nil {
+				return 0, err
+			}
 		}
 		prepared = append(prepared, preparedRemoteSecretVersion{
 			remote:  remote,
@@ -2103,6 +2120,43 @@ func (s *FileStore) RegisterRemoteWorkspace(canonicalSlug, alias, kind, remoteWo
 		s.State.RemoteBindings = map[string]asiri.RemoteWorkspaceBinding{}
 	}
 	s.State.RemoteBindings[canonicalSlug] = asiri.RemoteWorkspaceBinding{WorkspaceID: remoteWorkspaceID, WorkspaceSlug: canonicalSlug, BoundAt: now}
+	return workspace, nil
+}
+
+func (s *FileStore) AdoptRemoteWorkspace(canonicalSlug, alias, kind, remoteWorkspaceID string) (asiri.LocalWorkspace, error) {
+	if err := ValidateWorkspaceSlug(canonicalSlug); err != nil {
+		return asiri.LocalWorkspace{}, err
+	}
+	if alias != "" {
+		if err := ValidateWorkspaceSlug(alias); err != nil {
+			return asiri.LocalWorkspace{}, err
+		}
+	}
+	if remoteWorkspaceID == "" {
+		return asiri.LocalWorkspace{}, errors.New("remote workspace id is required")
+	}
+	local, ok := s.LocalWorkspace(canonicalSlug)
+	if !ok || local.CanonicalSlug != canonicalSlug || local.RemoteWorkspaceID != "" {
+		return asiri.LocalWorkspace{}, fmt.Errorf("local workspace %s is not available for remote adoption", canonicalSlug)
+	}
+	if existing, ok := s.LocalWorkspaceByRemoteID(remoteWorkspaceID); ok && existing.ID != local.ID {
+		return asiri.LocalWorkspace{}, fmt.Errorf("remote workspace %s is already registered as local workspace %s", remoteWorkspaceID, existing.CanonicalSlug)
+	}
+	for _, existing := range s.State.Workspaces {
+		if existing.ID != local.ID && localWorkspaceIdentityCollision(existing, canonicalSlug, alias) {
+			return asiri.LocalWorkspace{}, fmt.Errorf("remote workspace identity collides with local workspace %s", existing.CanonicalSlug)
+		}
+	}
+	if err := s.BindWorkspacePrefix(canonicalSlug, remoteWorkspaceID, canonicalSlug); err != nil {
+		return asiri.LocalWorkspace{}, err
+	}
+	workspace, err := s.RegisterRemoteWorkspace(canonicalSlug, alias, kind, remoteWorkspaceID)
+	if err != nil {
+		return asiri.LocalWorkspace{}, err
+	}
+	if err := s.Save(); err != nil {
+		return asiri.LocalWorkspace{}, err
+	}
 	return workspace, nil
 }
 
