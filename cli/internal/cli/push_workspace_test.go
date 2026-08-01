@@ -167,7 +167,7 @@ func TestPushReportsRequestedWorkspaceWriteDenial(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{
 				"id": "org_oclan", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_oclan",
 			}}})
-		case "/v1/sync/write-options":
+		case "/v1/sync/push-plan":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"requestedWorkspaceSlug": "oclan-co",
 				"workspace": map[string]any{
@@ -176,11 +176,15 @@ func TestPushReportsRequestedWorkspaceWriteDenial(t *testing.T) {
 					"canWrite": false,
 					"paths": []map[string]any{{
 						"fullPath": "oclan-co/recipe-app/API_KEY",
+						"scope":    "oclan-co/recipe-app",
+						"name":     "API_KEY",
 						"canWrite": false,
 					}},
 				},
+				"targets":  []map[string]any{{"scope": "oclan-co/recipe-app", "name": "API_KEY", "devices": []map[string]any{}}},
+				"recovery": nil, "encryptedSecrets": []map[string]any{}, "secrets": []map[string]any{},
 			})
-		case "/v1/secrets":
+		case "/v1/secrets/batch":
 			secretPushSeen = true
 			http.NotFound(w, r)
 		default:

@@ -31,11 +31,21 @@ func (a App) rekey(st *store.FileStore, args []string) int {
 	if err := rejectUnknownArgs(remaining, "--yes"); err != nil {
 		return a.fail(err)
 	}
-	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	var accessToken string
+	err = a.withProgress("Checking control-plane session", func() error {
+		var accessErr error
+		accessToken, accessErr = ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+		return accessErr
+	})
 	if err != nil {
 		return a.fail(err)
 	}
-	target, accessToken, err := a.remoteWorkspaceTarget(st, accessToken, workspaceArg)
+	var target remoteWorkspaceResponse
+	err = a.withProgress("Resolving workspace", func() error {
+		var targetErr error
+		target, accessToken, targetErr = a.remoteWorkspaceTarget(st, accessToken, workspaceArg)
+		return targetErr
+	})
 	if err != nil {
 		return a.fail(err)
 	}
@@ -53,17 +63,28 @@ func (a App) rekey(st *store.FileStore, args []string) int {
 		fmt.Fprintln(a.Out, "No local active secrets to rekey")
 		return 0
 	}
-	options, err := remoteWriteOptions(st, st.State.ControlPlane.Origin, accessToken, target, selectedRefs)
+	var options writeOptionsResponse
+	err = a.withProgress("Checking rekey permissions", func() error {
+		var optionsErr error
+		options, optionsErr = remoteWriteOptions(st, st.State.ControlPlane.Origin, accessToken, target, selectedRefs)
+		if optionsErr != nil {
+			return optionsErr
+		}
+		_, optionsErr = getActiveRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, target.ID, accessToken)
+		return optionsErr
+	})
 	if err != nil {
 		return a.fail(err)
 	}
 	if !options.Workspace.CanWrite {
 		return a.fail(fmt.Errorf("workspace %s cannot write %s", target.Slug, fullPathList(options.Workspace.Paths)))
 	}
-	if _, err := getActiveRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, target.ID, accessToken); err != nil {
-		return a.fail(err)
-	}
-	rotated, err := st.RotateDataKeysForPrefix(target.Slug)
+	rotated := 0
+	err = a.withProgress(fmt.Sprintf("Re-encrypting %d local secret(s)", len(selectedRefs)), func() error {
+		var rotateErr error
+		rotated, rotateErr = st.RotateDataKeysForPrefix(target.Slug)
+		return rotateErr
+	})
 	if err != nil {
 		return a.fail(err)
 	}
@@ -92,15 +113,30 @@ func (a App) rewrap(st *store.FileStore, args []string) int {
 	if err := rejectUnknownArgs(remaining); err != nil {
 		return a.fail(err)
 	}
-	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	var accessToken string
+	err = a.withProgress("Checking control-plane session", func() error {
+		var accessErr error
+		accessToken, accessErr = ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+		return accessErr
+	})
 	if err != nil {
 		return a.fail(err)
 	}
-	target, accessToken, err := a.remoteWorkspaceTarget(st, accessToken, workspaceArg)
+	var target remoteWorkspaceResponse
+	err = a.withProgress("Resolving workspace", func() error {
+		var targetErr error
+		target, accessToken, targetErr = a.remoteWorkspaceTarget(st, accessToken, workspaceArg)
+		return targetErr
+	})
 	if err != nil {
 		return a.fail(err)
 	}
-	stats, err := a.rewrapWorkspace(st, accessToken, target)
+	var stats rewrapStats
+	err = a.withProgress("Wrapping keys for trusted devices", func() error {
+		var rewrapErr error
+		stats, rewrapErr = a.rewrapWorkspace(st, accessToken, target)
+		return rewrapErr
+	})
 	if err != nil {
 		return a.fail(err)
 	}
@@ -251,11 +287,21 @@ func (a App) recovery(st *store.FileStore, args []string) int {
 		if err := rejectUnknownArgs(remaining); err != nil {
 			return a.fail(err)
 		}
-		accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+		var accessToken string
+		err = a.withProgress("Checking control-plane session", func() error {
+			var accessErr error
+			accessToken, accessErr = ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+			return accessErr
+		})
 		if err != nil {
 			return a.fail(err)
 		}
-		target, accessToken, err := a.remoteWorkspaceTarget(st, accessToken, workspaceArg)
+		var target remoteWorkspaceResponse
+		err = a.withProgress("Resolving workspace", func() error {
+			var targetErr error
+			target, accessToken, targetErr = a.remoteWorkspaceTarget(st, accessToken, workspaceArg)
+			return targetErr
+		})
 		if err != nil {
 			return a.fail(err)
 		}
@@ -270,7 +316,12 @@ func (a App) recovery(st *store.FileStore, args []string) int {
 		if st.State.Recoveries == nil {
 			st.State.Recoveries = map[string]asiri.RecoveryConfig{}
 		}
-		recovery, err := getActiveRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, target.ID, accessToken)
+		var recovery *asiri.RecoveryConfig
+		err = a.withProgress("Checking recovery coverage", func() error {
+			var recoveryErr error
+			recovery, recoveryErr = getActiveRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, target.ID, accessToken)
+			return recoveryErr
+		})
 		if err != nil {
 			return a.fail(err)
 		}
@@ -320,16 +371,31 @@ func (a App) recovery(st *store.FileStore, args []string) int {
 		if !hasOutput && (!isTerminalOutput || !term.IsTerminal(int(outFile.Fd()))) {
 			return a.fail(errors.New("recovery setup requires --output-file in non-interactive mode"))
 		}
-		accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+		var accessToken string
+		err = a.withProgress("Checking control-plane session", func() error {
+			var accessErr error
+			accessToken, accessErr = ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+			return accessErr
+		})
 		if err != nil {
 			return a.fail(err)
 		}
-		target, accessToken, err := a.remoteWorkspaceTarget(st, accessToken, workspaceArg)
+		var target remoteWorkspaceResponse
+		err = a.withProgress("Resolving workspace", func() error {
+			var targetErr error
+			target, accessToken, targetErr = a.remoteWorkspaceTarget(st, accessToken, workspaceArg)
+			return targetErr
+		})
 		if err != nil {
 			return a.fail(err)
 		}
 		force := hasFlag(remaining, "--force")
-		remoteRecovery, err := getActiveRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, target.ID, accessToken)
+		var remoteRecovery *asiri.RecoveryConfig
+		err = a.withProgress("Checking existing recovery configuration", func() error {
+			var recoveryErr error
+			remoteRecovery, recoveryErr = getActiveRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, target.ID, accessToken)
+			return recoveryErr
+		})
 		if err != nil {
 			return a.fail(err)
 		}
@@ -355,7 +421,14 @@ func (a App) recovery(st *store.FileStore, args []string) int {
 				}
 			}()
 		}
-		replacements, covered, remoteWrapped, err := a.prepareRemoteRecoveryReplacementKeys(st, accessToken, target, setup.Config)
+		var replacements []recoveryRecipientReplacement
+		covered := 0
+		remoteWrapped := 0
+		err = a.withProgress("Preparing recovery wrapping", func() error {
+			var prepareErr error
+			replacements, covered, remoteWrapped, prepareErr = a.prepareRemoteRecoveryReplacementKeys(st, accessToken, target, setup.Config)
+			return prepareErr
+		})
 		if err != nil {
 			return a.fail(err)
 		}
@@ -371,11 +444,17 @@ func (a App) recovery(st *store.FileStore, args []string) int {
 			fmt.Fprintln(a.Out, "Copy this key to a secure place, for example a password app or a printed copy. Asiri will not show it again.")
 		}
 		if remoteRecovery != nil {
-			if err := replaceRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, target.ID, target.CurrentDeviceID, accessToken, setup, replacements); err != nil {
+			if err := a.withProgress("Committing recovery replacement", func() error {
+				return replaceRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, target.ID, target.CurrentDeviceID, accessToken, setup, replacements)
+			}); err != nil {
 				return a.fail(fmt.Errorf("recovery key delivered, but remote replacement failed: %w", err))
 			}
-		} else if err := registerRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, target.ID, target.CurrentDeviceID, accessToken, setup, replacements); err != nil {
-			return a.fail(fmt.Errorf("recovery key delivered, but remote registration failed: %w", err))
+		} else {
+			if err := a.withProgress("Committing recovery setup", func() error {
+				return registerRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, target.ID, target.CurrentDeviceID, accessToken, setup, replacements)
+			}); err != nil {
+				return a.fail(fmt.Errorf("recovery key delivered, but remote registration failed: %w", err))
+			}
 		}
 		st.CommitRecoverySetup(target.ID, target.Slug, setup)
 		if covered > 0 {
@@ -440,15 +519,30 @@ func (a App) recoveryRestore(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	var accessToken string
+	err = a.withProgress("Checking control-plane session", func() error {
+		var accessErr error
+		accessToken, accessErr = ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+		return accessErr
+	})
 	if err != nil {
 		return a.fail(err)
 	}
-	target, accessToken, err := a.remoteWorkspaceTarget(st, accessToken, workspaceArg)
+	var target remoteWorkspaceResponse
+	err = a.withProgress("Resolving workspace", func() error {
+		var targetErr error
+		target, accessToken, targetErr = a.remoteWorkspaceTarget(st, accessToken, workspaceArg)
+		return targetErr
+	})
 	if err != nil {
 		return a.fail(err)
 	}
-	secrets, err := listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, identity.RecipientID, false)
+	var secrets []remoteSecretRecord
+	err = a.withProgress("Downloading recovery-encrypted secrets", func() error {
+		var secretsErr error
+		secrets, secretsErr = listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, identity.RecipientID, false)
+		return secretsErr
+	})
 	if err != nil {
 		return a.fail(err)
 	}
@@ -460,11 +554,21 @@ func (a App) recoveryRestore(st *store.FileStore, args []string) int {
 		fmt.Fprintln(a.Out, "No remote active secrets to restore")
 		return 0
 	}
-	imported, identity, err := st.ImportRecoveryRemoteSecretVersions(target.ID, target.Slug, activeVersions, recoveryKey, hasFlag(remaining, "--force"))
+	imported := 0
+	err = a.withProgress(fmt.Sprintf("Restoring %d secret version(s)", len(activeVersions)), func() error {
+		var importErr error
+		imported, identity, importErr = st.ImportRecoveryRemoteSecretVersions(target.ID, target.Slug, activeVersions, recoveryKey, hasFlag(remaining, "--force"))
+		return importErr
+	})
 	if err != nil {
 		return a.fail(err)
 	}
-	rewrapped, err := a.addRecoveredDeviceWrappedKeys(st, accessToken, target, secrets, identity.RecipientID)
+	rewrapped := 0
+	err = a.withProgress("Registering this device on restored secrets", func() error {
+		var rewrapErr error
+		rewrapped, rewrapErr = a.addRecoveredDeviceWrappedKeys(st, accessToken, target, secrets, identity.RecipientID)
+		return rewrapErr
+	})
 	if err != nil {
 		return a.fail(err)
 	}

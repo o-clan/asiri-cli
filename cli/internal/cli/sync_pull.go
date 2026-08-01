@@ -24,11 +24,21 @@ func (a App) pull(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	var accessToken string
+	err = a.withProgress("Checking control-plane session", func() error {
+		var accessErr error
+		accessToken, accessErr = ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+		return accessErr
+	})
 	if err != nil {
 		return a.fail(err)
 	}
-	target, accessToken, err := a.remoteWorkspaceTarget(st, accessToken, options.Workspace)
+	var target remoteWorkspaceResponse
+	err = a.withProgress("Resolving workspace", func() error {
+		var targetErr error
+		target, accessToken, targetErr = a.remoteWorkspaceTarget(st, accessToken, options.Workspace)
+		return targetErr
+	})
 	if err != nil {
 		return a.fail(err)
 	}
@@ -51,7 +61,9 @@ func (a App) pullOneWorkspaceWithBundle(st *store.FileStore, accessToken string,
 	}
 	var bundle syncBundleResponse
 	endpoint := fmt.Sprintf("%s/v1/sync?orgId=%s&deviceId=%s", strings.TrimRight(st.State.ControlPlane.Origin, "/"), url.QueryEscape(workspace.ID), url.QueryEscape(workspace.CurrentDeviceID))
-	if err := getJSONBearer(st, endpoint, accessToken, &bundle); err != nil {
+	if err := a.withProgress("Downloading encrypted workspace", func() error {
+		return getJSONBearer(st, endpoint, accessToken, &bundle)
+	}); err != nil {
 		return 0, 0, "", bundle, err
 	}
 	if err := validateSyncBundleTarget(bundle, workspace); err != nil {
@@ -60,7 +72,12 @@ func (a App) pullOneWorkspaceWithBundle(st *store.FileStore, accessToken string,
 	if err := registerPullWorkspace(st, workspace); err != nil {
 		return 0, 0, "", bundle, err
 	}
-	imported, err := a.importRemoteVersions(st, workspace, bundle.EncryptedSecrets, force)
+	imported := 0
+	err := a.withProgress(fmt.Sprintf("Importing %d encrypted secret version(s)", len(bundle.EncryptedSecrets)), func() error {
+		var importErr error
+		imported, importErr = a.importRemoteVersions(st, workspace, bundle.EncryptedSecrets, force)
+		return importErr
+	})
 	if err != nil {
 		var partial *store.RemoteImportPartialError
 		if !errors.As(err, &partial) {

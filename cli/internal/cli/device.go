@@ -186,7 +186,12 @@ func (a App) trustDeviceInWorkspace(st *store.FileStore, origin, accessToken, wo
 	fmt.Fprintf(a.Out, "\nTrust this device for workspace %s\n", workspaceSlug)
 	fmt.Fprintf(a.Out, "Open %s\n", start.VerificationURIComplete)
 	fmt.Fprintf(a.Out, "Code: %s\n", start.UserCode)
-	result, err := pollDeviceCodeTrust(st, origin, start)
+	var result deviceCodeTokenResponse
+	err = a.withProgress("Waiting for device approval", func() error {
+		var pollErr error
+		result, pollErr = pollDeviceCodeTrust(st, origin, start)
+		return pollErr
+	})
 	if err != nil {
 		return result, err
 	}
@@ -198,7 +203,12 @@ func (a App) trustDeviceInWorkspace(st *store.FileStore, origin, accessToken, wo
 	}
 	fmt.Fprintf(a.Out, "✓ This device is trusted for workspace %s\n", result.WorkspaceSlug)
 	target := remoteWorkspaceResponse{ID: result.OrgID, Slug: result.WorkspaceSlug, CurrentDeviceTrusted: boolPtr(true), CanPull: boolPtr(true), CurrentDeviceID: result.DeviceID}
-	stats, err := a.rewrapWorkspace(st, accessToken, target)
+	var stats rewrapStats
+	err = a.withProgress("Wrapping existing secrets for this device", func() error {
+		var rewrapErr error
+		stats, rewrapErr = a.rewrapWorkspace(st, accessToken, target)
+		return rewrapErr
+	})
 	if err != nil {
 		fmt.Fprintf(a.Err, "asiri: trusted device, but automatic rewrap could not run: %s\n", err)
 		return result, nil

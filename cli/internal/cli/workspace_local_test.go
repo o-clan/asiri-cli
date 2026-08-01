@@ -172,17 +172,20 @@ func TestFirstSyncCanonicalizesLocalWorkspaceAndKeepsAlias(t *testing.T) {
 		t.Fatal(err)
 	}
 	out.Reset()
-	_, _, dryRunStop, err := app.prepareLocalWorkspacePush(st, pushOptions{Workspace: "xai-dev", DryRun: true}, "at_sync")
+	_, _, dryRunStop, _, err := app.prepareLocalWorkspacePush(st, pushOptions{Workspace: "xai-dev", DryRun: true}, "at_sync")
 	if err != nil || !dryRunStop || !strings.Contains(out.String(), "alias xai would be retained") {
 		t.Fatalf("dry-run did not report the selected alias: stop=%v err=%v out=%s", dryRunStop, err, out.String())
 	}
 	out.Reset()
-	options, _, stop, err := app.prepareLocalWorkspacePush(st, pushOptions{Workspace: "xai-dev"}, "at_sync")
+	options, _, stop, workspaceMessage, err := app.prepareLocalWorkspacePush(st, pushOptions{Workspace: "xai-dev"}, "at_sync")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if stop || options.Workspace != "xai-dev-8dhc3udj" {
 		t.Fatalf("unexpected canonicalization result: options=%#v stop=%v", options, stop)
+	}
+	if out.Len() != 0 || !strings.Contains(workspaceMessage, "synced as xai-dev-8dhc3udj") {
+		t.Fatalf("workspace sync result must be returned for printing after progress stops: message=%q out=%q", workspaceMessage, out.String())
 	}
 	workspace, ok := st.LocalWorkspace("xai")
 	if !ok || workspace.CanonicalSlug != "xai-dev-8dhc3udj" || workspace.Alias != "xai" || workspace.RemoteWorkspaceID != "org_synced" {

@@ -86,6 +86,30 @@ func (a App) pushWorkspaceTarget(st *store.FileStore, accessToken, requested str
 }
 
 func remoteWriteOptions(st *store.FileStore, origin, accessToken string, target remoteWorkspaceResponse, refs []store.LocalSecretRef) (writeOptionsResponse, error) {
+	entries := remoteWriteOptionEntries(refs)
+	var result writeOptionsResponse
+	if err := postJSONBearer(st, strings.TrimRight(origin, "/")+"/v1/sync/write-options", accessToken, map[string]any{"orgId": target.ID, "entries": entries}, &result); err != nil {
+		return result, err
+	}
+	if err := validateRemoteWriteOptions(result.RequestedWorkspaceSlug, result.Workspace, target); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+func remotePushPlan(st *store.FileStore, origin, accessToken string, target remoteWorkspaceResponse, refs []store.LocalSecretRef) (remotePushPlanResponse, error) {
+	entries := remoteWriteOptionEntries(refs)
+	var result remotePushPlanResponse
+	if err := postJSONBearer(st, strings.TrimRight(origin, "/")+"/v1/sync/push-plan", accessToken, map[string]any{"orgId": target.ID, "entries": entries}, &result); err != nil {
+		return result, err
+	}
+	if err := validateRemoteWriteOptions(result.RequestedWorkspaceSlug, result.Workspace, target); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+func remoteWriteOptionEntries(refs []store.LocalSecretRef) []map[string]string {
 	entries := make([]map[string]string, 0, len(refs))
 	seen := map[string]bool{}
 	for _, ref := range refs {
@@ -96,17 +120,17 @@ func remoteWriteOptions(st *store.FileStore, origin, accessToken string, target 
 		seen[key] = true
 		entries = append(entries, map[string]string{"scope": ref.Scope, "name": ref.Name})
 	}
-	var result writeOptionsResponse
-	if err := postJSONBearer(st, strings.TrimRight(origin, "/")+"/v1/sync/write-options", accessToken, map[string]any{"orgId": target.ID, "entries": entries}, &result); err != nil {
-		return result, err
+	return entries
+}
+
+func validateRemoteWriteOptions(requestedWorkspaceSlug string, workspace writeWorkspaceOption, target remoteWorkspaceResponse) error {
+	if requestedWorkspaceSlug == "" || workspace.Slug == "" {
+		return errors.New("control plane returned incomplete write options")
 	}
-	if result.RequestedWorkspaceSlug == "" || result.Workspace.Slug == "" {
-		return result, errors.New("control plane returned incomplete write options")
+	if workspace.ID != target.ID || workspace.Slug != target.Slug || requestedWorkspaceSlug != target.Slug {
+		return errors.New("control plane returned write options for a different workspace")
 	}
-	if result.Workspace.ID != target.ID || result.Workspace.Slug != target.Slug || result.RequestedWorkspaceSlug != target.Slug {
-		return result, errors.New("control plane returned write options for a different workspace")
-	}
-	return result, nil
+	return nil
 }
 
 func fullPathList(paths []writePathOption) string {

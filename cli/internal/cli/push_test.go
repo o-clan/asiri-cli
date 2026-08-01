@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -44,7 +43,8 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 	sourcePath := testSecretBytesFile(t, sourceValue)
 	mountedPath := filepath.Join(tmp, "mounted-private-key")
 	secretPushCount := 0
-	wrappingDiscoveryCount := 0
+	pushPlanCount := 0
+	perSecretDiscoveryCount := 0
 	syncSeen := false
 	devicePublicKey := ""
 	var pushedSecret map[string]any
@@ -87,7 +87,14 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 					{"id": "org_remote", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_remote"},
 				},
 			})
-		case "/v1/sync/write-options":
+		case "/v1/sync/push-plan":
+			pushPlanCount++
+			encryptedSecrets := []map[string]any{}
+			secretMetadata := []map[string]any{}
+			if pushedSecret != nil {
+				encryptedSecrets = append(encryptedSecrets, pushedSecret)
+				secretMetadata = append(secretMetadata, pushedSecret)
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"requestedWorkspaceSlug": "oclan-co",
 				"workspace": map[string]any{
@@ -96,44 +103,51 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 					"canWrite": true,
 					"paths": []map[string]any{{
 						"fullPath": "oclan-co/local/asiri/API_KEY",
+						"scope":    "oclan-co/local/asiri",
+						"name":     "API_KEY",
 						"canWrite": true,
 					}},
 				},
+				"targets": []map[string]any{{
+					"scope": "oclan-co/local/asiri",
+					"name":  "API_KEY",
+					"devices": []map[string]any{
+						{"id": "dev_remote", "name": "qa-laptop", "status": "trusted", "kind": "laptop", "encryptionPublicKey": devicePublicKey},
+						{"id": "dev_other", "name": "server", "status": "trusted", "kind": "server", "encryptionPublicKey": devicePublicKey},
+					},
+				}},
+				"recovery":         nil,
+				"encryptedSecrets": encryptedSecrets,
+				"secrets":          secretMetadata,
 			})
+		case "/v1/secrets/batch":
+			secretPushCount++
+			if r.Header.Get("authorization") != "Bearer at_push" {
+				t.Fatalf("unexpected push auth header: %s", r.Header.Get("authorization"))
+			}
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			uploads, ok := body["uploads"].([]any)
+			if !ok || len(uploads) != 1 {
+				t.Fatalf("unexpected push batch: %#v", body)
+			}
+			pushedSecret = uploads[0].(map[string]any)
+			if pushedSecret["orgId"] != "org_remote" || pushedSecret["createdByDeviceId"] != "dev_remote" || pushedSecret["scope"] != "oclan-co/local/asiri" || pushedSecret["name"] != "API_KEY" {
+				t.Fatalf("unexpected pushed secret body: %#v", pushedSecret)
+			}
+			wrapped, ok := pushedSecret["wrappedKeys"].([]any)
+			if !ok || len(wrapped) != 2 {
+				t.Fatalf("missing wrapped keys: %#v", pushedSecret["wrappedKeys"])
+			}
+			pushedSecret["id"] = "secv_remote"
+			pushedSecret["status"] = "active"
+			pushedSecret["createdAt"] = time.Now().UTC().Format(time.RFC3339)
+			_ = json.NewEncoder(w).Encode(map[string]any{"saved": []map[string]any{{"id": "secv_remote", "status": "active"}}, "rewrapped": []map[string]any{}})
 		case "/v1/secrets":
 			if r.Method == http.MethodPost {
-				secretPushCount++
-				if r.Header.Get("authorization") != "Bearer at_push" {
-					t.Fatalf("unexpected push auth header: %s", r.Header.Get("authorization"))
-				}
-				var body map[string]any
-				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-					t.Fatal(err)
-				}
-				if body["orgId"] != "org_remote" || body["createdByDeviceId"] != "dev_remote" || body["scope"] != "oclan-co/local/asiri" || body["name"] != "API_KEY" {
-					t.Fatalf("unexpected pushed secret body: %#v", body)
-				}
-				wrapped, ok := body["wrappedKeys"].([]any)
-				if !ok || len(wrapped) != 2 {
-					t.Fatalf("missing wrapped keys: %#v", body["wrappedKeys"])
-				}
-				recipients := map[string]bool{}
-				for _, item := range wrapped {
-					wrappedKey := item.(map[string]any)
-					if wrappedKey["wrapAlgorithm"] != "p256-hkdf-aes256gcm" {
-						t.Fatalf("unexpected wrapped key: %#v", wrappedKey)
-					}
-					recipients[fmt.Sprint(wrappedKey["recipientId"])] = true
-				}
-				if !recipients["dev_remote"] || !recipients["dev_other"] {
-					t.Fatalf("unexpected wrapped recipients: %#v", wrapped)
-				}
-				pushedSecret = body
-				pushedSecret["id"] = "secv_remote"
-				pushedSecret["status"] = "active"
-				pushedSecret["createdAt"] = time.Now().UTC().Format(time.RFC3339)
-				_ = json.NewEncoder(w).Encode(map[string]any{"id": "secv_remote", "status": "active"})
-				return
+				t.Fatal("push must not post individual secrets")
 			}
 			if r.Method != http.MethodGet {
 				http.NotFound(w, r)
@@ -169,12 +183,7 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 				"encryptedSecrets": []map[string]any{pushedSecret},
 			})
 		case "/v1/devices":
-			wrappingDiscoveryCount++
-			if wrappingDiscoveryCount == 1 {
-				w.Header().Set("Retry-After", "0")
-				http.Error(w, `{"error":"rate limited"}`, http.StatusTooManyRequests)
-				return
-			}
+			perSecretDiscoveryCount++
 			if r.Header.Get("authorization") != "Bearer at_push" {
 				t.Fatalf("unexpected device list auth header: %s", r.Header.Get("authorization"))
 			}
@@ -255,14 +264,108 @@ func TestPushAndPullUseBearerAccessToken(t *testing.T) {
 			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
 		}
 	}
-	if secretPushCount != 1 || !syncSeen {
+	if secretPushCount != 1 || pushPlanCount != 2 || perSecretDiscoveryCount != 1 || !syncSeen {
 		t.Fatalf("expected push and pull endpoints to be called")
-	}
-	if wrappingDiscoveryCount < 2 {
-		t.Fatal("push did not retry rate-limited wrapping target discovery")
 	}
 	if strings.Contains(out.String(), "BEGIN OPENSSH PRIVATE KEY") || strings.Contains(errb.String(), "BEGIN OPENSSH PRIVATE KEY") {
 		t.Fatalf("push/pull leaked secret stdout=%q stderr=%q", out.String(), errb.String())
+	}
+}
+
+func TestPushBatchesMultipleSecretsIntoOnePlanAndOneCommit(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	planCalls := 0
+	commitCalls := 0
+	legacyCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{"deviceCode": "dc_batch_push", "userCode": "BPSH-1234", "verificationUriComplete": serverURL(r) + "/auth/device?code=BPSH-1234", "expiresIn": 30, "interval": 0})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "approved", "orgId": "org_batch_push", "workspaceSlug": "oclan-co", "userId": "usr_owner", "deviceId": "dev_batch_push", "accessToken": "at_batch_push", "refreshToken": "rt_batch_push", "expiresIn": 3600, "refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339)})
+		case "/v1/orgs":
+			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{"id": "org_batch_push", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_batch_push"}}})
+		case "/v1/sync/push-plan":
+			planCalls++
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"requestedWorkspaceSlug": "oclan-co",
+				"workspace": map[string]any{"id": "org_batch_push", "slug": "oclan-co", "canWrite": true, "paths": []map[string]any{
+					{"scope": "oclan-co/local/asiri", "name": "FIRST_KEY", "fullPath": "oclan-co/local/asiri/FIRST_KEY", "canWrite": true},
+					{"scope": "oclan-co/local/asiri", "name": "SECOND_KEY", "fullPath": "oclan-co/local/asiri/SECOND_KEY", "canWrite": true},
+				}},
+				"targets": []map[string]any{
+					{"scope": "oclan-co/local/asiri", "name": "FIRST_KEY", "devices": []map[string]any{}},
+					{"scope": "oclan-co/local/asiri", "name": "SECOND_KEY", "devices": []map[string]any{}},
+				},
+				"recovery": nil, "encryptedSecrets": []map[string]any{}, "secrets": []map[string]any{},
+			})
+		case "/v1/secrets/batch":
+			commitCalls++
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if uploads, ok := body["uploads"].([]any); !ok || len(uploads) != 2 {
+				t.Fatalf("expected both secrets in one commit: %#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"saved": []map[string]any{{"id": "sec_first"}, {"id": "sec_second"}}, "rewrapped": []map[string]any{}})
+		case "/v1/devices", "/v1/secrets", "/v1/secrets/encrypted", "/v1/sync/write-options":
+			legacyCalls++
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out, errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop", "--workspace", "oclan-co"},
+		{"add", "--workspace", "oclan-co", "local/asiri/FIRST_KEY", "--value-file", testSecretFile(t, "first")},
+		{"add", "--workspace", "oclan-co", "local/asiri/SECOND_KEY", "--value-file", testSecretFile(t, "second")},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+	linkLocalWorkspaceForTest(t, "oclan-co")
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"push", "--workspace", "oclan-co"}); code != 0 {
+		t.Fatalf("batched push failed: %s", errb.String())
+	}
+	if planCalls != 1 || commitCalls != 1 || legacyCalls != 0 {
+		t.Fatalf("push request fan-out regressed: plans=%d commits=%d legacy=%d", planCalls, commitCalls, legacyCalls)
+	}
+}
+
+func TestPushRejectsOversizedAtomicPayloadBeforeSending(t *testing.T) {
+	_, err := encodeRemotePushBatch(remotePushBatchRequest{
+		OrgID: "org_large_push",
+		Uploads: []store.RemoteSecretVersion{{
+			Scope:      "large/prod/api",
+			Name:       "LARGE_KEY",
+			Ciphertext: strings.Repeat("x", 256),
+		}},
+		Rewraps: []remotePushBatchRewrap{},
+	}, 128)
+	if err == nil {
+		t.Fatal("oversized atomic push payload was accepted")
+	}
+	for _, expected := range []string{"atomic push payload", "above", "--scope", "--secret"} {
+		if !strings.Contains(err.Error(), expected) {
+			t.Fatalf("size error %q does not contain %q", err, expected)
+		}
 	}
 }
 
@@ -346,8 +449,31 @@ func TestPushDryRunLinkedWorkspaceEvaluatesRemoteState(t *testing.T) {
 							{"id": "org_dry_run", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_dry_run"},
 						},
 					})
-				case "/v1/sync/write-options":
+				case "/v1/sync/push-plan":
 					writeOptionsSeen = true
+					devicesSeen = true
+					encryptedSeen = true
+					metadataSeen = true
+					if remoteVersion == nil {
+						t.Fatal("remote version was not prepared before dry-run push")
+					}
+					ciphertext := remoteVersion.Ciphertext
+					if tc.conflict {
+						ciphertext = "conflicting-ciphertext"
+					}
+					encryptedSecrets := []map[string]any{}
+					if !tc.metadataOnlyConflict {
+						encryptedSecrets = append(encryptedSecrets, map[string]any{
+							"id": "sec_dry_run", "orgId": "org_dry_run", "scope": "oclan-co/local/asiri", "name": "API_KEY",
+							"version": remoteVersion.Version, "algorithm": remoteVersion.Algorithm, "nonce": remoteVersion.Nonce,
+							"ciphertext": ciphertext, "aad": remoteVersion.AAD, "status": "active",
+							"wrappedKeys": []map[string]any{{"recipientType": "device", "recipientId": "dev_dry_run", "wrapAlgorithm": "p256-hkdf-aes256gcm", "wrappedKey": "remote-wrapped"}},
+						})
+					}
+					metadataStatus := "active"
+					if tc.metadataOnlyConflict {
+						metadataStatus = "stale"
+					}
 					_ = json.NewEncoder(w).Encode(map[string]any{
 						"requestedWorkspaceSlug": "oclan-co",
 						"workspace": map[string]any{
@@ -356,9 +482,21 @@ func TestPushDryRunLinkedWorkspaceEvaluatesRemoteState(t *testing.T) {
 							"canWrite": true,
 							"paths": []map[string]any{{
 								"fullPath": "oclan-co/local/asiri/API_KEY",
+								"scope":    "oclan-co/local/asiri",
+								"name":     "API_KEY",
 								"canWrite": true,
 							}},
 						},
+						"targets": []map[string]any{{"scope": "oclan-co/local/asiri", "name": "API_KEY", "devices": []map[string]any{
+							{"id": "dev_dry_run", "name": "qa-laptop", "status": "trusted", "kind": "laptop", "encryptionPublicKey": devicePublicKey},
+							{"id": "dev_other", "name": "server", "status": "trusted", "kind": "server", "encryptionPublicKey": devicePublicKey},
+						}}},
+						"recovery":         nil,
+						"encryptedSecrets": encryptedSecrets,
+						"secrets": []map[string]any{{
+							"id": "sec_dry_run_meta", "orgId": "org_dry_run", "scope": "oclan-co/local/asiri", "name": "API_KEY",
+							"version": remoteVersion.Version, "algorithm": remoteVersion.Algorithm, "status": metadataStatus,
+						}},
 					})
 				case "/v1/recovery-recipient":
 					http.NotFound(w, r)
@@ -574,10 +712,11 @@ func TestPushDryRunRemoteWorkspaceDoesNotSwitchAccountSession(t *testing.T) {
 				"expiresIn":        3600,
 				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 			})
-		case "/v1/sync/write-options":
+		case "/v1/sync/push-plan":
 			if r.Header.Get("authorization") != "Bearer at_refreshed" {
 				t.Fatalf("dry-run should reuse the refreshed account token, got %s", r.Header.Get("authorization"))
 			}
+			encryptedSeen = true
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"requestedWorkspaceSlug": "asiri-dev",
 				"workspace": map[string]any{
@@ -586,9 +725,13 @@ func TestPushDryRunRemoteWorkspaceDoesNotSwitchAccountSession(t *testing.T) {
 					"canWrite": true,
 					"paths": []map[string]any{{
 						"fullPath": "asiri-dev/local/asiri/API_KEY",
+						"scope":    "asiri-dev/local/asiri",
+						"name":     "API_KEY",
 						"canWrite": true,
 					}},
 				},
+				"targets":  []map[string]any{{"scope": "asiri-dev/local/asiri", "name": "API_KEY", "devices": []map[string]any{}}},
+				"recovery": nil, "encryptedSecrets": []map[string]any{}, "secrets": []map[string]any{},
 			})
 		case "/v1/recovery-recipient":
 			if r.URL.Query().Get("orgId") != "org_asiri" {
@@ -685,24 +828,9 @@ func TestPushFailsWhenTrustedDeviceDiscoveryUnavailable(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{
 				"id": "org_devices_fail", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_devices_fail",
 			}}})
-		case "/v1/sync/write-options":
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"requestedWorkspaceSlug": "oclan-co",
-				"workspace": map[string]any{
-					"id":       "org_devices_fail",
-					"slug":     "oclan-co",
-					"canWrite": true,
-					"paths": []map[string]any{{
-						"fullPath": "oclan-co/local/asiri/API_KEY",
-						"canWrite": true,
-					}},
-				},
-			})
-		case "/v1/recovery-recipient":
-			http.NotFound(w, r)
-		case "/v1/devices":
+		case "/v1/sync/push-plan":
 			http.Error(w, `{"error":"temporarily unavailable"}`, http.StatusServiceUnavailable)
-		case "/v1/secrets":
+		case "/v1/secrets/batch":
 			if r.Method == http.MethodPost {
 				postSeen = true
 			}
@@ -737,8 +865,8 @@ func TestPushFailsWhenTrustedDeviceDiscoveryUnavailable(t *testing.T) {
 	if postSeen {
 		t.Fatal("push should not upload secrets after trusted-device discovery fails")
 	}
-	if !strings.Contains(errb.String(), "trusted device discovery failed") {
-		t.Fatalf("missing device discovery failure: %s", errb.String())
+	if !strings.Contains(errb.String(), "control plane returned HTTP 503") {
+		t.Fatalf("missing push-plan failure: %s", errb.String())
 	}
 }
 
@@ -901,5 +1029,34 @@ func TestPushReconcileSkipsRemoteWrappedRecipientSuperset(t *testing.T) {
 	}
 	if len(result.Upload) != 0 || result.SkippedExisting != 1 {
 		t.Fatalf("remote wrapped recipient superset should skip existing: %#v", result)
+	}
+}
+
+func TestPushReconcileUsesMetadataToAvoidRedundantRewrap(t *testing.T) {
+	currentWrapped := store.RemoteWrappedKey{RecipientType: "device", RecipientID: "dev_current", WrapAlgorithm: "p256-hkdf-aes256gcm", WrappedKey: "wrapped-current"}
+	otherWrapped := store.RemoteWrappedKey{RecipientType: "device", RecipientID: "dev_other", WrapAlgorithm: "p256-hkdf-aes256gcm", WrappedKey: "wrapped-other"}
+	encrypted := remoteSecretRecord{
+		ID: "secv_existing", OrgID: "org_remote", Scope: "oclan-co/prod/github", Name: "SYNC_KEY", Version: 1,
+		Algorithm: "aes-256-gcm", Nonce: "nonce", Ciphertext: "ciphertext", AAD: "aad", Status: "active",
+		WrappedKeys: []store.RemoteWrappedKey{currentWrapped},
+	}
+	metadata := remoteSecretRecord{
+		ID: "secv_existing", OrgID: "org_remote", Scope: "oclan-co/prod/github", Name: "SYNC_KEY", Version: 1, Status: "active",
+		WrappedRecipients: []remoteWrappedRecipient{
+			{RecipientType: "device", RecipientID: "dev_current", WrapAlgorithm: "p256-hkdf-aes256gcm"},
+			{RecipientType: "device", RecipientID: "dev_other", WrapAlgorithm: "p256-hkdf-aes256gcm"},
+		},
+	}
+
+	result, err := reconcilePushVersions([]store.RemoteSecretVersion{{
+		OrgID: "org_remote", Scope: "oclan-co/prod/github", Name: "SYNC_KEY", Version: 1,
+		Algorithm: "aes-256-gcm", Nonce: "nonce", Ciphertext: "ciphertext", AAD: "aad",
+		WrappedKeys: []store.RemoteWrappedKey{currentWrapped, otherWrapped},
+	}}, mergeRemoteSecretRecords([]remoteSecretRecord{encrypted}, []remoteSecretRecord{metadata}))
+	if err != nil {
+		t.Fatalf("recipient metadata should make an unchanged secret comparable: %v", err)
+	}
+	if len(result.Upload) != 0 || len(result.Rewrap) != 0 || result.SkippedExisting != 1 {
+		t.Fatalf("known remote recipients should avoid a redundant commit: %#v", result)
 	}
 }

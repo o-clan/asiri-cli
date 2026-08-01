@@ -40,7 +40,11 @@ func (a App) Run(args []string) int {
 	var err error
 	if commandUsesLifecycleStateLock(cmd) {
 		var release func() error
-		st, release, err = store.LoadDefaultLocked()
+		err = a.withProgress("Opening local vault", func() error {
+			var loadErr error
+			st, release, loadErr = store.LoadDefaultLocked()
+			return loadErr
+		})
 		if err == nil {
 			defer release()
 		}

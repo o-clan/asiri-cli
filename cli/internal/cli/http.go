@@ -40,6 +40,17 @@ func postJSONBearer(st *store.FileStore, url, bearer string, body any, out any) 
 	return nil
 }
 
+func postJSONBearerEncoded(st *store.FileStore, url, bearer string, encoded []byte, out any) error {
+	status, err := postJSONBearerEncodedStatusWithClient(st, http.DefaultClient, url, bearer, encoded, out)
+	if err != nil {
+		return err
+	}
+	if status < 200 || status >= 300 {
+		return fmt.Errorf("control plane returned HTTP %d", status)
+	}
+	return nil
+}
+
 func putJSONBearer(st *store.FileStore, url, bearer string, body any, out any) error {
 	encoded, err := json.Marshal(body)
 	if err != nil {
@@ -109,6 +120,10 @@ func postJSONBearerStatusWithClient(st *store.FileStore, client *http.Client, ur
 	if err != nil {
 		return 0, err
 	}
+	return postJSONBearerEncodedStatusWithClient(st, client, url, bearer, encoded, out)
+}
+
+func postJSONBearerEncodedStatusWithClient(st *store.FileStore, client *http.Client, url, bearer string, encoded []byte, out any) (int, error) {
 	bearer = latestControlPlaneBearer(st, bearer)
 	status, responseBody, err := sendPostJSONBearer(st, client, url, bearer, encoded)
 	if err != nil {

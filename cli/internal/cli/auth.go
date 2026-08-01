@@ -182,7 +182,12 @@ func (a App) login(st *store.FileStore, args []string) int {
 	}
 	fmt.Fprintf(a.Out, "Open %s\n", start.VerificationURIComplete)
 	fmt.Fprintf(a.Out, "Code: %s\n", start.UserCode)
-	result, err := pollDeviceCodeLogin(st, origin, start)
+	var result deviceCodeTokenResponse
+	err = a.withProgress("Waiting for approval in your browser", func() error {
+		var pollErr error
+		result, pollErr = pollDeviceCodeLogin(st, origin, start)
+		return pollErr
+	})
 	if err != nil {
 		return a.fail(err)
 	}

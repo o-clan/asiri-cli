@@ -230,17 +230,19 @@ func mergeRemoteSecretRecords(primary, secondary []remoteSecretRecord) []remoteS
 		return primary
 	}
 	merged := make([]remoteSecretRecord, 0, len(primary)+len(secondary))
-	seen := map[string]bool{}
+	seen := map[string]int{}
 	for _, item := range primary {
 		merged = append(merged, item)
-		seen[pushVersionKey(item.Scope, item.Name, item.Version)] = true
+		seen[pushVersionKey(item.Scope, item.Name, item.Version)] = len(merged) - 1
 	}
 	for _, item := range secondary {
 		key := pushVersionKey(item.Scope, item.Name, item.Version)
-		if seen[key] {
+		if index, ok := seen[key]; ok {
+			merged[index].WrappedRecipients = item.WrappedRecipients
 			continue
 		}
 		merged = append(merged, item)
+		seen[key] = len(merged) - 1
 	}
 	return merged
 }
@@ -436,6 +438,43 @@ type remoteWrappedKeyBatchEntry struct {
 	SecretID    string                   `json:"secretId"`
 	WrappedKeys []store.RemoteWrappedKey `json:"wrappedKeys"`
 	LocalRepair bool                     `json:"localRepair"`
+}
+
+type remotePushBatchRewrap struct {
+	SecretID    string                   `json:"secretId"`
+	WrappedKeys []store.RemoteWrappedKey `json:"wrappedKeys"`
+}
+
+type remotePushBatchRequest struct {
+	OrgID   string                      `json:"orgId"`
+	Uploads []store.RemoteSecretVersion `json:"uploads"`
+	Rewraps []remotePushBatchRewrap     `json:"rewraps"`
+}
+
+const remotePushBatchMaxBytes = 32 * 1024 * 1024
+
+func commitRemotePushBatch(st *store.FileStore, origin, orgID, accessToken string, uploads []store.RemoteSecretVersion, rewraps []pushRewrapCandidate) error {
+	entries := make([]remotePushBatchRewrap, 0, len(rewraps))
+	for _, candidate := range rewraps {
+		entries = append(entries, remotePushBatchRewrap{SecretID: candidate.SecretID, WrappedKeys: candidate.Missing})
+	}
+	encoded, err := encodeRemotePushBatch(remotePushBatchRequest{OrgID: orgID, Uploads: uploads, Rewraps: entries}, remotePushBatchMaxBytes)
+	if err != nil {
+		return err
+	}
+	endpoint := strings.TrimRight(origin, "/") + "/v1/secrets/batch"
+	return postJSONBearerEncoded(st, endpoint, accessToken, encoded, nil)
+}
+
+func encodeRemotePushBatch(request remotePushBatchRequest, maxBytes int) ([]byte, error) {
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	if len(encoded) > maxBytes {
+		return nil, fmt.Errorf("atomic push payload is %.1f MiB, above the %.0f MiB limit; push a smaller selection with --scope or --secret", float64(len(encoded))/(1024*1024), float64(maxBytes)/(1024*1024))
+	}
+	return encoded, nil
 }
 
 func addRemoteWrappedKeysBatch(st *store.FileStore, origin, orgID, accessToken string, entries []remoteWrappedKeyBatchEntry) (bool, error) {

@@ -55,7 +55,13 @@ func TestRecoverySetupShowsKeyOnceAndWrapsRemoteSecrets(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{
 				"id": "org_recovery", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_recovery",
 			}}})
-		case "/v1/sync/write-options":
+		case "/v1/sync/push-plan":
+			encryptedSecrets := []map[string]any{}
+			secretMetadata := []map[string]any{}
+			if pushedSecret != nil {
+				encryptedSecrets = append(encryptedSecrets, pushedSecret)
+				secretMetadata = append(secretMetadata, pushedSecret)
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"requestedWorkspaceSlug": "oclan-co",
 				"workspace": map[string]any{
@@ -64,26 +70,35 @@ func TestRecoverySetupShowsKeyOnceAndWrapsRemoteSecrets(t *testing.T) {
 					"canWrite": true,
 					"paths": []map[string]any{{
 						"fullPath": "oclan-co/local/asiri/API_KEY",
+						"scope":    "oclan-co/local/asiri",
+						"name":     "API_KEY",
 						"canWrite": true,
 					}},
 				},
+				"targets":  []map[string]any{{"scope": "oclan-co/local/asiri", "name": "API_KEY", "devices": []map[string]any{}}},
+				"recovery": nil, "encryptedSecrets": encryptedSecrets, "secrets": secretMetadata,
 			})
+		case "/v1/secrets/batch":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			uploads, ok := body["uploads"].([]any)
+			if !ok || len(uploads) != 1 {
+				t.Fatalf("expected one push upload: %#v", body)
+			}
+			pushedSecret = uploads[0].(map[string]any)
+			wrapped, ok := pushedSecret["wrappedKeys"].([]any)
+			if !ok || len(wrapped) != 1 {
+				t.Fatalf("initial push should contain only the device wrapped key: %#v", pushedSecret["wrappedKeys"])
+			}
+			pushedSecret["id"] = "secv_recovery"
+			pushedSecret["status"] = "active"
+			secretPushSeen = true
+			_ = json.NewEncoder(w).Encode(map[string]any{"saved": []map[string]any{{"id": "secv_recovery", "status": "active"}}, "rewrapped": []map[string]any{}})
 		case "/v1/secrets":
 			if r.Method == http.MethodPost {
-				var body map[string]any
-				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-					t.Fatal(err)
-				}
-				wrapped, ok := body["wrappedKeys"].([]any)
-				if !ok || len(wrapped) != 1 {
-					t.Fatalf("initial push should contain only the device wrapped key: %#v", body["wrappedKeys"])
-				}
-				body["id"] = "secv_recovery"
-				body["status"] = "active"
-				pushedSecret = body
-				secretPushSeen = true
-				_ = json.NewEncoder(w).Encode(map[string]any{"id": "secv_recovery", "status": "active"})
-				return
+				t.Fatal("push must not post individual secrets")
 			}
 			if r.Method != http.MethodGet {
 				http.NotFound(w, r)
@@ -613,7 +628,25 @@ func TestTargetedPushPreservesRecoveryWrappedCount(t *testing.T) {
 					{"id": "org_targeted_push", "name": "O Clan", "slug": "oclan-co", "ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_targeted_push"},
 				},
 			})
-		case "/v1/sync/write-options":
+		case "/v1/sync/push-plan":
+			var requestBody struct {
+				Entries []map[string]string `json:"entries"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+				t.Fatal(err)
+			}
+			if len(requestBody.Entries) != 1 {
+				t.Fatalf("expected one targeted push entry: %#v", requestBody.Entries)
+			}
+			requestedScope := requestBody.Entries[0]["scope"]
+			requestedName := requestBody.Entries[0]["name"]
+			var recovery any
+			if activeRecovery != nil {
+				recovery = map[string]any{
+					"recipientId": activeRecovery.RecipientID, "publicKey": activeRecovery.PublicKey,
+					"publicKeyFingerprint": activeRecovery.PublicKeyFingerprint, "status": "active",
+				}
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"requestedWorkspaceSlug": "oclan-co",
 				"workspace": map[string]any{
@@ -621,10 +654,14 @@ func TestTargetedPushPreservesRecoveryWrappedCount(t *testing.T) {
 					"slug":     "oclan-co",
 					"canWrite": true,
 					"paths": []map[string]any{{
-						"fullPath": "oclan-co/local/asiri/API_KEY",
+						"fullPath": requestedScope + "/" + requestedName,
+						"scope":    requestedScope,
+						"name":     requestedName,
 						"canWrite": true,
 					}},
 				},
+				"targets":  []map[string]any{{"scope": requestedScope, "name": requestedName, "devices": []map[string]any{}}},
+				"recovery": recovery, "encryptedSecrets": []map[string]any{}, "secrets": []map[string]any{},
 			})
 		case "/v1/recovery-recipient":
 			if activeRecovery == nil {
@@ -644,11 +681,7 @@ func TestTargetedPushPreservesRecoveryWrappedCount(t *testing.T) {
 				t.Fatalf("targeted push should request recovery-wrapped remote state, got query %s", r.URL.RawQuery)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{}})
-		case "/v1/secrets":
-			if r.Method != http.MethodPost {
-				http.NotFound(w, r)
-				return
-			}
+		case "/v1/secrets/batch":
 			pushSeen++
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": "secv_targeted_push", "status": "active"})
 		default:
@@ -761,30 +794,11 @@ func TestRecoverySetupSkipsWrappingWhenRemoteRegistrationFails(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{
 				"id": "org_recovery", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_recovery",
 			}}})
-		case "/v1/sync/write-options":
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"requestedWorkspaceSlug": "oclan-co",
-				"workspace": map[string]any{
-					"id":       "org_recovery",
-					"slug":     "oclan-co",
-					"canWrite": true,
-					"paths": []map[string]any{{
-						"fullPath": "oclan-co/local/asiri/API_KEY",
-						"canWrite": true,
-					}},
-				},
-			})
-		case "/v1/secrets":
-			if r.Method == http.MethodPost {
-				if err := json.NewDecoder(r.Body).Decode(&pushedSecret); err != nil {
-					t.Fatal(err)
-				}
-				pushedSecret["id"] = "secv_recovery"
-				pushedSecret["status"] = "active"
-				_ = json.NewEncoder(w).Encode(map[string]any{"id": "secv_recovery", "status": "active"})
-				return
-			}
-			http.NotFound(w, r)
+		case "/v1/sync/push-plan":
+			writeRecoveryPushPlanTest(t, w, pushedSecret, nil)
+		case "/v1/secrets/batch":
+			pushedSecret = decodeRecoveryPushBatchTest(t, r)
+			_ = json.NewEncoder(w).Encode(map[string]any{"saved": []map[string]any{{"id": "secv_recovery", "status": "active"}}, "rewrapped": []map[string]any{}})
 		case "/v1/secrets/encrypted":
 			if pushedSecret == nil {
 				_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{}})
@@ -892,30 +906,11 @@ func TestRecoverySetupFailsWhenRemoteReplacementFails(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{
 				"id": "org_recovery", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_recovery",
 			}}})
-		case "/v1/sync/write-options":
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"requestedWorkspaceSlug": "oclan-co",
-				"workspace": map[string]any{
-					"id":       "org_recovery",
-					"slug":     "oclan-co",
-					"canWrite": true,
-					"paths": []map[string]any{{
-						"fullPath": "oclan-co/local/asiri/API_KEY",
-						"canWrite": true,
-					}},
-				},
-			})
-		case "/v1/secrets":
-			if r.Method == http.MethodPost {
-				if err := json.NewDecoder(r.Body).Decode(&pushedSecret); err != nil {
-					t.Fatal(err)
-				}
-				pushedSecret["id"] = "secv_recovery"
-				pushedSecret["status"] = "active"
-				_ = json.NewEncoder(w).Encode(map[string]any{"id": "secv_recovery", "status": "active"})
-				return
-			}
-			http.NotFound(w, r)
+		case "/v1/sync/push-plan":
+			writeRecoveryPushPlanTest(t, w, pushedSecret, nil)
+		case "/v1/secrets/batch":
+			pushedSecret = decodeRecoveryPushBatchTest(t, r)
+			_ = json.NewEncoder(w).Encode(map[string]any{"saved": []map[string]any{{"id": "secv_recovery", "status": "active"}}, "rewrapped": []map[string]any{}})
 		case "/v1/secrets/encrypted":
 			if pushedSecret == nil {
 				_ = json.NewEncoder(w).Encode(map[string]any{"secrets": []map[string]any{}})
@@ -1028,30 +1023,11 @@ func TestRecoverySetupForceUsesCurrentDeviceWrapWhenPreviousRecipientIsRetired(t
 			_ = json.NewEncoder(w).Encode(map[string]any{"organizations": []map[string]any{{
 				"id": "org_recovery", "slug": "oclan-co", "role": "owner", "canPull": true, "canWrite": true, "currentDeviceTrusted": true, "currentDeviceId": "dev_recovery",
 			}}})
-		case "/v1/sync/write-options":
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"requestedWorkspaceSlug": "oclan-co",
-				"workspace": map[string]any{
-					"id":       "org_recovery",
-					"slug":     "oclan-co",
-					"canWrite": true,
-					"paths": []map[string]any{{
-						"fullPath": "oclan-co/local/asiri/API_KEY",
-						"canWrite": true,
-					}},
-				},
-			})
-		case "/v1/secrets":
-			if r.Method == http.MethodPost {
-				if err := json.NewDecoder(r.Body).Decode(&pushedSecret); err != nil {
-					t.Fatal(err)
-				}
-				pushedSecret["id"] = "secv_recovery"
-				pushedSecret["status"] = "active"
-				_ = json.NewEncoder(w).Encode(map[string]any{"id": "secv_recovery", "status": "active"})
-				return
-			}
-			http.NotFound(w, r)
+		case "/v1/sync/push-plan":
+			writeRecoveryPushPlanTest(t, w, pushedSecret, nil)
+		case "/v1/secrets/batch":
+			pushedSecret = decodeRecoveryPushBatchTest(t, r)
+			_ = json.NewEncoder(w).Encode(map[string]any{"saved": []map[string]any{{"id": "secv_recovery", "status": "active"}}, "rewrapped": []map[string]any{}})
 		case "/v1/recovery-recipient":
 			if r.Method == http.MethodGet {
 				if len(registeredRecipients) == 0 {
@@ -1340,4 +1316,41 @@ func TestRecoverySetupDoesNotPersistWhenKeyDeliveryFails(t *testing.T) {
 	if len(st.State.Recoveries) != 0 {
 		t.Fatalf("workspace recovery config persisted after key delivery failure: %#v", st.State.Recoveries)
 	}
+}
+
+func writeRecoveryPushPlanTest(t *testing.T, w http.ResponseWriter, pushedSecret map[string]any, recovery any) {
+	t.Helper()
+	encryptedSecrets := []map[string]any{}
+	secretMetadata := []map[string]any{}
+	if pushedSecret != nil {
+		encryptedSecrets = append(encryptedSecrets, pushedSecret)
+		secretMetadata = append(secretMetadata, pushedSecret)
+	}
+	if err := json.NewEncoder(w).Encode(map[string]any{
+		"requestedWorkspaceSlug": "oclan-co",
+		"workspace": map[string]any{
+			"id": "org_recovery", "slug": "oclan-co", "canWrite": true,
+			"paths": []map[string]any{{"scope": "oclan-co/local/asiri", "name": "API_KEY", "fullPath": "oclan-co/local/asiri/API_KEY", "canWrite": true}},
+		},
+		"targets":  []map[string]any{{"scope": "oclan-co/local/asiri", "name": "API_KEY", "devices": []map[string]any{}}},
+		"recovery": recovery, "encryptedSecrets": encryptedSecrets, "secrets": secretMetadata,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func decodeRecoveryPushBatchTest(t *testing.T, r *http.Request) map[string]any {
+	t.Helper()
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	uploads, ok := body["uploads"].([]any)
+	if !ok || len(uploads) != 1 {
+		t.Fatalf("expected one push upload: %#v", body)
+	}
+	secret := uploads[0].(map[string]any)
+	secret["id"] = "secv_recovery"
+	secret["status"] = "active"
+	return secret
 }

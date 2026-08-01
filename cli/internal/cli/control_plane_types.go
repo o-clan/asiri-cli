@@ -290,6 +290,21 @@ type remoteWrappingTargetsResponse struct {
 	Targets []remoteWrappingTargetResponse `json:"targets"`
 }
 
+type remotePushWrappingTargetResponse struct {
+	Scope   string                 `json:"scope"`
+	Name    string                 `json:"name"`
+	Devices []remoteDeviceResponse `json:"devices"`
+}
+
+type remotePushPlanResponse struct {
+	RequestedWorkspaceSlug string                             `json:"requestedWorkspaceSlug"`
+	Workspace              writeWorkspaceOption               `json:"workspace"`
+	Targets                []remotePushWrappingTargetResponse `json:"targets"`
+	Recovery               *remoteRecoveryRecipientResponse   `json:"recovery"`
+	EncryptedSecrets       []remoteSecretRecord               `json:"encryptedSecrets"`
+	Secrets                []remoteSecretRecord               `json:"secrets"`
+}
+
 type remoteSecretsResponse struct {
 	Secrets []remoteSecretRecord `json:"secrets"`
 }

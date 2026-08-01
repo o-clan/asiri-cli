@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,18 +27,42 @@ func (a App) push(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	accessToken, err := ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+	var accessToken string
+	err = a.withProgress("Checking control-plane session", func() error {
+		var accessErr error
+		accessToken, accessErr = ensureControlPlaneAccess(st.State.ControlPlane.Origin, st)
+		return accessErr
+	})
 	if err != nil {
 		return a.fail(err)
 	}
-	pushOptions, accessToken, stop, err := a.prepareLocalWorkspacePush(st, pushOptions, accessToken)
+	stop := false
+	workspaceMessage := ""
+	preparePush := func() error {
+		var prepareErr error
+		pushOptions, accessToken, stop, workspaceMessage, prepareErr = a.prepareLocalWorkspacePush(st, pushOptions, accessToken)
+		return prepareErr
+	}
+	if pushOptions.DryRun {
+		err = preparePush()
+	} else {
+		err = a.withProgress("Preparing workspace", preparePush)
+	}
 	if err != nil {
 		return a.fail(err)
+	}
+	if workspaceMessage != "" {
+		fmt.Fprintln(a.Out, workspaceMessage)
 	}
 	if stop {
 		return 0
 	}
-	target, accessToken, err := a.pushWorkspaceTarget(st, accessToken, pushOptions.Workspace)
+	var target remoteWorkspaceResponse
+	err = a.withProgress("Resolving workspace", func() error {
+		var targetErr error
+		target, accessToken, targetErr = a.pushWorkspaceTarget(st, accessToken, pushOptions.Workspace)
+		return targetErr
+	})
 	if err != nil {
 		return a.fail(err)
 	}
@@ -58,12 +81,17 @@ func (a App) push(st *store.FileStore, args []string) int {
 	if binding, ok := st.RemoteBindingForPrefix(target.Slug); ok && binding.WorkspaceID != target.ID {
 		return a.fail(fmt.Errorf("workspace prefix %s is bound to another control-plane workspace", target.Slug))
 	}
-	options, err := remoteWriteOptions(st, st.State.ControlPlane.Origin, accessToken, target, selectedRefs)
+	var plan remotePushPlanResponse
+	err = a.withProgress(fmt.Sprintf("Planning encrypted push for %d secret(s)", len(selectedRefs)), func() error {
+		var planErr error
+		plan, planErr = remotePushPlan(st, st.State.ControlPlane.Origin, accessToken, target, selectedRefs)
+		return planErr
+	})
 	if err != nil {
 		return a.fail(err)
 	}
-	if !options.Workspace.CanWrite {
-		return a.fail(fmt.Errorf("workspace %s cannot write %s", target.Slug, fullPathList(options.Workspace.Paths)))
+	if !plan.Workspace.CanWrite {
+		return a.fail(fmt.Errorf("workspace %s cannot write %s", target.Slug, fullPathList(plan.Workspace.Paths)))
 	}
 	if pushOptions.DryRun {
 		if st.State.RemoteBindings == nil {
@@ -79,38 +107,50 @@ func (a App) push(st *store.FileStore, args []string) int {
 			return a.fail(err)
 		}
 	}
-	recovery, err := getActiveRemoteRecoveryRecipient(st, st.State.ControlPlane.Origin, target.ID, accessToken)
-	if err != nil {
-		return a.fail(err)
-	}
-	versions, err := st.RemoteSecretVersionsForRefsWithRecovery(target.ID, target.Slug, target.CurrentDeviceID, selectedRefs, recovery)
-	if err != nil {
-		return a.fail(err)
-	}
-	for i := range versions {
-		devices, err := listRemoteWrappingDevices(st, st.State.ControlPlane.Origin, target.ID, versions[i].Scope, versions[i].Name, accessToken)
-		if err != nil {
-			return a.fail(fmt.Errorf("trusted device discovery failed; refusing to push without authorized wrapping targets for %s/%s: %w", versions[i].Scope, versions[i].Name, err))
+	var recovery *asiri.RecoveryConfig
+	if plan.Recovery != nil {
+		if plan.Recovery.Status != "active" || plan.Recovery.RecipientID == "" || plan.Recovery.PublicKey == "" || plan.Recovery.PublicKeyFingerprint == "" {
+			return a.fail(errors.New("control plane returned incomplete recovery recipient metadata"))
 		}
-		if err := addTrustedDeviceWrappedKeysToVersions(st, target.ID, versions[i:i+1], devices); err != nil {
-			return a.fail(err)
+		recovery = &asiri.RecoveryConfig{
+			RecipientID:          plan.Recovery.RecipientID,
+			PublicKey:            plan.Recovery.PublicKey,
+			PublicKeyFingerprint: plan.Recovery.PublicKeyFingerprint,
+			CreatedAt:            time.Now().UTC(),
 		}
 	}
-	recoveryRecipientID := ""
-	if recovery != nil {
-		recoveryRecipientID = recovery.RecipientID
-	}
-	remoteSecrets, err := listRemoteSecrets(st, st.State.ControlPlane.Origin, target.ID, accessToken, recoveryRecipientID, false)
+	var versions []store.RemoteSecretVersion
+	err = a.withProgress(fmt.Sprintf("Wrapping keys for %d secret(s)", len(selectedRefs)), func() error {
+		var versionsErr error
+		versions, versionsErr = st.RemoteSecretVersionsForRefsWithRecovery(target.ID, target.Slug, target.CurrentDeviceID, selectedRefs, recovery)
+		if versionsErr != nil {
+			return versionsErr
+		}
+		wrappingTargets := make(map[string][]remoteDeviceResponse, len(plan.Targets))
+		seenWrappingTargets := make(map[string]bool, len(plan.Targets))
+		for _, candidate := range plan.Targets {
+			key := store.SecretKey(candidate.Scope, candidate.Name)
+			if candidate.Scope == "" || candidate.Name == "" || seenWrappingTargets[key] {
+				return errors.New("control plane returned invalid push wrapping targets")
+			}
+			seenWrappingTargets[key] = true
+			wrappingTargets[key] = candidate.Devices
+		}
+		for i := range versions {
+			devices, ok := wrappingTargets[store.SecretKey(versions[i].Scope, versions[i].Name)]
+			if !ok {
+				return fmt.Errorf("trusted device discovery failed; refusing to push without authorized wrapping targets for %s/%s", versions[i].Scope, versions[i].Name)
+			}
+			if err := addTrustedDeviceWrappedKeysToVersions(st, target.ID, versions[i:i+1], devices); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		return a.fail(err)
 	}
-	remoteMetadata, status, err := listRemoteSecretMetadata(st, st.State.ControlPlane.Origin, target.ID, accessToken, true)
-	if err != nil {
-		return a.fail(err)
-	}
-	if status != http.StatusNotFound {
-		remoteSecrets = mergeRemoteSecretRecords(remoteSecrets, remoteMetadata)
-	}
+	remoteSecrets := mergeRemoteSecretRecords(plan.EncryptedSecrets, plan.Secrets)
 	reconciled, err := reconcilePushVersions(versions, remoteSecrets)
 	if pushOptions.DryRun {
 		printPushDryRun(a.Out, target.Slug, reconciled)
@@ -122,20 +162,19 @@ func (a App) push(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	for _, version := range reconciled.Upload {
-		if err := postJSONBearer(st, st.State.ControlPlane.Origin+"/v1/secrets", accessToken, version, nil); err != nil {
+	if len(reconciled.Upload)+len(reconciled.Rewrap) > 0 {
+		err := a.withProgress("Committing encrypted push", func() error {
+			return commitRemotePushBatch(st, st.State.ControlPlane.Origin, target.ID, accessToken, reconciled.Upload, reconciled.Rewrap)
+		})
+		if err != nil {
 			return a.fail(err)
 		}
 	}
 	rewrappedKeys := 0
-	rewrappedSecrets := 0
 	for _, candidate := range reconciled.Rewrap {
-		if err := addRemoteWrappedKeys(st, st.State.ControlPlane.Origin, target.ID, candidate.SecretID, accessToken, candidate.Missing, false); err != nil {
-			return a.fail(err)
-		}
-		rewrappedSecrets++
 		rewrappedKeys += len(candidate.Missing)
 	}
+	rewrappedSecrets := len(reconciled.Rewrap)
 	if recovery != nil {
 		if st.State.Recoveries == nil {
 			st.State.Recoveries = map[string]asiri.RecoveryConfig{}
@@ -179,14 +218,14 @@ func (a App) push(st *store.FileStore, args []string) int {
 	return 0
 }
 
-func (a App) prepareLocalWorkspacePush(st *store.FileStore, options pushOptions, accessToken string) (pushOptions, string, bool, error) {
+func (a App) prepareLocalWorkspacePush(st *store.FileStore, options pushOptions, accessToken string) (pushOptions, string, bool, string, error) {
 	workspace, ok := st.LocalWorkspace(options.Workspace)
 	if !ok {
-		return options, accessToken, false, nil
+		return options, accessToken, false, "", nil
 	}
 	if workspace.RemoteWorkspaceID != "" {
 		options.Workspace = workspace.CanonicalSlug
-		return options, accessToken, false, nil
+		return options, accessToken, false, "", nil
 	}
 	desiredAlias := workspace.Alias
 	if desiredAlias == "" {
@@ -194,30 +233,30 @@ func (a App) prepareLocalWorkspacePush(st *store.FileStore, options pushOptions,
 	}
 	if options.DryRun {
 		fmt.Fprintf(a.Out, "Workspace %s would receive a canonical slug in the form %s-<8 characters>; alias %s would be retained.\n", workspace.CanonicalSlug, workspace.CanonicalSlug, desiredAlias)
-		return options, accessToken, true, nil
+		return options, accessToken, true, "", nil
 	}
 	if err := requireHumanMemberSession(st); err != nil {
-		return options, accessToken, false, err
+		return options, accessToken, false, "", err
 	}
 	var remote remoteWorkspaceResponse
 	endpoint := strings.TrimRight(st.State.ControlPlane.Origin, "/") + "/v1/workspaces/sync"
 	body := map[string]string{"localWorkspaceId": workspace.ID, "localSlug": workspace.CanonicalSlug, "alias": desiredAlias}
 	if err := postJSONBearer(st, endpoint, accessToken, body, &remote); err != nil {
-		return options, accessToken, false, err
+		return options, accessToken, false, "", err
 	}
 	if remote.ID == "" || remote.Slug == "" {
-		return options, accessToken, false, errors.New("control plane did not return the canonical workspace identity")
+		return options, accessToken, false, "", errors.New("control plane did not return the canonical workspace identity")
 	}
 	if remote.Alias != desiredAlias {
-		return options, accessToken, false, errors.New("control plane returned a different workspace alias")
+		return options, accessToken, false, "", errors.New("control plane returned a different workspace alias")
 	}
 	oldSlug := workspace.CanonicalSlug
 	if err := st.RenameWorkspacePrefix(oldSlug, remote.Slug, remote.ID); err != nil {
-		return options, accessToken, false, err
+		return options, accessToken, false, "", err
 	}
 	options.Workspace = remote.Slug
-	fmt.Fprintf(a.Out, "✓ Workspace %s synced as %s; alias %s retained\n", oldSlug, remote.Slug, desiredAlias)
-	return options, latestControlPlaneBearer(st, accessToken), false, nil
+	message := fmt.Sprintf("✓ Workspace %s synced as %s; alias %s retained", oldSlug, remote.Slug, desiredAlias)
+	return options, latestControlPlaneBearer(st, accessToken), false, message, nil
 }
 
 type pushOptions struct {
@@ -373,7 +412,7 @@ func reconcilePushVersions(local []store.RemoteSecretVersion, remote []remoteSec
 		key := store.SecretKey(item.Scope, item.Name)
 		if existing, ok := byVersion[pushVersionKey(item.Scope, item.Name, item.Version)]; ok {
 			if existing.Status == "active" && remoteSecretEnvelopeComparable(existing) && remoteSecretEnvelopeMatches(item, existing) {
-				missing := missingRemoteWrappedKeys(item.WrappedKeys, existing.WrappedKeys)
+				missing := missingRemoteWrappedKeysForRecord(item.WrappedKeys, existing)
 				if len(missing) == 0 {
 					result.SkippedExisting++
 					continue
@@ -465,6 +504,23 @@ func missingRemoteWrappedKeys(local []store.RemoteWrappedKey, remote []store.Rem
 	remoteKeys := map[string]bool{}
 	for _, key := range remote {
 		remoteKeys[remoteWrappedKeyIdentity(key)] = true
+	}
+	missing := []store.RemoteWrappedKey{}
+	for _, key := range local {
+		if !remoteKeys[remoteWrappedKeyIdentity(key)] {
+			missing = append(missing, key)
+		}
+	}
+	return missing
+}
+
+func missingRemoteWrappedKeysForRecord(local []store.RemoteWrappedKey, remote remoteSecretRecord) []store.RemoteWrappedKey {
+	remoteKeys := map[string]bool{}
+	for _, key := range remote.WrappedKeys {
+		remoteKeys[remoteWrappedKeyIdentity(key)] = true
+	}
+	for _, key := range remote.WrappedRecipients {
+		remoteKeys[key.RecipientType+"\x00"+key.RecipientID+"\x00"+key.WrapAlgorithm] = true
 	}
 	missing := []store.RemoteWrappedKey{}
 	for _, key := range local {
