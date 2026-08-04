@@ -93,6 +93,90 @@ type RemoteImportSkipped struct {
 
 type RemoteImportPartialError struct {
 	Skipped []RemoteImportSkipped
+	causes  []error
+}
+
+type RemoteImportConflict struct {
+	Scope         string
+	Name          string
+	LocalVersion  int
+	RemoteVersion int
+}
+
+type RemoteImportConflictError struct {
+	Conflicts  []RemoteImportConflict
+	Unresolved []RemoteImportSkipped
+	causes     []error
+}
+
+// Is and As preserve every blocking cause on Go 1.19, before multi-error
+// unwrapping is available in the standard library.
+func (e *RemoteImportConflictError) Is(target error) bool {
+	if e == nil {
+		return false
+	}
+	return remoteImportCausesIs(e.causes, target)
+}
+
+func (e *RemoteImportConflictError) Unwrap() []error {
+	if e == nil {
+		return nil
+	}
+	return append([]error(nil), e.causes...)
+}
+
+func (e *RemoteImportConflictError) As(target any) bool {
+	if e == nil {
+		return false
+	}
+	return remoteImportCausesAs(e.causes, target)
+}
+
+func (e *RemoteImportConflictError) Error() string {
+	if e == nil || len(e.Conflicts) == 0 {
+		return ""
+	}
+	conflicts := append([]RemoteImportConflict(nil), e.Conflicts...)
+	sort.Slice(conflicts, func(i, j int) bool {
+		left := SecretKey(conflicts[i].Scope, conflicts[i].Name)
+		right := SecretKey(conflicts[j].Scope, conflicts[j].Name)
+		if left == right {
+			return conflicts[i].RemoteVersion < conflicts[j].RemoteVersion
+		}
+		return left < right
+	})
+	noun := "secret"
+	verb := "conflicts"
+	if len(conflicts) != 1 {
+		noun = "secrets"
+		verb = "conflict"
+	}
+	var message strings.Builder
+	fmt.Fprintf(&message, "%d remote %s %s with local active versions:\n", len(conflicts), noun, verb)
+	for _, conflict := range conflicts {
+		localVersion := "local active version unavailable"
+		if conflict.LocalVersion > 0 {
+			localVersion = fmt.Sprintf("local v%d", conflict.LocalVersion)
+		}
+		fmt.Fprintf(&message, "  %s (%s, remote v%d)\n", SecretKey(conflict.Scope, conflict.Name), localVersion, conflict.RemoteVersion)
+	}
+	message.WriteString("rerun with --force only if you intend to replace these local versions")
+	if len(e.Unresolved) > 0 {
+		unresolved := append([]RemoteImportSkipped(nil), e.Unresolved...)
+		sort.Slice(unresolved, func(i, j int) bool {
+			return remoteImportSkippedLabel(unresolved[i]) < remoteImportSkippedLabel(unresolved[j])
+		})
+		noun := "secret"
+		if len(unresolved) != 1 {
+			noun = "secrets"
+		}
+		fmt.Fprintf(&message, "\n%d additional remote %s could not be prepared:\n", len(unresolved), noun)
+		for _, issue := range unresolved {
+			fmt.Fprintf(&message, "  %s: %s\n", remoteImportSkippedLabel(issue), issue.Reason)
+		}
+		message.WriteString("resolve these errors before retrying without --force")
+	}
+	return message.String()
 }
 
 func (e *RemoteImportPartialError) Error() string {
@@ -107,11 +191,51 @@ func (e *RemoteImportPartialError) Error() string {
 	return fmt.Sprintf("skipped %d malformed remote secret version%s: %s: %s", len(e.Skipped), suffix, remoteImportSkippedLabel(first), first.Reason)
 }
 
+func (e *RemoteImportPartialError) Is(target error) bool {
+	if e == nil {
+		return false
+	}
+	return remoteImportCausesIs(e.causes, target)
+}
+
+func (e *RemoteImportPartialError) Unwrap() []error {
+	if e == nil {
+		return nil
+	}
+	return append([]error(nil), e.causes...)
+}
+
+func (e *RemoteImportPartialError) As(target any) bool {
+	if e == nil {
+		return false
+	}
+	return remoteImportCausesAs(e.causes, target)
+}
+
 func (e *RemoteImportPartialError) add(remote RemoteSecretVersion, err error) {
 	if err == nil {
 		return
 	}
 	e.Skipped = append(e.Skipped, RemoteImportSkipped{Scope: remote.Scope, Name: remote.Name, Reason: err.Error()})
+	e.causes = append(e.causes, err)
+}
+
+func remoteImportCausesIs(causes []error, target error) bool {
+	for _, cause := range causes {
+		if errors.Is(cause, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func remoteImportCausesAs(causes []error, target any) bool {
+	for _, cause := range causes {
+		if errors.As(cause, target) {
+			return true
+		}
+	}
+	return false
 }
 
 func remoteImportSkippedLabel(skipped RemoteImportSkipped) string {
@@ -131,6 +255,11 @@ type preparedRemoteSecretVersion struct {
 	remote  RemoteSecretVersion
 	dataKey []byte
 	account string
+}
+
+type remoteImportBlocking struct {
+	issue RemoteImportSkipped
+	cause error
 }
 
 type LocalSecretRef struct {
@@ -1466,6 +1595,8 @@ func (s *FileStore) importRemoteSecretVersions(workspaceID, workspaceSlug string
 	}
 	prepared := []preparedRemoteSecretVersion{}
 	partial := &RemoteImportPartialError{}
+	conflictsByKey := map[string]RemoteImportConflict{}
+	blocking := []remoteImportBlocking{}
 	for _, remote := range versions {
 		if remote.Status != "" && remote.Status != "active" {
 			continue
@@ -1512,40 +1643,79 @@ func (s *FileStore) importRemoteSecretVersions(workspaceID, workspaceSlug string
 		if secret := s.State.Secrets[key]; secret.Scope != "" && !force {
 			active := activeSecretVersion(secret)
 			if active == nil || active.Version != remote.Version {
-				return 0, fmt.Errorf("remote secret %s/%s conflicts with a local active version; rerun with --force only if you intend to replace it", remote.Scope, remote.Name)
+				conflict := RemoteImportConflict{Scope: remote.Scope, Name: remote.Name, RemoteVersion: remote.Version}
+				if active != nil {
+					conflict.LocalVersion = active.Version
+				}
+				if existing, ok := conflictsByKey[key]; !ok || conflict.RemoteVersion > existing.RemoteVersion {
+					conflictsByKey[key] = conflict
+				}
+				continue
 			}
 			sameEnvelope := active.Algorithm == remote.Algorithm && active.Nonce == remote.Nonce && active.AAD == remote.AAD && active.Ciphertext == remote.Ciphertext
 			if !sameEnvelope {
 				localPlaintext, err := s.decryptSecretVersion(*active)
 				if err != nil {
-					return 0, fmt.Errorf("cannot compare remote secret %s/%s with the local active version: %w", remote.Scope, remote.Name, err)
+					cause := fmt.Errorf("cannot be compared with the local active version: %w", err)
+					blocking = append(blocking, remoteImportBlocking{
+						issue: RemoteImportSkipped{Scope: remote.Scope, Name: remote.Name, Reason: cause.Error()},
+						cause: cause,
+					})
+					continue
 				}
 				if !hmac.Equal(localPlaintext, remotePlaintext) {
-					return 0, fmt.Errorf("remote secret %s/%s conflicts with a local active version; rerun with --force only if you intend to replace it", remote.Scope, remote.Name)
+					conflictsByKey[key] = RemoteImportConflict{Scope: remote.Scope, Name: remote.Name, LocalVersion: active.Version, RemoteVersion: remote.Version}
+					continue
 				}
 			}
 			reusedDataKeyAccount = active.DataKeyAccount
 		}
-		accountWorkspaceID := s.State.VaultID
 		if remote.OrgID != "" {
 			prefix := WorkspacePrefix(remote.Scope)
 			if existing := s.State.RemoteBindings[prefix]; existing.WorkspaceID != "" && existing.WorkspaceID != remote.OrgID {
-				return 0, fmt.Errorf("remote secret %s/%s belongs to workspace %s, but prefix %s is already bound to workspace %s", remote.Scope, remote.Name, remote.OrgID, prefix, existing.WorkspaceID)
-			}
-			accountWorkspaceID = remote.OrgID
-		}
-		account := reusedDataKeyAccount
-		if account == "" {
-			account, err = newSecretDataKeyAccount(accountWorkspaceID)
-			if err != nil {
-				return 0, err
+				cause := fmt.Errorf("belongs to workspace %s, but prefix %s is already bound to workspace %s", remote.OrgID, prefix, existing.WorkspaceID)
+				blocking = append(blocking, remoteImportBlocking{
+					issue: RemoteImportSkipped{Scope: remote.Scope, Name: remote.Name, Reason: cause.Error()},
+					cause: cause,
+				})
+				continue
 			}
 		}
 		prepared = append(prepared, preparedRemoteSecretVersion{
 			remote:  remote,
 			dataKey: dataKey,
-			account: account,
+			account: reusedDataKeyAccount,
 		})
+	}
+	if len(conflictsByKey) > 0 {
+		conflicts := make([]RemoteImportConflict, 0, len(conflictsByKey))
+		for _, conflict := range conflictsByKey {
+			conflicts = append(conflicts, conflict)
+		}
+		sort.Slice(conflicts, func(i, j int) bool {
+			return SecretKey(conflicts[i].Scope, conflicts[i].Name) < SecretKey(conflicts[j].Scope, conflicts[j].Name)
+		})
+		unresolved := append([]RemoteImportSkipped(nil), partial.Skipped...)
+		causes := append([]error(nil), partial.causes...)
+		for _, blocked := range blocking {
+			unresolved = append(unresolved, blocked.issue)
+			causes = append(causes, blocked.cause)
+		}
+		return 0, &RemoteImportConflictError{Conflicts: conflicts, Unresolved: unresolved, causes: causes}
+	}
+	if len(blocking) > 0 {
+		first := blocking[0]
+		return 0, fmt.Errorf("remote secret %s: %w", remoteImportSkippedLabel(first.issue), first.cause)
+	}
+	for i := range prepared {
+		if prepared[i].account != "" {
+			continue
+		}
+		account, err := newSecretDataKeyAccount(workspaceID)
+		if err != nil {
+			return 0, err
+		}
+		prepared[i].account = account
 	}
 	imported := 0
 	now := time.Now().UTC()

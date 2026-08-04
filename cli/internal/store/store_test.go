@@ -1847,11 +1847,211 @@ func TestImportRemoteSecretRejectsLocalConflictWithoutForce(t *testing.T) {
 	if _, err := st.AddSecret("oclan-co/local/asiri/API_KEY", "changed-local-secret"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ImportRemoteSecretVersions("org_oclan", "oclan-co", "dev_source", versions, false); err == nil || !strings.Contains(err.Error(), "conflicts with a local active version") {
-		t.Fatalf("expected conflict rejection, got %v", err)
+	if _, err := st.ImportRemoteSecretVersions("org_oclan", "oclan-co", "dev_source", versions, false); err == nil {
+		t.Fatal("expected conflict rejection")
+	} else {
+		var conflictErr *RemoteImportConflictError
+		if !errors.As(err, &conflictErr) || len(conflictErr.Conflicts) != 1 {
+			t.Fatalf("expected one typed conflict, got %v", err)
+		}
+		conflict := conflictErr.Conflicts[0]
+		if SecretKey(conflict.Scope, conflict.Name) != "oclan-co/local/asiri/API_KEY" || conflict.LocalVersion != 2 || conflict.RemoteVersion != 1 {
+			t.Fatalf("unexpected conflict metadata: %#v", conflict)
+		}
 	}
 	if _, err := st.ImportRemoteSecretVersions("org_oclan", "oclan-co", "dev_source", versions, true); err != nil {
 		t.Fatalf("force import should replace local active version: %v", err)
+	}
+}
+
+func TestImportRemoteSecretListsAllLocalConflictsAndComparisonFailuresWithoutPartialImport(t *testing.T) {
+	const (
+		workspaceID   = "org_oclan"
+		workspaceSlug = "oclan-co"
+		scope         = "oclan-co/prod/asiri"
+	)
+	expires := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
+
+	source := testInitializedStore(t)
+	sourceDevice := testDevice(t, "source")
+	source.State.Devices = append(source.State.Devices, sourceDevice)
+	if err := source.Save(); err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []struct {
+		name  string
+		value string
+	}{
+		{name: "ZETA_KEY", value: "remote-zeta"},
+		{name: "MIDDLE_KEY", value: "remote-middle"},
+		{name: "BROKEN_KEY", value: "remote-broken"},
+		{name: "ALPHA_KEY", value: "remote-alpha"},
+	} {
+		if _, err := source.AddSecret(SecretKey(scope, secret.name), secret.value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := source.LinkControlPlane("http://control.test", workspaceID, workspaceSlug, "usr_owner", "dev_source", "at_source", "rt_source", 3600, expires); err != nil {
+		t.Fatal(err)
+	}
+	bindPrefixForTest(t, source, workspaceSlug, workspaceID)
+	versions, err := source.RemoteSecretVersionsForPrefix(workspaceID, workspaceSlug, "dev_source", workspaceSlug)
+	if err != nil || len(versions) != 4 {
+		t.Fatalf("unexpected source versions: count=%d err=%v", len(versions), err)
+	}
+	remoteDataKeys := make(map[string][]byte, len(versions))
+	for _, version := range versions {
+		dataKey, err := source.dataKeyForSecretVersion(version.Scope, version.Name, version.Version)
+		if err != nil {
+			t.Fatal(err)
+		}
+		remoteDataKeys[SecretKey(version.Scope, version.Name)] = dataKey
+	}
+
+	target := testInitializedStore(t)
+	targetDevice := testDevice(t, "target")
+	target.State.Devices = append(target.State.Devices, targetDevice)
+	if err := target.Save(); err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []struct {
+		name  string
+		value string
+	}{
+		{name: "ALPHA_KEY", value: "local-alpha"},
+		{name: "BROKEN_KEY", value: "local-broken"},
+		{name: "ZETA_KEY", value: "local-zeta"},
+	} {
+		if _, err := target.AddSecret(SecretKey(scope, secret.name), secret.value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, secret := range []struct {
+		name  string
+		value string
+	}{
+		{name: "ALPHA_KEY", value: "local-alpha-v2"},
+		{name: "ZETA_KEY", value: "local-zeta-v2"},
+	} {
+		if _, err := target.AddSecret(SecretKey(scope, secret.name), secret.value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := target.LinkControlPlane("http://control.test", workspaceID, workspaceSlug, "usr_owner", "dev_target", "at_target", "rt_target", 3600, expires); err != nil {
+		t.Fatal(err)
+	}
+	bindPrefixForTest(t, target, workspaceSlug, workspaceID)
+	for left, right := 0, len(versions)-1; left < right; left, right = left+1, right-1 {
+		versions[left], versions[right] = versions[right], versions[left]
+	}
+
+	wantPaths := []string{
+		"oclan-co/prod/asiri/ALPHA_KEY",
+		"oclan-co/prod/asiri/ZETA_KEY",
+	}
+	var blockedVersion RemoteSecretVersion
+	var partialVersion RemoteSecretVersion
+	for _, version := range versions {
+		if version.Name == "BROKEN_KEY" {
+			blockedVersion = version
+		}
+		if version.Name == "MIDDLE_KEY" {
+			partialVersion = version
+		}
+	}
+	if blockedVersion.Name == "" || partialVersion.Name == "" {
+		t.Fatal("blocked-key or partial remote fixture not found")
+	}
+	for _, injected := range []error{keystore.ErrPlatformAuthentication, keystore.ErrPlatformTimeout} {
+		partialCause := keystore.ErrPlatformAuthentication
+		if errors.Is(injected, keystore.ErrPlatformAuthentication) {
+			partialCause = keystore.ErrPlatformTimeout
+		}
+		restoreFailure := keystore.FailPlatformOperationsForTesting(nil, injected, nil)
+		imported, err := target.importRemoteSecretVersions(workspaceID, workspaceSlug, versions, false, func(remote RemoteSecretVersion) ([]byte, bool, error) {
+			if remote.Name == "MIDDLE_KEY" {
+				return nil, false, fmt.Errorf("remote key preparation failed: %w", partialCause)
+			}
+			return remoteDataKeys[SecretKey(remote.Scope, remote.Name)], true, nil
+		})
+		restoreFailure()
+		if err == nil {
+			t.Fatal("expected aggregate conflict rejection")
+		}
+		if imported != 0 {
+			t.Fatalf("conflicting import reported %d imported secrets", imported)
+		}
+		var conflictErr *RemoteImportConflictError
+		if !errors.As(err, &conflictErr) {
+			t.Fatalf("expected typed conflict error, got %T: %v", err, err)
+		}
+		if !errors.Is(err, injected) {
+			t.Fatalf("aggregate conflict error lost %v: %v", injected, err)
+		}
+		if !errors.Is(err, partialCause) {
+			t.Fatalf("aggregate conflict error lost partial cause %v: %v", partialCause, err)
+		}
+		if len(conflictErr.Conflicts) != 2 {
+			t.Fatalf("expected two conflicts, got %#v", conflictErr.Conflicts)
+		}
+		unresolvedPaths := map[string]bool{}
+		for _, unresolved := range conflictErr.Unresolved {
+			unresolvedPaths[remoteImportSkippedLabel(unresolved)] = true
+		}
+		if len(conflictErr.Unresolved) != 2 || !unresolvedPaths["oclan-co/prod/asiri/BROKEN_KEY"] || !unresolvedPaths["oclan-co/prod/asiri/MIDDLE_KEY"] {
+			t.Fatalf("expected the comparison failure alongside conflicts, got %#v", conflictErr.Unresolved)
+		}
+		for i, conflict := range conflictErr.Conflicts {
+			if got := SecretKey(conflict.Scope, conflict.Name); got != wantPaths[i] {
+				t.Fatalf("conflict %d path = %q, want %q", i, got, wantPaths[i])
+			}
+			if conflict.LocalVersion != 2 || conflict.RemoteVersion != 1 {
+				t.Fatalf("conflict %d versions unexpected: %#v", i, conflict)
+			}
+		}
+		message := err.Error()
+		if alpha, zeta := strings.Index(message, wantPaths[0]), strings.Index(message, wantPaths[1]); alpha < 0 || zeta < 0 || alpha >= zeta {
+			t.Fatalf("conflict message should list every key in order: %s", message)
+		}
+		for _, expected := range []string{"2 additional remote secrets could not be prepared", "oclan-co/prod/asiri/BROKEN_KEY", "cannot be compared with the local active version", "oclan-co/prod/asiri/MIDDLE_KEY", "remote key preparation failed"} {
+			if !strings.Contains(message, expected) {
+				t.Fatalf("conflict message missing comparison failure %q: %s", expected, message)
+			}
+		}
+
+		restoreFailure = keystore.FailPlatformOperationsForTesting(nil, injected, nil)
+		_, standaloneErr := target.importRemoteSecretVersions(workspaceID, workspaceSlug, []RemoteSecretVersion{blockedVersion}, false, func(remote RemoteSecretVersion) ([]byte, bool, error) {
+			return remoteDataKeys[SecretKey(remote.Scope, remote.Name)], true, nil
+		})
+		restoreFailure()
+		if !errors.Is(standaloneErr, injected) {
+			t.Fatalf("standalone comparison error lost %v: %v", injected, standaloneErr)
+		}
+
+		_, partialErr := target.importRemoteSecretVersions(workspaceID, workspaceSlug, []RemoteSecretVersion{partialVersion}, false, func(remote RemoteSecretVersion) ([]byte, bool, error) {
+			return nil, false, fmt.Errorf("remote key preparation failed: %w", partialCause)
+		})
+		if !errors.Is(partialErr, partialCause) {
+			t.Fatalf("partial import error lost %v: %v", partialCause, partialErr)
+		}
+	}
+	if _, ok := target.State.Secrets[SecretKey(scope, "MIDDLE_KEY")]; ok {
+		t.Fatal("non-conflicting remote secret was imported despite aggregate conflict rejection")
+	}
+	for _, secret := range []struct {
+		name  string
+		value string
+	}{
+		{name: "ALPHA_KEY", value: "local-alpha-v2"},
+		{name: "ZETA_KEY", value: "local-zeta-v2"},
+	} {
+		value, _, err := target.GetSecret(SecretKey(scope, secret.name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if value != secret.value {
+			t.Fatalf("local value for %s changed during rejected import", secret.name)
+		}
 	}
 }
 

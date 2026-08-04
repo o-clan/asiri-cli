@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/o-clan/asiri/cli/internal/keystore"
 	"github.com/o-clan/asiri/cli/internal/store"
 )
 
@@ -310,7 +313,9 @@ func TestPullAdoptsUnboundLocalWorkspaceWithHostedCanonicalSlug(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	remoteVersions = []store.RemoteSecretVersion{pullTestRemoteVersion(t, tmp, "dev_testamy", device.EncryptionPublicKey)}
+	remoteVersions = pullTestRemoteVersions(t, tmp, "dev_testamy", device.EncryptionPublicKey, []pullTestSecret{{
+		Scope: "testamy-com/common", Name: "LOCAL_KEY", Value: "local-value",
+	}})
 
 	out.Reset()
 	errb.Reset()
@@ -366,7 +371,222 @@ func TestPullAdoptsUnboundLocalWorkspaceWithHostedCanonicalSlug(t *testing.T) {
 	}
 }
 
-func pullTestRemoteVersion(t *testing.T, root, targetDeviceID, targetPublicKey string) store.RemoteSecretVersion {
+func TestPullListsEveryConflictingKeyWithoutPartialImport(t *testing.T) {
+	tmp := t.TempDir()
+	old := os.Getenv("ASIRI_HOME")
+	t.Cleanup(func() { _ = os.Setenv("ASIRI_HOME", old) })
+	if err := os.Setenv("ASIRI_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	var remoteVersions []store.RemoteSecretVersion
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/device-code/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":              "dc_conflicts",
+				"userCode":                "PULL-CONFLICTS",
+				"verificationUri":         serverURL(r) + "/auth/device",
+				"verificationUriComplete": serverURL(r) + "/auth/device?code=PULL-CONFLICTS",
+				"expiresIn":               30,
+				"interval":                0,
+			})
+		case "/v1/auth/device-code/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "approved",
+				"orgId":            "org_testamy",
+				"workspaceSlug":    "testamy-com",
+				"userId":           "usr_owner",
+				"deviceId":         "dev_testamy",
+				"accessToken":      "at_testamy",
+				"refreshToken":     "rt_testamy",
+				"expiresIn":        3600,
+				"refreshExpiresAt": time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			})
+		case "/v1/orgs":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"activeOrgId": "org_testamy",
+				"organizations": []map[string]any{{
+					"id": "org_testamy", "name": "Testamy", "slug": "testamy-com", "kind": "domain",
+					"ownerUserId": "usr_owner", "role": "owner", "canPull": true, "canWrite": true,
+					"currentDeviceTrusted": true, "currentDeviceId": "dev_testamy",
+				}},
+			})
+		case "/v1/sync":
+			if r.Header.Get("authorization") != "Bearer at_testamy" || r.URL.Query().Get("orgId") != "org_testamy" || r.URL.Query().Get("deviceId") != "dev_testamy" {
+				t.Fatalf("unexpected sync request auth=%s query=%s", r.Header.Get("authorization"), r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"orgId": "org_testamy", "deviceId": "dev_testamy", "issuedAt": time.Now().UTC().Format(time.RFC3339),
+				"encryptedSecrets": remoteVersions,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	var errb bytes.Buffer
+	app := New(&out, &errb)
+	for _, step := range [][]string{
+		{"init", "--device", "qa-laptop"},
+		{"workspace", "create", "testamy-com"},
+		{"add", "--workspace", "testamy-com", "prod/asiri/ALPHA_KEY", "--value-file", testSecretFile(t, "local-alpha")},
+		{"add", "--workspace", "testamy-com", "prod/asiri/ZETA_KEY", "--value-file", testSecretFile(t, "local-zeta")},
+		{"login", "--origin", server.URL},
+	} {
+		out.Reset()
+		errb.Reset()
+		if code := app.Run(step); code != 0 {
+			t.Fatalf("%v failed with code %d stderr=%s", step, code, errb.String())
+		}
+	}
+
+	st, err := store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := st.ActiveDevice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteVersions = pullTestRemoteVersions(t, tmp, "dev_testamy", device.EncryptionPublicKey, []pullTestSecret{
+		{Scope: "testamy-com/prod/asiri", Name: "ALPHA_KEY", Value: "remote-alpha"},
+		{Scope: "testamy-com/prod/asiri", Name: "MIDDLE_KEY", Value: "remote-middle"},
+		{Scope: "testamy-com/prod/asiri", Name: "ZETA_KEY", Value: "remote-zeta"},
+	})
+	for left, right := 0, len(remoteVersions)-1; left < right; left, right = left+1, right-1 {
+		remoteVersions[left], remoteVersions[right] = remoteVersions[right], remoteVersions[left]
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := app.Run([]string{"pull", "--workspace", "testamy-com"}); code == 0 {
+		t.Fatalf("pull should fail on conflicts: stdout=%s", out.String())
+	}
+	message := errb.String()
+	alphaPath := "testamy-com/prod/asiri/ALPHA_KEY"
+	zetaPath := "testamy-com/prod/asiri/ZETA_KEY"
+	for _, expected := range []string{
+		"asiri: 2 remote secrets conflict with local active versions:",
+		"(local v1, remote v1)",
+		"rerun with --force only if you intend to replace these local versions",
+	} {
+		if !strings.Contains(message, expected) {
+			t.Fatalf("pull conflict output missing %q: %s", expected, message)
+		}
+	}
+	if alpha, zeta := strings.Index(message, alphaPath), strings.Index(message, zetaPath); alpha < 0 || zeta < 0 || alpha >= zeta {
+		t.Fatalf("pull should list every conflicting key in order: %s", message)
+	}
+	for _, value := range []string{"local-alpha", "local-zeta", "remote-alpha", "remote-middle", "remote-zeta"} {
+		if strings.Contains(message, value) {
+			t.Fatal("pull conflict output exposed a secret value")
+		}
+	}
+	st, err = store.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.State.Secrets[store.SecretKey("testamy-com/prod/asiri", "MIDDLE_KEY")]; ok {
+		t.Fatal("pull imported a non-conflicting secret despite aggregate conflicts")
+	}
+}
+
+func TestFailKeepsConflictListWithKeychainGuidance(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		cause    error
+		guidance string
+	}{
+		{name: "authentication", cause: keystore.ErrPlatformAuthentication, guidance: "macOS denied access to the login Keychain"},
+		{name: "timeout", cause: keystore.ErrPlatformTimeout, guidance: "macOS Keychain did not respond in time"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			conflict := &store.RemoteImportConflictError{Conflicts: []store.RemoteImportConflict{{
+				Scope: "testamy-com/prod/asiri", Name: "API_KEY", LocalVersion: 2, RemoteVersion: 1,
+			}}}
+			err := remoteImportErrorWithCause{detail: conflict, cause: test.cause}
+			var errb bytes.Buffer
+			if code := New(io.Discard, &errb).fail(err); code == 0 {
+				t.Fatal("fail unexpectedly returned success")
+			}
+			for _, expected := range []string{
+				"testamy-com/prod/asiri/API_KEY (local v2, remote v1)",
+				test.guidance,
+				"Refresh the Keychain",
+			} {
+				if !strings.Contains(errb.String(), expected) {
+					t.Fatalf("combined failure output missing %q: %s", expected, errb.String())
+				}
+			}
+		})
+	}
+}
+
+func TestFailKeepsPartialImportDetailsWithKeychainGuidance(t *testing.T) {
+	for _, cause := range []error{keystore.ErrPlatformAuthentication, keystore.ErrPlatformTimeout} {
+		partial := &store.RemoteImportPartialError{Skipped: []store.RemoteImportSkipped{{
+			Scope: "testamy-com/prod/asiri", Name: "API_KEY", Reason: cause.Error(),
+		}}}
+		err := remoteImportErrorWithCause{detail: partial, cause: cause}
+		var errb bytes.Buffer
+		if code := New(io.Discard, &errb).fail(err); code == 0 {
+			t.Fatal("fail unexpectedly returned success")
+		}
+		for _, expected := range []string{
+			"skipped 1 malformed remote secret version",
+			"testamy-com/prod/asiri/API_KEY",
+			"Refresh the Keychain",
+		} {
+			if !strings.Contains(errb.String(), expected) {
+				t.Fatalf("combined failure output missing %q: %s", expected, errb.String())
+			}
+		}
+	}
+}
+
+type remoteImportErrorWithCause struct {
+	detail error
+	cause  error
+}
+
+func (e remoteImportErrorWithCause) Error() string {
+	return e.detail.Error()
+}
+
+func (e remoteImportErrorWithCause) Is(target error) bool {
+	return errors.Is(e.cause, target)
+}
+
+func (e remoteImportErrorWithCause) As(target any) bool {
+	switch typed := target.(type) {
+	case **store.RemoteImportConflictError:
+		conflict, ok := e.detail.(*store.RemoteImportConflictError)
+		if ok {
+			*typed = conflict
+		}
+		return ok
+	case **store.RemoteImportPartialError:
+		partial, ok := e.detail.(*store.RemoteImportPartialError)
+		if ok {
+			*typed = partial
+		}
+		return ok
+	default:
+		return false
+	}
+}
+
+type pullTestSecret struct {
+	Scope string
+	Name  string
+	Value string
+}
+
+func pullTestRemoteVersions(t *testing.T, root, targetDeviceID, targetPublicKey string, secrets []pullTestSecret) []store.RemoteSecretVersion {
 	t.Helper()
 	source, err := store.Load(filepath.Join(root, "remote-source", "state.json"))
 	if err != nil {
@@ -387,8 +607,10 @@ func pullTestRemoteVersion(t *testing.T, root, targetDeviceID, targetPublicKey s
 	if err := source.Save(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := source.AddSecret("testamy-com/common/LOCAL_KEY", "local-value"); err != nil {
-		t.Fatal(err)
+	for _, secret := range secrets {
+		if _, err := source.AddSecret(store.SecretKey(secret.Scope, secret.Name), secret.Value); err != nil {
+			t.Fatal(err)
+		}
 	}
 	expires := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
 	if err := source.LinkControlPlaneForDevice("http://control.test", "org_testamy", "testamy-com", "usr_owner", "dev_source", device.ID, "at_source", "rt_source", 3600, expires); err != nil {
@@ -398,13 +620,15 @@ func pullTestRemoteVersion(t *testing.T, root, targetDeviceID, targetPublicKey s
 		t.Fatal(err)
 	}
 	versions, err := source.RemoteSecretVersionsForPrefix("org_testamy", "testamy-com", "dev_source", "testamy-com")
-	if err != nil || len(versions) != 1 {
+	if err != nil || len(versions) != len(secrets) {
 		t.Fatalf("unexpected remote source versions: count=%d err=%v", len(versions), err)
 	}
-	wrapped, err := source.RemoteWrappedKeyForSecretVersionPublicKey("org_testamy", versions[0].Scope, versions[0].Name, versions[0].Version, targetDeviceID, targetPublicKey)
-	if err != nil {
-		t.Fatal(err)
+	for i := range versions {
+		wrapped, err := source.RemoteWrappedKeyForSecretVersionPublicKey("org_testamy", versions[i].Scope, versions[i].Name, versions[i].Version, targetDeviceID, targetPublicKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		versions[i].WrappedKeys = []store.RemoteWrappedKey{wrapped}
 	}
-	versions[0].WrappedKeys = []store.RemoteWrappedKey{wrapped}
-	return versions[0]
+	return versions
 }

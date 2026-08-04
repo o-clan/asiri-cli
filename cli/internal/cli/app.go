@@ -128,12 +128,14 @@ func commandUsesLifecycleStateLock(command string) bool {
 
 func (a App) fail(err error) int {
 	if errors.Is(err, keystore.ErrPlatformAuthentication) {
+		writeRemoteImportDetails(a.Err, err)
 		fmt.Fprintln(a.Err, "asiri: macOS denied access to the login Keychain.")
 		fmt.Fprintln(a.Err, "\nThis can happen when macOS leaves the Keychain in a stale state.")
 		writeKeychainRecovery(a.Err)
 		return 1
 	}
 	if errors.Is(err, keystore.ErrPlatformTimeout) {
+		writeRemoteImportDetails(a.Err, err)
 		fmt.Fprintln(a.Err, "asiri: macOS Keychain did not respond in time.")
 		fmt.Fprintln(a.Err, "\nAsiri could not confirm that the Keychain operation completed.")
 		writeKeychainRecovery(a.Err)
@@ -141,6 +143,18 @@ func (a App) fail(err error) int {
 	}
 	fmt.Fprintf(a.Err, "asiri: %s\n", err)
 	return 1
+}
+
+func writeRemoteImportDetails(out io.Writer, err error) {
+	var conflictErr *store.RemoteImportConflictError
+	if errors.As(err, &conflictErr) {
+		fmt.Fprintf(out, "asiri: %s\n\n", conflictErr)
+		return
+	}
+	var partialErr *store.RemoteImportPartialError
+	if errors.As(err, &partialErr) {
+		fmt.Fprintf(out, "asiri: %s\n\n", partialErr)
+	}
 }
 
 func writeKeychainRecovery(out io.Writer) {
