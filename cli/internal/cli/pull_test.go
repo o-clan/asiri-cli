@@ -380,6 +380,7 @@ func TestPullListsEveryConflictingKeyWithoutPartialImport(t *testing.T) {
 	}
 
 	var remoteVersions []store.RemoteSecretVersion
+	var remoteTombstones []map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "application/json")
 		switch r.URL.Path {
@@ -420,6 +421,7 @@ func TestPullListsEveryConflictingKeyWithoutPartialImport(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"orgId": "org_testamy", "deviceId": "dev_testamy", "issuedAt": time.Now().UTC().Format(time.RFC3339),
 				"encryptedSecrets": remoteVersions,
+				"tombstones":       remoteTombstones,
 			})
 		default:
 			http.NotFound(w, r)
@@ -435,6 +437,7 @@ func TestPullListsEveryConflictingKeyWithoutPartialImport(t *testing.T) {
 		{"workspace", "create", "testamy-com"},
 		{"add", "--workspace", "testamy-com", "prod/asiri/ALPHA_KEY", "--value-file", testSecretFile(t, "local-alpha")},
 		{"add", "--workspace", "testamy-com", "prod/asiri/ZETA_KEY", "--value-file", testSecretFile(t, "local-zeta")},
+		{"add", "--workspace", "testamy-com", "prod/asiri/DELETE_ME", "--value-file", testSecretFile(t, "local-delete")},
 		{"login", "--origin", server.URL},
 	} {
 		out.Reset()
@@ -460,6 +463,10 @@ func TestPullListsEveryConflictingKeyWithoutPartialImport(t *testing.T) {
 	for left, right := 0, len(remoteVersions)-1; left < right; left, right = left+1, right-1 {
 		remoteVersions[left], remoteVersions[right] = remoteVersions[right], remoteVersions[left]
 	}
+	remoteTombstones = []map[string]any{{
+		"orgId": "org_testamy", "scope": "testamy-com/prod/asiri", "name": "DELETE_ME",
+		"deletedThroughVersion": 1, "deletedAt": time.Now().UTC().Format(time.RFC3339),
+	}}
 
 	out.Reset()
 	errb.Reset()
@@ -492,6 +499,13 @@ func TestPullListsEveryConflictingKeyWithoutPartialImport(t *testing.T) {
 	}
 	if _, ok := st.State.Secrets[store.SecretKey("testamy-com/prod/asiri", "MIDDLE_KEY")]; ok {
 		t.Fatal("pull imported a non-conflicting secret despite aggregate conflicts")
+	}
+	deleteMe := st.State.Secrets[store.SecretKey("testamy-com/prod/asiri", "DELETE_ME")]
+	if deleteMe.ActiveVersion != 1 || deleteMe.Versions[0].Status != "active" {
+		t.Fatalf("pull applied a tombstone despite aggregate conflicts: %#v", deleteMe)
+	}
+	if len(st.State.SecretTombstones) != 0 {
+		t.Fatalf("pull persisted tombstones despite aggregate conflicts: %#v", st.State.SecretTombstones)
 	}
 }
 

@@ -94,6 +94,17 @@ type Secret struct {
 	UpdatedAt     time.Time       `json:"updatedAt"`
 }
 
+type SecretTombstone struct {
+	WorkspaceID           string     `json:"orgId"`
+	Scope                 string     `json:"scope"`
+	Name                  string     `json:"name"`
+	DeletedThroughVersion int        `json:"deletedThroughVersion"`
+	DeletedAt             time.Time  `json:"deletedAt"`
+	DeletedByUserID       string     `json:"deletedByUserId,omitempty"`
+	PurgeAfter            *time.Time `json:"purgeAfter,omitempty"`
+	ReconciledAt          time.Time  `json:"reconciledAt,omitempty"`
+}
+
 type Policy struct {
 	ID            string     `json:"id"`
 	Subject       string     `json:"subject"`
@@ -170,6 +181,7 @@ type State struct {
 	Recoveries         map[string]RecoveryConfig         `json:"recoveries,omitempty"`
 	Devices            []Device                          `json:"devices"`
 	Secrets            map[string]Secret                 `json:"secrets"`
+	SecretTombstones   map[string]SecretTombstone        `json:"secretTombstones,omitempty"`
 	Policies           []Policy                          `json:"policies"`
 	EnvelopeAuditModes map[string]AuditMode              `json:"envelopeAuditModes,omitempty"`
 	AuditLedger        []AuditLedgerRecord               `json:"auditLedger,omitempty"`

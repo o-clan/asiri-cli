@@ -67,6 +67,8 @@ grep -q '^name: asiri$' "$skill_extract_dir/asiri/SKILL.md"
 grep -q '^description: ' "$skill_extract_dir/asiri/SKILL.md"
 grep -q -- '--label' "$skill_extract_dir/asiri/SKILL.md"
 grep -q 'audit metadata only' "$skill_extract_dir/asiri/SKILL.md"
+grep -q 'asiri sync --workspace <workspace>' "$skill_extract_dir/asiri/SKILL.md"
+grep -q 'control-plane' "$skill_extract_dir/asiri/SKILL.md"
 if grep -Eq 'asiri (grant|deny)( |$)' "$skill_extract_dir/asiri/SKILL.md"; then
   echo "packaged skill still references removed root label policy commands" >&2
   exit 1

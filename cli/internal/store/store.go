@@ -334,7 +334,7 @@ func Load(path string) (*FileStore, error) {
 	store := &FileStore{Path: path}
 	bytes, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		store.State = asiri.State{Version: 1, Secrets: map[string]asiri.Secret{}, Policies: []asiri.Policy{}, Audit: []asiri.AuditEvent{}, Workspaces: map[string]asiri.LocalWorkspace{}, RemoteBindings: map[string]asiri.RemoteWorkspaceBinding{}}
+		store.State = asiri.State{Version: 1, Secrets: map[string]asiri.Secret{}, SecretTombstones: map[string]asiri.SecretTombstone{}, Policies: []asiri.Policy{}, Audit: []asiri.AuditEvent{}, Workspaces: map[string]asiri.LocalWorkspace{}, RemoteBindings: map[string]asiri.RemoteWorkspaceBinding{}}
 		store.loadedStateKnown = true
 		return store, nil
 	}
@@ -347,6 +347,9 @@ func Load(path string) (*FileStore, error) {
 	store.migratePreviousState(bytes)
 	if store.State.Secrets == nil {
 		store.State.Secrets = map[string]asiri.Secret{}
+	}
+	if store.State.SecretTombstones == nil {
+		store.State.SecretTombstones = map[string]asiri.SecretTombstone{}
 	}
 	if store.State.KeyRefs == nil {
 		store.State.KeyRefs = []asiri.KeyRef{}
@@ -1063,8 +1066,8 @@ func (s *FileStore) AddSecretBytes(fullPath string, value []byte) (asiri.Secret,
 			secret.Versions[i].Status = "stale"
 		}
 	}
-	version := nextSecretVersion(secret.Versions)
 	workspaceID := s.encryptionWorkspaceIDForScope(scope)
+	version := s.nextSecretVersion(workspaceID, secret)
 	aad := fmt.Sprintf("%s:%s:%s:%d:%s", workspaceID, scope, name, version, device.ID)
 	dataKey, dataKeyAccount, err := s.newSecretDataKey(scope, name, version)
 	if err != nil {
@@ -1535,6 +1538,7 @@ func (s *FileStore) RemoteSecretVersionsForRefsWithRecovery(workspaceID, workspa
 				AAD:               version.AAD,
 				WrappedKeys:       wrappedKeys,
 				CreatedByDeviceID: remoteDeviceID,
+				CreatedAt:         version.CreatedAt,
 			})
 			break
 		}
@@ -1546,13 +1550,97 @@ func (s *FileStore) RemoteSecretVersionsForRefsWithRecovery(workspaceID, workspa
 }
 
 func (s *FileStore) ImportRemoteSecretVersions(workspaceID, workspaceSlug, remoteDeviceID string, versions []RemoteSecretVersion, force bool) (int, error) {
-	return s.importRemoteSecretVersions(workspaceID, workspaceSlug, versions, force, func(remote RemoteSecretVersion) ([]byte, bool, error) {
+	return s.importRemoteSecretVersions(workspaceID, workspaceSlug, versions, force, false, func(remote RemoteSecretVersion) ([]byte, bool, error) {
 		dataKey, err := s.UnwrapDeviceDataKey(remoteDeviceID, remote.WrappedKeys)
 		if err != nil {
 			return nil, false, fmt.Errorf("is not wrapped to this device: %w", err)
 		}
 		return dataKey, true, nil
 	})
+}
+
+func (s *FileStore) ImportRemoteSecretVersionsForSync(workspaceID, workspaceSlug, remoteDeviceID string, versions []RemoteSecretVersion) (int, error) {
+	return s.importRemoteSecretVersions(workspaceID, workspaceSlug, versions, true, true, func(remote RemoteSecretVersion) ([]byte, bool, error) {
+		dataKey, err := s.UnwrapDeviceDataKey(remoteDeviceID, remote.WrappedKeys)
+		if err != nil {
+			return nil, false, fmt.Errorf("is not wrapped to this device: %w", err)
+		}
+		return dataKey, true, nil
+	})
+}
+
+func SecretTombstoneKey(workspaceID, scope, name string) string {
+	return workspaceID + "\x00" + SecretKey(scope, name)
+}
+
+func (s *FileStore) SecretTombstone(workspaceID, scope, name string) (asiri.SecretTombstone, bool) {
+	if s.State.SecretTombstones == nil {
+		return asiri.SecretTombstone{}, false
+	}
+	tombstone, ok := s.State.SecretTombstones[SecretTombstoneKey(workspaceID, scope, name)]
+	return tombstone, ok
+}
+
+func (s *FileStore) ReconcileRemoteTombstones(workspaceID, workspaceSlug string, tombstones []asiri.SecretTombstone) (int, error) {
+	if err := s.RequireInitialized(); err != nil {
+		return 0, err
+	}
+	if workspaceID == "" || workspaceSlug == "" {
+		return 0, errors.New("remote workspace is required")
+	}
+	next := make(map[string]asiri.SecretTombstone, len(s.State.SecretTombstones)+len(tombstones))
+	for key, tombstone := range s.State.SecretTombstones {
+		// Sync bundles are filtered to the member's current access. An omitted
+		// tombstone is therefore not proof that the deletion was reversed.
+		next[key] = tombstone
+	}
+	reconciledAt := time.Now().UTC()
+	for _, tombstone := range tombstones {
+		if tombstone.WorkspaceID != workspaceID {
+			return 0, fmt.Errorf("remote tombstone %s belongs to workspace %s, not %s", SecretKey(tombstone.Scope, tombstone.Name), tombstone.WorkspaceID, workspaceID)
+		}
+		if tombstone.Scope == "" || tombstone.Name == "" || tombstone.DeletedThroughVersion < 1 {
+			return 0, errors.New("control plane returned an invalid secret tombstone")
+		}
+		if WorkspacePrefix(tombstone.Scope) != workspaceSlug {
+			return 0, fmt.Errorf("remote tombstone %s is outside workspace %s", SecretKey(tombstone.Scope, tombstone.Name), workspaceSlug)
+		}
+		key := SecretTombstoneKey(workspaceID, tombstone.Scope, tombstone.Name)
+		existing, ok := s.State.SecretTombstones[key]
+		preserveReconciliation := ok && !existing.ReconciledAt.IsZero() && (existing.DeletedThroughVersion > tombstone.DeletedThroughVersion ||
+			(existing.DeletedThroughVersion == tombstone.DeletedThroughVersion && existing.DeletedAt.Equal(tombstone.DeletedAt)))
+		if preserveReconciliation {
+			tombstone.ReconciledAt = existing.ReconciledAt
+		} else {
+			tombstone.ReconciledAt = reconciledAt
+		}
+		next[key] = tombstone
+	}
+	changed := 0
+	for key, secret := range s.State.Secrets {
+		tombstone, ok := next[SecretTombstoneKey(workspaceID, secret.Scope, secret.Name)]
+		if !ok {
+			continue
+		}
+		secretChanged := false
+		for i := range secret.Versions {
+			if secret.Versions[i].Version <= tombstone.DeletedThroughVersion && secret.Versions[i].Status != "deleted" {
+				secret.Versions[i].Status = "deleted"
+				secretChanged = true
+			}
+		}
+		if secret.ActiveVersion <= tombstone.DeletedThroughVersion && secret.ActiveVersion != 0 {
+			secret.ActiveVersion = 0
+			secretChanged = true
+		}
+		if secretChanged {
+			secret.UpdatedAt = time.Now().UTC()
+			s.State.Secrets[key] = secret
+			changed++
+		}
+	}
+	s.State.SecretTombstones = next
+	return changed, nil
 }
 
 func (s *FileStore) ImportRecoveryRemoteSecretVersions(workspaceID, workspaceSlug string, versions []RemoteSecretVersion, recoveryKey string, force bool) (int, RecoveryKeyIdentity, error) {
@@ -1563,7 +1651,7 @@ func (s *FileStore) ImportRecoveryRemoteSecretVersions(workspaceID, workspaceSlu
 	if err != nil {
 		return 0, RecoveryKeyIdentity{}, err
 	}
-	imported, err := s.importRemoteSecretVersions(workspaceID, workspaceSlug, versions, force, func(remote RemoteSecretVersion) ([]byte, bool, error) {
+	imported, err := s.importRemoteSecretVersions(workspaceID, workspaceSlug, versions, force, false, func(remote RemoteSecretVersion) ([]byte, bool, error) {
 		return unwrapRecoveryDataKeyWithIdentity(privateKey, identity, remote.WrappedKeys)
 	})
 	if err != nil {
@@ -1580,7 +1668,7 @@ func RecoveryKeyIdentityForKey(recoveryKey string) (RecoveryKeyIdentity, error) 
 	return identity, err
 }
 
-func (s *FileStore) importRemoteSecretVersions(workspaceID, workspaceSlug string, versions []RemoteSecretVersion, force bool, dataKeyForRemote func(RemoteSecretVersion) ([]byte, bool, error)) (int, error) {
+func (s *FileStore) importRemoteSecretVersions(workspaceID, workspaceSlug string, versions []RemoteSecretVersion, force, preserveNewerLocal bool, dataKeyForRemote func(RemoteSecretVersion) ([]byte, bool, error)) (int, error) {
 	if err := s.RequireInitialized(); err != nil {
 		return 0, err
 	}
@@ -1640,9 +1728,57 @@ func (s *FileStore) importRemoteSecretVersions(workspaceID, workspaceSlug string
 		}
 		key := SecretKey(remote.Scope, remote.Name)
 		reusedDataKeyAccount := ""
+		if force {
+			if secret := s.State.Secrets[key]; secret.Scope != "" {
+				for i := range secret.Versions {
+					version := &secret.Versions[i]
+					if version.Version == remote.Version && version.Algorithm == remote.Algorithm && version.Nonce == remote.Nonce && version.AAD == remote.AAD && version.Ciphertext == remote.Ciphertext {
+						reusedDataKeyAccount = version.DataKeyAccount
+						break
+					}
+				}
+			}
+		}
+		if preserveNewerLocal {
+			if secret := s.State.Secrets[key]; secret.Scope != "" {
+				if active := activeSecretVersion(secret); active != nil {
+					if active.Version > remote.Version {
+						continue
+					}
+					if active.Version == remote.Version {
+						sameEnvelope := active.Algorithm == remote.Algorithm && active.Nonce == remote.Nonce && active.AAD == remote.AAD && active.Ciphertext == remote.Ciphertext
+						if !sameEnvelope {
+							localPlaintext, err := s.decryptSecretVersion(*active)
+							if err != nil {
+								cause := fmt.Errorf("cannot be compared with the local active version: %w", err)
+								blocking = append(blocking, remoteImportBlocking{
+									issue: RemoteImportSkipped{Scope: remote.Scope, Name: remote.Name, Reason: cause.Error()},
+									cause: cause,
+								})
+								continue
+							}
+							if !hmac.Equal(localPlaintext, remotePlaintext) {
+								conflictsByKey[key] = RemoteImportConflict{Scope: remote.Scope, Name: remote.Name, LocalVersion: active.Version, RemoteVersion: remote.Version}
+								continue
+							}
+						}
+						reusedDataKeyAccount = active.DataKeyAccount
+					}
+				}
+			}
+		}
 		if secret := s.State.Secrets[key]; secret.Scope != "" && !force {
 			active := activeSecretVersion(secret)
-			if active == nil || active.Version != remote.Version {
+			var deletedSameVersion *asiri.SecretVersion
+			if active == nil {
+				for i := range secret.Versions {
+					if secret.Versions[i].Version == remote.Version && secret.Versions[i].Status == "deleted" {
+						deletedSameVersion = &secret.Versions[i]
+						break
+					}
+				}
+			}
+			if (active == nil && deletedSameVersion == nil) || (active != nil && active.Version != remote.Version) {
 				conflict := RemoteImportConflict{Scope: remote.Scope, Name: remote.Name, RemoteVersion: remote.Version}
 				if active != nil {
 					conflict.LocalVersion = active.Version
@@ -1652,8 +1788,16 @@ func (s *FileStore) importRemoteSecretVersions(workspaceID, workspaceSlug string
 				}
 				continue
 			}
-			sameEnvelope := active.Algorithm == remote.Algorithm && active.Nonce == remote.Nonce && active.AAD == remote.AAD && active.Ciphertext == remote.Ciphertext
-			if !sameEnvelope {
+			if deletedSameVersion != nil {
+				sameEnvelope := deletedSameVersion.Algorithm == remote.Algorithm && deletedSameVersion.Nonce == remote.Nonce && deletedSameVersion.AAD == remote.AAD && deletedSameVersion.Ciphertext == remote.Ciphertext
+				if !sameEnvelope {
+					conflictsByKey[key] = RemoteImportConflict{Scope: remote.Scope, Name: remote.Name, LocalVersion: deletedSameVersion.Version, RemoteVersion: remote.Version}
+					continue
+				}
+				reusedDataKeyAccount = deletedSameVersion.DataKeyAccount
+			}
+			sameEnvelope := active != nil && active.Algorithm == remote.Algorithm && active.Nonce == remote.Nonce && active.AAD == remote.AAD && active.Ciphertext == remote.Ciphertext
+			if active != nil && !sameEnvelope {
 				localPlaintext, err := s.decryptSecretVersion(*active)
 				if err != nil {
 					cause := fmt.Errorf("cannot be compared with the local active version: %w", err)
@@ -1668,7 +1812,9 @@ func (s *FileStore) importRemoteSecretVersions(workspaceID, workspaceSlug string
 					continue
 				}
 			}
-			reusedDataKeyAccount = active.DataKeyAccount
+			if active != nil {
+				reusedDataKeyAccount = active.DataKeyAccount
+			}
 		}
 		if remote.OrgID != "" {
 			prefix := WorkspacePrefix(remote.Scope)
@@ -1706,6 +1852,12 @@ func (s *FileStore) importRemoteSecretVersions(workspaceID, workspaceSlug string
 	if len(blocking) > 0 {
 		first := blocking[0]
 		return 0, fmt.Errorf("remote secret %s: %w", remoteImportSkippedLabel(first.issue), first.cause)
+	}
+	// Reconciliation is all-or-nothing. Ordinary pull may quarantine malformed
+	// records while importing valid ones, but sync must not claim alignment from
+	// a partial control-plane ledger.
+	if preserveNewerLocal && len(partial.Skipped) > 0 {
+		return 0, partial
 	}
 	for i := range prepared {
 		if prepared[i].account != "" {
@@ -1908,8 +2060,8 @@ func (s *FileStore) rotateDataKeys(prefix string) (int, error) {
 				secret.Versions[i].Status = "stale"
 			}
 		}
-		nextVersion := nextSecretVersion(secret.Versions)
 		workspaceID := s.encryptionWorkspaceIDForScope(secret.Scope)
+		nextVersion := s.nextSecretVersion(workspaceID, secret)
 		aad := fmt.Sprintf("%s:%s:%s:%d:%s", workspaceID, secret.Scope, secret.Name, nextVersion, device.ID)
 		dataKey, dataKeyAccount, err := s.newSecretDataKey(secret.Scope, secret.Name, nextVersion)
 		if err != nil {
@@ -3108,6 +3260,14 @@ func nextSecretVersion(versions []asiri.SecretVersion) int {
 		if version.Version >= next {
 			next = version.Version + 1
 		}
+	}
+	return next
+}
+
+func (s *FileStore) nextSecretVersion(workspaceID string, secret asiri.Secret) int {
+	next := nextSecretVersion(secret.Versions)
+	if tombstone, ok := s.SecretTombstone(workspaceID, secret.Scope, secret.Name); ok && next <= tombstone.DeletedThroughVersion {
+		return tombstone.DeletedThroughVersion + 1
 	}
 	return next
 }

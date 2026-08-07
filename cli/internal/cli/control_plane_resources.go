@@ -446,19 +446,27 @@ type remotePushBatchRewrap struct {
 }
 
 type remotePushBatchRequest struct {
-	OrgID   string                      `json:"orgId"`
-	Uploads []store.RemoteSecretVersion `json:"uploads"`
-	Rewraps []remotePushBatchRewrap     `json:"rewraps"`
+	OrgID     string                      `json:"orgId"`
+	Uploads   []store.RemoteSecretVersion `json:"uploads"`
+	Rewraps   []remotePushBatchRewrap     `json:"rewraps"`
+	Recreates []remotePushBatchRecreate   `json:"recreates,omitempty"`
+}
+
+type remotePushBatchRecreate struct {
+	OrgID                 string `json:"orgId"`
+	Scope                 string `json:"scope"`
+	Name                  string `json:"name"`
+	DeletedThroughVersion int    `json:"deletedThroughVersion"`
 }
 
 const remotePushBatchMaxBytes = 32 * 1024 * 1024
 
-func commitRemotePushBatch(st *store.FileStore, origin, orgID, accessToken string, uploads []store.RemoteSecretVersion, rewraps []pushRewrapCandidate) error {
+func commitRemotePushBatch(st *store.FileStore, origin, orgID, accessToken string, uploads []store.RemoteSecretVersion, rewraps []pushRewrapCandidate, recreates []remotePushBatchRecreate) error {
 	entries := make([]remotePushBatchRewrap, 0, len(rewraps))
 	for _, candidate := range rewraps {
 		entries = append(entries, remotePushBatchRewrap{SecretID: candidate.SecretID, WrappedKeys: candidate.Missing})
 	}
-	encoded, err := encodeRemotePushBatch(remotePushBatchRequest{OrgID: orgID, Uploads: uploads, Rewraps: entries}, remotePushBatchMaxBytes)
+	encoded, err := encodeRemotePushBatch(remotePushBatchRequest{OrgID: orgID, Uploads: uploads, Rewraps: entries, Recreates: recreates}, remotePushBatchMaxBytes)
 	if err != nil {
 		return err
 	}

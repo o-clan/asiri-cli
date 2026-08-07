@@ -259,6 +259,7 @@ type syncBundleResponse struct {
 	DeviceID         string                      `json:"deviceId"`
 	IssuedAt         string                      `json:"issuedAt"`
 	EncryptedSecrets []store.RemoteSecretVersion `json:"encryptedSecrets"`
+	Tombstones       []asiri.SecretTombstone     `json:"tombstones"`
 	Policies         []syncPolicyResponse        `json:"policies"`
 	Scopes           []syncScopeResponse         `json:"scopes"`
 }
@@ -302,6 +303,7 @@ type remotePushPlanResponse struct {
 	Targets                []remotePushWrappingTargetResponse `json:"targets"`
 	Recovery               *remoteRecoveryRecipientResponse   `json:"recovery"`
 	EncryptedSecrets       []remoteSecretRecord               `json:"encryptedSecrets"`
+	Tombstones             []asiri.SecretTombstone            `json:"tombstones"`
 	Secrets                []remoteSecretRecord               `json:"secrets"`
 }
 

@@ -38,11 +38,14 @@ func TestCLICommandMatrix(t *testing.T) {
 		}
 	}
 
-	if help := expectOK("--help"); !strings.Contains(help, "asiri broker start") || !strings.Contains(help, "pull") || strings.Contains(help, "  sync") {
+	if help := expectOK("--help"); !strings.Contains(help, "asiri broker start") || !strings.Contains(help, "pull") || !strings.Contains(help, "  sync") {
 		t.Fatalf("help missing broker command: %s", help)
 	}
 	if pullHelp := expectOK("pull", "--help"); !strings.Contains(pullHelp, "Usage: asiri pull") || strings.Contains(pullHelp, "Usage: asiri sync") {
 		t.Fatalf("pull help output mismatch: %s", pullHelp)
+	}
+	if syncHelp := expectOK("sync", "--help"); !strings.Contains(syncHelp, "Usage: asiri sync") || !strings.Contains(syncHelp, "control-plane ledger") {
+		t.Fatalf("sync help output mismatch: %s", syncHelp)
 	}
 	for _, check := range []struct {
 		args []string
@@ -72,12 +75,11 @@ func TestCLICommandMatrix(t *testing.T) {
 			}
 		}
 	}
-	expectFail("unknown help topic", "sync", "--help")
 	if version := expectOK("--version"); !strings.Contains(version, "asiri "+Version) {
 		t.Fatalf("version output mismatch: %s", version)
 	}
 	expectOK("init", "--device", "qa-laptop", "--workspace", "qa")
-	expectFail("unknown command", "sync")
+	expectFail("not linked to a control plane", "sync")
 	for _, step := range [][]string{
 		{"add", "openai/missing", "--value-file", testSecretFile(t, "value")},
 		{"rotate", "openai/missing", "--value-file", testSecretFile(t, "value")},

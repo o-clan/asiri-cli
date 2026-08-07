@@ -22,6 +22,7 @@ Commands:
               Manage and log in as service accounts.
   push        Upload encrypted local-only secrets to a specified workspace.
   pull        Pull encrypted remote secrets into the local vault.
+  sync        Reconcile one trusted device with the control-plane ledger.
   rewrap      Add missing trusted-device recipients to remote secret versions.
   rekey       Re-encrypt local secrets with fresh scoped data keys, then push.
   recovery    Configure or use workspace recovery keys.
@@ -146,6 +147,8 @@ func (a App) helpFor(path []string) int {
 		fmt.Fprint(a.Out, "Usage: asiri push --workspace <slug> [--scope <scope>...] [--secret <scope/name>...] [--version <n>] [--dry-run] [--yes]\n\nUploads new local encrypted versions for the specified workspace. Existing matching versions are skipped, older local versions are skipped with a warning, and same-version mismatches fail as conflicts. Use --scope for one envelope, --secret for one exact secret, and --version only with one --secret. Use short paths without the workspace prefix.\n")
 	case "pull":
 		fmt.Fprint(a.Out, "Usage: asiri pull --workspace <slug> [--force]\n\nPulls encrypted remote secret versions from one explicit workspace into the local vault. Pull is import-only; it never uploads local-only secrets.\n")
+	case "sync":
+		fmt.Fprint(a.Out, "Usage: asiri sync --workspace <slug>\n\nReconciles one trusted device against the control-plane ledger. Remote active versions and deletion tombstones are applied first; human sessions then publish remaining local-only or newly recreated versions. Service-account sessions are receive-only.\n")
 	case "rewrap":
 		fmt.Fprint(a.Out, "Usage: asiri rewrap --workspace <slug>\n\nAdds missing wrapped-key recipients for trusted devices in the specified workspace.\n")
 	case "rekey":

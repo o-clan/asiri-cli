@@ -76,6 +76,8 @@ func (a App) Run(args []string) int {
 		return a.push(st, args)
 	case "pull":
 		return a.pull(st, args)
+	case "sync":
+		return a.sync(st, args)
 	case "rewrap":
 		return a.rewrap(st, args)
 	case "rekey":
@@ -119,7 +121,7 @@ func (a App) Run(args []string) int {
 
 func commandUsesLifecycleStateLock(command string) bool {
 	switch command {
-	case "init", "login", "logout", "workspace", "member", "service-account", "push", "pull", "rewrap", "rekey", "recovery", "device", "secret", "local", "add", "rotate", "rm", "cache":
+	case "init", "login", "logout", "workspace", "member", "service-account", "push", "pull", "sync", "rewrap", "rekey", "recovery", "device", "secret", "local", "add", "rotate", "rm", "cache":
 		return true
 	default:
 		return false

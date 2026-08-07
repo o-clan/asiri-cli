@@ -14,6 +14,14 @@ import (
 )
 
 func (a App) push(st *store.FileStore, args []string) int {
+	return a.pushWithMode(st, args, false)
+}
+
+func (a App) pushForSync(st *store.FileStore, args []string) int {
+	return a.pushWithMode(st, args, true)
+}
+
+func (a App) pushWithMode(st *store.FileStore, args []string, reconcile bool) int {
 	if err := st.RequireInitialized(); err != nil {
 		return a.fail(err)
 	}
@@ -60,7 +68,11 @@ func (a App) push(st *store.FileStore, args []string) int {
 	var target remoteWorkspaceResponse
 	err = a.withProgress("Resolving workspace", func() error {
 		var targetErr error
-		target, accessToken, targetErr = a.pushWorkspaceTarget(st, accessToken, pushOptions.Workspace)
+		if reconcile {
+			target, accessToken, targetErr = a.remoteWorkspaceTarget(st, accessToken, pushOptions.Workspace)
+		} else {
+			target, accessToken, targetErr = a.pushWorkspaceTarget(st, accessToken, pushOptions.Workspace)
+		}
 		return targetErr
 	})
 	if err != nil {
@@ -76,7 +88,15 @@ func (a App) push(st *store.FileStore, args []string) int {
 		return a.fail(err)
 	}
 	if len(selectedRefs) == 0 {
+		if reconcile {
+			fmt.Fprintf(a.Out, "No local active secrets to publish for workspace %s\n", target.Slug)
+			return 0
+		}
 		return a.fail(fmt.Errorf("no local active secrets under workspace %s; local prefixes are %s", target.Slug, strings.Join(localSecretWorkspacePrefixes(refs), ", ")))
+	}
+	if reconcile && target.CanWrite != nil && !*target.CanWrite {
+		fmt.Fprintf(a.Out, "No writable local secret versions to publish for workspace %s\n", target.Slug)
+		return 0
 	}
 	if binding, ok := st.RemoteBindingForPrefix(target.Slug); ok && binding.WorkspaceID != target.ID {
 		return a.fail(fmt.Errorf("workspace prefix %s is bound to another control-plane workspace", target.Slug))
@@ -90,7 +110,16 @@ func (a App) push(st *store.FileStore, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	if !plan.Workspace.CanWrite {
+	if reconcile {
+		selectedRefs, err = writablePushRefs(selectedRefs, plan.Workspace.Paths)
+		if err != nil {
+			return a.fail(err)
+		}
+		if len(selectedRefs) == 0 {
+			fmt.Fprintf(a.Out, "No writable local secret versions to publish for workspace %s\n", target.Slug)
+			return 0
+		}
+	} else if !plan.Workspace.CanWrite {
 		return a.fail(fmt.Errorf("workspace %s cannot write %s", target.Slug, fullPathList(plan.Workspace.Paths)))
 	}
 	if pushOptions.DryRun {
@@ -151,7 +180,7 @@ func (a App) push(st *store.FileStore, args []string) int {
 		return a.fail(err)
 	}
 	remoteSecrets := mergeRemoteSecretRecords(plan.EncryptedSecrets, plan.Secrets)
-	reconciled, err := reconcilePushVersions(versions, remoteSecrets)
+	reconciled, err := reconcilePushVersionsWithTombstones(versions, remoteSecrets, plan.Tombstones, st.State.SecretTombstones, target.ID)
 	if pushOptions.DryRun {
 		printPushDryRun(a.Out, target.Slug, reconciled)
 		if err != nil {
@@ -164,7 +193,7 @@ func (a App) push(st *store.FileStore, args []string) int {
 	}
 	if len(reconciled.Upload)+len(reconciled.Rewrap) > 0 {
 		err := a.withProgress("Committing encrypted push", func() error {
-			return commitRemotePushBatch(st, st.State.ControlPlane.Origin, target.ID, accessToken, reconciled.Upload, reconciled.Rewrap)
+			return commitRemotePushBatch(st, st.State.ControlPlane.Origin, target.ID, accessToken, reconciled.Upload, reconciled.Rewrap, reconciled.Recreate)
 		})
 		if err != nil {
 			return a.fail(err)
@@ -216,6 +245,31 @@ func (a App) push(st *store.FileStore, args []string) int {
 		fmt.Fprintf(a.Out, "✓ Rewrapped %d trusted-device key(s) across %d existing secret version(s)\n", rewrappedKeys, rewrappedSecrets)
 	}
 	return 0
+}
+
+func writablePushRefs(refs []store.LocalSecretRef, paths []writePathOption) ([]store.LocalSecretRef, error) {
+	options := make(map[string]bool, len(paths))
+	for _, path := range paths {
+		if path.Scope == "" || path.Name == "" {
+			return nil, errors.New("control plane returned an invalid push path")
+		}
+		key := store.SecretKey(path.Scope, path.Name)
+		if _, exists := options[key]; exists {
+			return nil, errors.New("control plane returned duplicate push paths")
+		}
+		options[key] = path.CanWrite
+	}
+	writable := make([]store.LocalSecretRef, 0, len(refs))
+	for _, ref := range refs {
+		canWrite, ok := options[store.SecretKey(ref.Scope, ref.Name)]
+		if !ok {
+			return nil, fmt.Errorf("control plane omitted push permission for %s", store.SecretKey(ref.Scope, ref.Name))
+		}
+		if canWrite {
+			writable = append(writable, ref)
+		}
+	}
+	return writable, nil
 }
 
 func (a App) prepareLocalWorkspacePush(st *store.FileStore, options pushOptions, accessToken string) (pushOptions, string, bool, string, error) {
@@ -386,6 +440,7 @@ func selectPushRefs(st *store.FileStore, refs []store.LocalSecretRef, target rem
 type pushReconcileResult struct {
 	Upload          []store.RemoteSecretVersion
 	Rewrap          []pushRewrapCandidate
+	Recreate        []remotePushBatchRecreate
 	SkippedExisting int
 	SkippedOlder    int
 	Conflicts       []string
@@ -397,6 +452,10 @@ type pushRewrapCandidate struct {
 }
 
 func reconcilePushVersions(local []store.RemoteSecretVersion, remote []remoteSecretRecord) (pushReconcileResult, error) {
+	return reconcilePushVersionsWithTombstones(local, remote, nil, nil, "")
+}
+
+func reconcilePushVersionsWithTombstones(local []store.RemoteSecretVersion, remote []remoteSecretRecord, tombstones []asiri.SecretTombstone, localTombstones map[string]asiri.SecretTombstone, workspaceID string) (pushReconcileResult, error) {
 	result := pushReconcileResult{Upload: []store.RemoteSecretVersion{}}
 	byVersion := map[string]remoteSecretRecord{}
 	maxVersion := map[string]int{}
@@ -407,9 +466,30 @@ func reconcilePushVersions(local []store.RemoteSecretVersion, remote []remoteSec
 		}
 		byVersion[pushVersionKey(item.Scope, item.Name, item.Version)] = item
 	}
+	tombstoneByKey := map[string]asiri.SecretTombstone{}
+	for _, tombstone := range tombstones {
+		tombstoneByKey[store.SecretKey(tombstone.Scope, tombstone.Name)] = tombstone
+	}
 	conflicts := []string{}
+	tombstoneConflicts := []string{}
 	for _, item := range local {
 		key := store.SecretKey(item.Scope, item.Name)
+		if tombstone, ok := tombstoneByKey[key]; ok {
+			if item.Version <= tombstone.DeletedThroughVersion {
+				tombstoneConflicts = append(tombstoneConflicts, fmt.Sprintf("%s v%d (deleted through v%d)", key, item.Version, tombstone.DeletedThroughVersion))
+				continue
+			}
+			if maxVersion[key] <= tombstone.DeletedThroughVersion {
+				localTombstone, locallyReconciled := localTombstones[store.SecretTombstoneKey(workspaceID, item.Scope, item.Name)]
+				switch {
+				case item.Version > tombstone.DeletedThroughVersion && locallyReconciled && localTombstone.DeletedThroughVersion == tombstone.DeletedThroughVersion && !localTombstone.ReconciledAt.IsZero() && item.CreatedAt.After(localTombstone.ReconciledAt):
+					result.Recreate = append(result.Recreate, remotePushBatchRecreate{OrgID: workspaceID, Scope: item.Scope, Name: item.Name, DeletedThroughVersion: tombstone.DeletedThroughVersion})
+				default:
+					tombstoneConflicts = append(tombstoneConflicts, fmt.Sprintf("%s v%d (requires a new version created after deletion-ledger reconciliation)", key, item.Version))
+					continue
+				}
+			}
+		}
 		if existing, ok := byVersion[pushVersionKey(item.Scope, item.Name, item.Version)]; ok {
 			if existing.Status == "active" && remoteSecretEnvelopeComparable(existing) && remoteSecretEnvelopeMatches(item, existing) {
 				missing := missingRemoteWrappedKeysForRecord(item.WrappedKeys, existing)
@@ -434,6 +514,10 @@ func reconcilePushVersions(local []store.RemoteSecretVersion, remote []remoteSec
 	}
 	sort.Strings(conflicts)
 	result.Conflicts = conflicts
+	if len(tombstoneConflicts) > 0 {
+		sort.Strings(tombstoneConflicts)
+		return result, fmt.Errorf("control-plane deletion ledger blocks %s; run `asiri sync --workspace %s`, then add or rotate each blocked secret to a new local version before publishing again", strings.Join(tombstoneConflicts, ", "), store.WorkspacePrefix(local[0].Scope))
+	}
 	if len(conflicts) > 0 {
 		return result, fmt.Errorf("remote secret version conflict for %s; pull first or rotate locally to a newer version", strings.Join(conflicts, ", "))
 	}

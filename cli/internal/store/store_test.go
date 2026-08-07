@@ -66,6 +66,265 @@ func TestEncryptedLocalSecretStoreDoesNotPersistPlaintext(t *testing.T) {
 	}
 }
 
+func TestRemoteTombstoneRetiresDeletedVersionsAndAddUsesNextVersion(t *testing.T) {
+	st := testInitializedStore(t)
+	device := testDevice(t, "tombstone-device")
+	st.State.Devices = append(st.State.Devices, device)
+	st.State.LocalDeviceID = device.ID
+	bindPrefixForTest(t, st, "ledger", "org_ledger")
+	secret, err := st.AddSecret("ledger/prod/API_KEY", "v1-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := secret.Versions[0].DataKeyAccount
+	deletionAt := time.Now().UTC()
+	changed, err := st.ReconcileRemoteTombstones("org_ledger", "ledger", []asiri.SecretTombstone{{
+		WorkspaceID:           "org_ledger",
+		Scope:                 "ledger/prod",
+		Name:                  "API_KEY",
+		DeletedThroughVersion: 1,
+		DeletedAt:             deletionAt,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed != 1 {
+		t.Fatalf("expected one local secret to be retired, got %d", changed)
+	}
+	retired := st.State.Secrets[SecretKey("ledger/prod", "API_KEY")]
+	if retired.ActiveVersion != 0 || retired.Versions[0].Status != "deleted" {
+		t.Fatalf("expected v1 to be tombstoned, got %#v", retired)
+	}
+	if _, err := keystore.Load(account); err != nil {
+		t.Fatalf("tombstone must preserve recoverable local key material: %v", err)
+	}
+	recreated, err := st.AddSecret("ledger/prod/API_KEY", "v2-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recreated.ActiveVersion != 2 {
+		t.Fatalf("expected explicit add after tombstone to create v2, got v%d", recreated.ActiveVersion)
+	}
+	localTombstone, ok := st.SecretTombstone("org_ledger", "ledger/prod", "API_KEY")
+	if !ok || localTombstone.DeletedThroughVersion != 1 || localTombstone.ReconciledAt.IsZero() {
+		t.Fatalf("expected v1 tombstone to remain as recreation proof, got %#v", localTombstone)
+	}
+	if _, err := st.ReconcileRemoteTombstones("org_ledger", "ledger", []asiri.SecretTombstone{{
+		WorkspaceID:           "org_ledger",
+		Scope:                 "ledger/prod",
+		Name:                  "API_KEY",
+		DeletedThroughVersion: 1,
+		DeletedAt:             deletionAt,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	refreshedTombstone, _ := st.SecretTombstone("org_ledger", "ledger/prod", "API_KEY")
+	if !refreshedTombstone.ReconciledAt.Equal(localTombstone.ReconciledAt) {
+		t.Fatalf("unchanged tombstone refresh reset recreation provenance: before=%s after=%s", localTombstone.ReconciledAt, refreshedTombstone.ReconciledAt)
+	}
+	if _, err := st.ReconcileRemoteTombstones("org_ledger", "ledger", []asiri.SecretTombstone{{
+		WorkspaceID:           "org_ledger",
+		Scope:                 "ledger/prod",
+		Name:                  "API_KEY",
+		DeletedThroughVersion: 1,
+		DeletedAt:             deletionAt.Add(time.Second),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	repeatedDeletionTombstone, _ := st.SecretTombstone("org_ledger", "ledger/prod", "API_KEY")
+	if !repeatedDeletionTombstone.ReconciledAt.After(refreshedTombstone.ReconciledAt) {
+		t.Fatalf("repeated same-version deletion did not reset reconciliation provenance: before=%s after=%s", refreshedTombstone.ReconciledAt, repeatedDeletionTombstone.ReconciledAt)
+	}
+	refreshedTombstone = repeatedDeletionTombstone
+	refreshedTombstone.ReconciledAt = time.Unix(1, 0).UTC()
+	st.State.SecretTombstones[SecretTombstoneKey("org_ledger", "ledger/prod", "API_KEY")] = refreshedTombstone
+	if _, err := st.ReconcileRemoteTombstones("org_ledger", "ledger", []asiri.SecretTombstone{{
+		WorkspaceID:           "org_ledger",
+		Scope:                 "ledger/prod",
+		Name:                  "API_KEY",
+		DeletedThroughVersion: 2,
+		DeletedAt:             time.Now().UTC(),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	advancedTombstone, _ := st.SecretTombstone("org_ledger", "ledger/prod", "API_KEY")
+	if !advancedTombstone.ReconciledAt.After(refreshedTombstone.ReconciledAt) {
+		t.Fatalf("higher deletion floor did not advance reconciliation provenance: before=%s after=%s", refreshedTombstone.ReconciledAt, advancedTombstone.ReconciledAt)
+	}
+	if _, err := st.ReconcileRemoteTombstones("org_ledger", "ledger", []asiri.SecretTombstone{{
+		WorkspaceID:           "org_ledger",
+		Scope:                 "ledger/prod",
+		Name:                  "API_KEY",
+		DeletedThroughVersion: 1,
+		DeletedAt:             time.Now().UTC(),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	restoredFloorTombstone, _ := st.SecretTombstone("org_ledger", "ledger/prod", "API_KEY")
+	if !restoredFloorTombstone.ReconciledAt.Equal(advancedTombstone.ReconciledAt) {
+		t.Fatalf("lower deletion floor reset reconciliation provenance: before=%s after=%s", advancedTombstone.ReconciledAt, restoredFloorTombstone.ReconciledAt)
+	}
+}
+
+func TestRemoteTombstoneReconciliationPreservesFilteredWorkspaceEntries(t *testing.T) {
+	st := testInitializedStore(t)
+	firstSeen := time.Unix(10, 0).UTC()
+	st.State.SecretTombstones = map[string]asiri.SecretTombstone{
+		SecretTombstoneKey("org_ledger", "ledger/prod", "VISIBLE_KEY"): {
+			WorkspaceID:           "org_ledger",
+			Scope:                 "ledger/prod",
+			Name:                  "VISIBLE_KEY",
+			DeletedThroughVersion: 1,
+			ReconciledAt:          firstSeen,
+		},
+		SecretTombstoneKey("org_ledger", "ledger/prod", "FILTERED_KEY"): {
+			WorkspaceID:           "org_ledger",
+			Scope:                 "ledger/prod",
+			Name:                  "FILTERED_KEY",
+			DeletedThroughVersion: 2,
+			ReconciledAt:          firstSeen,
+		},
+	}
+
+	if _, err := st.ReconcileRemoteTombstones("org_ledger", "ledger", []asiri.SecretTombstone{{
+		WorkspaceID:           "org_ledger",
+		Scope:                 "ledger/prod",
+		Name:                  "VISIBLE_KEY",
+		DeletedThroughVersion: 1,
+		DeletedAt:             time.Now().UTC(),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	filtered, ok := st.SecretTombstone("org_ledger", "ledger/prod", "FILTERED_KEY")
+	if !ok || filtered.DeletedThroughVersion != 2 || !filtered.ReconciledAt.Equal(firstSeen) {
+		t.Fatalf("filtered tombstone was discarded or changed: %#v", filtered)
+	}
+}
+
+func TestSyncImportRejectsPartialBundleBeforeMutation(t *testing.T) {
+	st := testInitializedStore(t)
+	beforeAudit := len(st.State.Audit)
+	imported, err := st.importRemoteSecretVersions("org_ledger", "ledger", []RemoteSecretVersion{{
+		OrgID: "org_ledger",
+		Scope: "ledger/prod",
+	}}, false, true, func(RemoteSecretVersion) ([]byte, bool, error) {
+		t.Fatal("malformed record must be rejected before key preparation")
+		return nil, false, nil
+	})
+	var partial *RemoteImportPartialError
+	if imported != 0 || !errors.As(err, &partial) || len(partial.Skipped) != 1 {
+		t.Fatalf("expected atomic partial rejection, got imported=%d err=%v", imported, err)
+	}
+	if len(st.State.Audit) != beforeAudit || len(st.State.Secrets) != 0 || len(st.State.RemoteBindings) != 0 {
+		t.Fatalf("partial sync mutated local state: %#v", st.State)
+	}
+}
+
+func TestSyncImportPreservesNewerLocalActiveVersionForPush(t *testing.T) {
+	const (
+		workspaceID   = "org_sync_newer"
+		workspaceSlug = "sync-newer"
+		path          = "sync-newer/prod/API_KEY"
+	)
+	source := testInitializedStore(t)
+	sourceDevice := testDevice(t, "sync-source")
+	source.State.Devices = append(source.State.Devices, sourceDevice)
+	expires := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
+	if err := source.LinkControlPlane("http://control.test", workspaceID, workspaceSlug, "usr_owner", "dev_sync_source", "at_source", "rt_source", 3600, expires); err != nil {
+		t.Fatal(err)
+	}
+	bindPrefixForTest(t, source, workspaceSlug, workspaceID)
+	if _, err := source.AddSecret(path, "remote-v1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.AddSecret(path, "remote-v2"); err != nil {
+		t.Fatal(err)
+	}
+	remote, err := source.RemoteSecretVersionsForPrefix(workspaceID, workspaceSlug, "dev_sync_source", workspaceSlug)
+	if err != nil || len(remote) != 1 || remote[0].Version != 2 {
+		t.Fatalf("unexpected remote fixture: %#v err=%v", remote, err)
+	}
+	remoteKey, err := source.dataKeyForSecretVersion(remote[0].Scope, remote[0].Name, remote[0].Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target := testInitializedStore(t)
+	targetDevice := testDevice(t, "sync-target")
+	target.State.Devices = append(target.State.Devices, targetDevice)
+	bindPrefixForTest(t, target, workspaceSlug, workspaceID)
+	for _, value := range []string{"local-v1", "local-v2", "local-v3"} {
+		if _, err := target.AddSecret(path, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	imported, err := target.importRemoteSecretVersions(workspaceID, workspaceSlug, remote, true, true, func(RemoteSecretVersion) ([]byte, bool, error) {
+		return remoteKey, true, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imported != 0 {
+		t.Fatalf("sync should leave the newer local version for push, imported=%d", imported)
+	}
+	secret := target.State.Secrets[SecretKey("sync-newer/prod", "API_KEY")]
+	if secret.ActiveVersion != 3 || secret.Versions[2].Status != "active" {
+		t.Fatalf("newer local version was demoted during sync: %#v", secret)
+	}
+}
+
+func TestSyncImportRejectsDifferentEqualVersionWithoutReplacingLocalValue(t *testing.T) {
+	const (
+		workspaceID   = "org_sync_equal"
+		workspaceSlug = "sync-equal"
+		path          = "sync-equal/prod/API_KEY"
+	)
+	source := testInitializedStore(t)
+	sourceDevice := testDevice(t, "sync-equal-source")
+	source.State.Devices = append(source.State.Devices, sourceDevice)
+	expires := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
+	if err := source.LinkControlPlane("http://control.test", workspaceID, workspaceSlug, "usr_owner", "dev_sync_equal_source", "at_source", "rt_source", 3600, expires); err != nil {
+		t.Fatal(err)
+	}
+	bindPrefixForTest(t, source, workspaceSlug, workspaceID)
+	if _, err := source.AddSecret(path, "remote-value"); err != nil {
+		t.Fatal(err)
+	}
+	remote, err := source.RemoteSecretVersionsForPrefix(workspaceID, workspaceSlug, "dev_sync_equal_source", workspaceSlug)
+	if err != nil || len(remote) != 1 {
+		t.Fatalf("unexpected remote fixture: %#v err=%v", remote, err)
+	}
+	remoteKey, err := source.dataKeyForSecretVersion(remote[0].Scope, remote[0].Name, remote[0].Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target := testInitializedStore(t)
+	targetDevice := testDevice(t, "sync-equal-target")
+	target.State.Devices = append(target.State.Devices, targetDevice)
+	bindPrefixForTest(t, target, workspaceSlug, workspaceID)
+	if _, err := target.AddSecret(path, "local-value"); err != nil {
+		t.Fatal(err)
+	}
+	localBefore := target.State.Secrets[SecretKey("sync-equal/prod", "API_KEY")].Versions[0]
+	imported, err := target.importRemoteSecretVersions(workspaceID, workspaceSlug, remote, true, true, func(RemoteSecretVersion) ([]byte, bool, error) {
+		return remoteKey, true, nil
+	})
+	var conflictErr *RemoteImportConflictError
+	if imported != 0 || !errors.As(err, &conflictErr) || len(conflictErr.Conflicts) != 1 {
+		t.Fatalf("expected one equal-version conflict without import, imported=%d err=%v", imported, err)
+	}
+	localAfter := target.State.Secrets[SecretKey("sync-equal/prod", "API_KEY")].Versions[0]
+	if localAfter.Ciphertext != localBefore.Ciphertext || localAfter.DataKeyAccount != localBefore.DataKeyAccount || localAfter.Status != "active" {
+		t.Fatalf("sync replaced the conflicting local version: before=%#v after=%#v", localBefore, localAfter)
+	}
+	value, _, err := target.GetSecret(path)
+	if err != nil || value != "local-value" {
+		t.Fatalf("local value was not preserved: value=%q err=%v", value, err)
+	}
+}
+
 func TestStaleWriterCannotMixSecretCiphertextAndDataKey(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	initial, err := Load(path)
@@ -1968,7 +2227,7 @@ func TestImportRemoteSecretListsAllLocalConflictsAndComparisonFailuresWithoutPar
 			partialCause = keystore.ErrPlatformTimeout
 		}
 		restoreFailure := keystore.FailPlatformOperationsForTesting(nil, injected, nil)
-		imported, err := target.importRemoteSecretVersions(workspaceID, workspaceSlug, versions, false, func(remote RemoteSecretVersion) ([]byte, bool, error) {
+		imported, err := target.importRemoteSecretVersions(workspaceID, workspaceSlug, versions, false, false, func(remote RemoteSecretVersion) ([]byte, bool, error) {
 			if remote.Name == "MIDDLE_KEY" {
 				return nil, false, fmt.Errorf("remote key preparation failed: %w", partialCause)
 			}
@@ -2020,7 +2279,7 @@ func TestImportRemoteSecretListsAllLocalConflictsAndComparisonFailuresWithoutPar
 		}
 
 		restoreFailure = keystore.FailPlatformOperationsForTesting(nil, injected, nil)
-		_, standaloneErr := target.importRemoteSecretVersions(workspaceID, workspaceSlug, []RemoteSecretVersion{blockedVersion}, false, func(remote RemoteSecretVersion) ([]byte, bool, error) {
+		_, standaloneErr := target.importRemoteSecretVersions(workspaceID, workspaceSlug, []RemoteSecretVersion{blockedVersion}, false, false, func(remote RemoteSecretVersion) ([]byte, bool, error) {
 			return remoteDataKeys[SecretKey(remote.Scope, remote.Name)], true, nil
 		})
 		restoreFailure()
@@ -2028,7 +2287,7 @@ func TestImportRemoteSecretListsAllLocalConflictsAndComparisonFailuresWithoutPar
 			t.Fatalf("standalone comparison error lost %v: %v", injected, standaloneErr)
 		}
 
-		_, partialErr := target.importRemoteSecretVersions(workspaceID, workspaceSlug, []RemoteSecretVersion{partialVersion}, false, func(remote RemoteSecretVersion) ([]byte, bool, error) {
+		_, partialErr := target.importRemoteSecretVersions(workspaceID, workspaceSlug, []RemoteSecretVersion{partialVersion}, false, false, func(remote RemoteSecretVersion) ([]byte, bool, error) {
 			return nil, false, fmt.Errorf("remote key preparation failed: %w", partialCause)
 		})
 		if !errors.Is(partialErr, partialCause) {
@@ -2124,6 +2383,18 @@ func TestRemoteSecretVersionsRejectsStaleSelectedVersion(t *testing.T) {
 	}
 	if _, err := st.RotateDataKeysForPrefix("oclan-co"); err != nil {
 		t.Fatal(err)
+	}
+	active := st.State.Secrets[SecretKey("oclan-co/prod/asiri", "API_KEY")]
+	remote, err := st.RemoteSecretVersionsForRefsWithRecovery("org_oclan", "oclan-co", "dev_remote", []LocalSecretRef{{
+		Scope:   "oclan-co/prod/asiri",
+		Name:    "API_KEY",
+		Version: active.ActiveVersion,
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remote) != 1 || !remote[0].CreatedAt.Equal(active.Versions[len(active.Versions)-1].CreatedAt) {
+		t.Fatalf("remote upload candidate lost local creation time: %#v", remote)
 	}
 	_, err = st.RemoteSecretVersionsForRefsWithRecovery("org_oclan", "oclan-co", "dev_remote", []LocalSecretRef{{
 		Scope:   "oclan-co/prod/asiri",

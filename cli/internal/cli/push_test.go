@@ -962,6 +962,96 @@ func TestPushReconcileRejectsIncompleteRemoteEnvelope(t *testing.T) {
 	}
 }
 
+func TestPushReconcileBlocksTombstonedVersionAndNamesTheKey(t *testing.T) {
+	local := []store.RemoteSecretVersion{{OrgID: "org_remote", Scope: "oclan-co/prod/github", Name: "SYNC_KEY", Version: 1}}
+	tombstones := []asiri.SecretTombstone{{WorkspaceID: "org_remote", Scope: "oclan-co/prod/github", Name: "SYNC_KEY", DeletedThroughVersion: 1}}
+	result, err := reconcilePushVersionsWithTombstones(local, nil, tombstones, nil, "org_remote")
+	if err == nil || !strings.Contains(err.Error(), "oclan-co/prod/github/SYNC_KEY v1") || !strings.Contains(err.Error(), "asiri sync --workspace oclan-co") || !strings.Contains(err.Error(), "add or rotate") {
+		t.Fatalf("expected actionable tombstone conflict, got result=%#v err=%v", result, err)
+	}
+	if len(result.Upload) != 0 || len(result.Recreate) != 0 {
+		t.Fatalf("tombstoned version must not be uploaded: %#v", result)
+	}
+}
+
+func TestPushReconcileStillNamesTombstonedVersionAfterRecreation(t *testing.T) {
+	local := []store.RemoteSecretVersion{{OrgID: "org_remote", Scope: "oclan-co/prod/github", Name: "SYNC_KEY", Version: 1}}
+	remote := []remoteSecretRecord{{
+		OrgID: "org_remote", Scope: "oclan-co/prod/github", Name: "SYNC_KEY", Version: 2, Status: "active",
+		Algorithm: "aes-256-gcm", Nonce: "nonce-v2", Ciphertext: "ciphertext-v2", AAD: "aad-v2",
+	}}
+	tombstones := []asiri.SecretTombstone{{WorkspaceID: "org_remote", Scope: "oclan-co/prod/github", Name: "SYNC_KEY", DeletedThroughVersion: 1}}
+	result, err := reconcilePushVersionsWithTombstones(local, remote, tombstones, nil, "org_remote")
+	if err == nil || !strings.Contains(err.Error(), "oclan-co/prod/github/SYNC_KEY v1") || !strings.Contains(err.Error(), "asiri sync --workspace oclan-co") {
+		t.Fatalf("expected the recreated path to retain its tombstone hint, got result=%#v err=%v", result, err)
+	}
+	if result.SkippedOlder != 0 || len(result.Upload) != 0 {
+		t.Fatalf("tombstoned version must not be silently treated as an older upload: %#v", result)
+	}
+
+	matchingV2 := []store.RemoteSecretVersion{{
+		OrgID: "org_remote", Scope: "oclan-co/prod/github", Name: "SYNC_KEY", Version: 2,
+		Algorithm: "aes-256-gcm", Nonce: "nonce-v2", Ciphertext: "ciphertext-v2", AAD: "aad-v2",
+	}}
+	result, err = reconcilePushVersionsWithTombstones(matchingV2, remote, tombstones, nil, "org_remote")
+	if err != nil || result.SkippedExisting != 1 || len(result.Upload) != 0 {
+		t.Fatalf("matching recreated v2 should remain idempotent, got result=%#v err=%v", result, err)
+	}
+	newerV3 := []store.RemoteSecretVersion{{OrgID: "org_remote", Scope: "oclan-co/prod/github", Name: "SYNC_KEY", Version: 3}}
+	result, err = reconcilePushVersionsWithTombstones(newerV3, remote, tombstones, nil, "org_remote")
+	if err != nil || len(result.Upload) != 1 || result.Upload[0].Version != 3 {
+		t.Fatalf("normal rotation after recreated v2 should remain publishable, got result=%#v err=%v", result, err)
+	}
+}
+
+func TestWritablePushRefsKeepsOnlyAuthorizedSyncPaths(t *testing.T) {
+	refs := []store.LocalSecretRef{
+		{Scope: "oclan-co/prod", Name: "READ_ONLY", Version: 1},
+		{Scope: "oclan-co/prod", Name: "WRITABLE", Version: 2},
+	}
+	paths := []writePathOption{
+		{Scope: "oclan-co/prod", Name: "READ_ONLY", CanWrite: false},
+		{Scope: "oclan-co/prod", Name: "WRITABLE", CanWrite: true},
+	}
+	writable, err := writablePushRefs(refs, paths)
+	if err != nil || len(writable) != 1 || writable[0].Name != "WRITABLE" {
+		t.Fatalf("expected only the authorized sync path, got %#v err=%v", writable, err)
+	}
+	if _, err := writablePushRefs(refs, paths[:1]); err == nil {
+		t.Fatal("missing path permissions must fail closed")
+	}
+}
+
+func TestPushReconcileAllowsReconciledRecreationAfterAdditionalLocalRotations(t *testing.T) {
+	reconciledAt := time.Now().UTC().Add(-time.Minute)
+	local := []store.RemoteSecretVersion{{OrgID: "org_remote", Scope: "oclan-co/prod/github", Name: "SYNC_KEY", Version: 2, CreatedAt: reconciledAt.Add(time.Second)}}
+	tombstone := asiri.SecretTombstone{WorkspaceID: "org_remote", Scope: "oclan-co/prod/github", Name: "SYNC_KEY", DeletedThroughVersion: 1}
+	if _, err := reconcilePushVersionsWithTombstones(local, nil, []asiri.SecretTombstone{tombstone}, nil, "org_remote"); err == nil {
+		t.Fatal("an unreconciled device must not recreate a tombstoned secret")
+	}
+	localTombstone := tombstone
+	localTombstone.ReconciledAt = reconciledAt
+	localLedger := map[string]asiri.SecretTombstone{store.SecretTombstoneKey("org_remote", tombstone.Scope, tombstone.Name): localTombstone}
+	result, err := reconcilePushVersionsWithTombstones(local, nil, []asiri.SecretTombstone{tombstone}, localLedger, "org_remote")
+	if err != nil {
+		t.Fatalf("reconciled next version should be publishable: %v", err)
+	}
+	if len(result.Upload) != 1 || len(result.Recreate) != 1 || result.Recreate[0].DeletedThroughVersion != 1 {
+		t.Fatalf("expected v2 upload with recreation proof, got %#v", result)
+	}
+	local[0].Version = 3
+	local[0].CreatedAt = reconciledAt.Add(2 * time.Second)
+	result, err = reconcilePushVersionsWithTombstones(local, nil, []asiri.SecretTombstone{tombstone}, localLedger, "org_remote")
+	if err != nil || len(result.Upload) != 1 || result.Upload[0].Version != 3 || len(result.Recreate) != 1 {
+		t.Fatalf("recreated secret rotated again before push should remain publishable, got result=%#v err=%v", result, err)
+	}
+	local[0].Version = 2
+	local[0].CreatedAt = reconciledAt.Add(-time.Second)
+	if _, err := reconcilePushVersionsWithTombstones(local, nil, []asiri.SecretTombstone{tombstone}, localLedger, "org_remote"); err == nil {
+		t.Fatal("a version created before tombstone reconciliation must not masquerade as an explicit recreation")
+	}
+}
+
 func TestPushReconcileRepairsMissingDeviceRecipient(t *testing.T) {
 	localWrapped := store.RemoteWrappedKey{RecipientType: "device", RecipientID: "dev_remote", WrapAlgorithm: "p256-hkdf-aes256gcm", WrappedKey: "wrapped-local"}
 	remoteWrapped := store.RemoteWrappedKey{RecipientType: "device", RecipientID: "dev_other", WrapAlgorithm: "p256-hkdf-aes256gcm", WrappedKey: "wrapped-remote"}

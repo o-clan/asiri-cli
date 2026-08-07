@@ -184,7 +184,7 @@ asiri member access revoke --workspace <workspace> --grant <grant-id>
 
 Grant and revoke are remote, audited mutations and send transactional notifications. Revocation blocks future access through that grant. It does not erase decrypted or cached copies, and another active grant may still cover the same secrets. Service-account sessions cannot manage members.
 
-## Pull, Push, And Rewrap
+## Pull, Push, Sync, And Rewrap
 
 Use pull when a trusted device needs encrypted remote records locally:
 
@@ -197,6 +197,19 @@ Use push when local encrypted records should be tracked in the hosted workspace:
 ```sh
 asiri push --workspace <workspace>
 ```
+
+Use sync when a trusted device should reconcile fully against the control-plane
+ledger. Sync applies remote active versions and deletion tombstones first, then
+publishes only local versions the signed-in human is allowed to write. Read-only
+human and service-account sessions reconcile receive-only:
+
+```sh
+asiri sync --workspace <workspace>
+```
+
+If push reports that the deletion ledger blocks one or more named secret paths,
+run sync before adding or publishing that secret again. Deleted versions remain
+deleted; an explicit later add starts at the next permitted version.
 
 Use rewrap only when the user explicitly wants trusted devices or recovery recipients to receive wrapped access to existing encrypted records:
 
