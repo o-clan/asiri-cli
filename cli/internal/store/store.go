@@ -32,8 +32,10 @@ var scopePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9/_-]{1,96}$`)
 var namePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{1,96}$`)
 
 const (
-	KeyStorePlatform = "platform"
-	KeyStoreFile     = "file"
+	KeyStorePlatform                   = "platform"
+	KeyStoreFile                       = "file"
+	controlPlaneAccessTokenLifetime    = time.Hour
+	controlPlaneRefreshSessionLifetime = 90 * 24 * time.Hour
 )
 
 type FileStore struct {
@@ -1318,13 +1320,13 @@ func (s *FileStore) LinkControlPlaneForDevice(origin, workspaceID, workspaceSlug
 	}
 	accessAccount := keystore.SessionAccessAccount(workspaceID, deviceID)
 	refreshAccount := keystore.SessionRefreshAccount(workspaceID, deviceID)
-	refreshExpiry, err := parseControlPlaneExpiry(refreshExpiresAt, 7*24*time.Hour)
+	refreshExpiry, err := parseControlPlaneExpiry(refreshExpiresAt, controlPlaneRefreshSessionLifetime)
 	if err != nil {
 		return err
 	}
 	accessExpiry := time.Now().UTC().Add(time.Duration(expiresIn) * time.Second)
 	if expiresIn <= 0 {
-		accessExpiry = time.Now().UTC().Add(time.Hour)
+		accessExpiry = time.Now().UTC().Add(controlPlaneAccessTokenLifetime)
 	}
 	if s.State.ControlPlane != nil {
 		s.deleteControlPlaneTokens(s.State.ControlPlane)
@@ -1375,7 +1377,7 @@ func (s *FileStore) LinkServiceAccountControlPlane(origin, workspaceID, workspac
 	}
 	accessAccount := keystore.SessionAccessAccount(workspaceID, deviceID)
 	refreshAccount := keystore.SessionRefreshAccount(workspaceID, deviceID)
-	refreshExpiry, err := parseControlPlaneExpiry(refreshExpiresAt, 7*24*time.Hour)
+	refreshExpiry, err := parseControlPlaneExpiry(refreshExpiresAt, controlPlaneRefreshSessionLifetime)
 	if err != nil {
 		return err
 	}
@@ -1401,7 +1403,7 @@ func (s *FileStore) LinkServiceAccountControlPlane(origin, workspaceID, workspac
 	s.State.Policies = keptPolicies
 	expiresAt := time.Now().UTC().Add(time.Duration(expiresIn) * time.Second)
 	if expiresIn <= 0 {
-		expiresAt = time.Now().UTC().Add(time.Hour)
+		expiresAt = time.Now().UTC().Add(controlPlaneAccessTokenLifetime)
 	}
 	s.State.ControlPlane = &asiri.ControlPlaneLink{
 		Origin:               origin,
@@ -2757,7 +2759,7 @@ func (s *FileStore) RefreshControlPlane(accessToken string, expiresIn int, refre
 	if accessToken == "" {
 		return errors.New("control plane did not return an access token")
 	}
-	refreshExpiry, err := parseControlPlaneExpiry(refreshExpiresAt, 7*24*time.Hour)
+	refreshExpiry, err := parseControlPlaneExpiry(refreshExpiresAt, controlPlaneRefreshSessionLifetime)
 	if err != nil {
 		return err
 	}
@@ -2766,7 +2768,7 @@ func (s *FileStore) RefreshControlPlane(accessToken string, expiresIn int, refre
 	}
 	expiresAt := time.Now().UTC().Add(time.Duration(expiresIn) * time.Second)
 	if expiresIn <= 0 {
-		expiresAt = time.Now().UTC().Add(time.Hour)
+		expiresAt = time.Now().UTC().Add(controlPlaneAccessTokenLifetime)
 	}
 	s.State.ControlPlane.AccessTokenExpiresAt = expiresAt
 	s.State.ControlPlane.RefreshExpiresAt = refreshExpiry

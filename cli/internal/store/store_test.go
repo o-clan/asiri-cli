@@ -913,6 +913,42 @@ func TestServiceAccountLinkUsesIsolatedRuntimeSubject(t *testing.T) {
 	}
 }
 
+func TestControlPlaneSessionFallbackLifetimes(t *testing.T) {
+	st := testInitializedStore(t)
+	device := testDevice(t, "session-lifetime")
+	st.State.Devices = append(st.State.Devices, device)
+	st.State.LocalDeviceID = device.ID
+
+	assertLifetime := func(name string, expiresAt, startedAt time.Time, want time.Duration) {
+		t.Helper()
+		got := expiresAt.Sub(startedAt)
+		if got < want-time.Second || got > want+time.Second {
+			t.Fatalf("%s lifetime = %v, want %v", name, got, want)
+		}
+	}
+
+	humanStarted := time.Now().UTC()
+	if err := st.LinkControlPlaneForDevice("http://control.test", "org_human", "human", "usr_owner", "dev_human", device.ID, "at_human", "rt_human", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	assertLifetime("human access token", st.State.ControlPlane.AccessTokenExpiresAt, humanStarted, time.Hour)
+	assertLifetime("human refresh session", st.State.ControlPlane.RefreshExpiresAt, humanStarted, 90*24*time.Hour)
+
+	serviceStarted := time.Now().UTC()
+	if err := st.LinkServiceAccountControlPlane("http://control.test", "org_service", "service", "usr_owner", "svc_prod", "prod-api", "Production API", "dev_service", device.ID, "at_service", "rt_service", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	assertLifetime("service account access token", st.State.ControlPlane.AccessTokenExpiresAt, serviceStarted, time.Hour)
+	assertLifetime("service account refresh session", st.State.ControlPlane.RefreshExpiresAt, serviceStarted, 90*24*time.Hour)
+
+	refreshStarted := time.Now().UTC()
+	if err := st.RefreshControlPlane("at_refreshed", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	assertLifetime("refreshed access token", st.State.ControlPlane.AccessTokenExpiresAt, refreshStarted, time.Hour)
+	assertLifetime("refreshed session", st.State.ControlPlane.RefreshExpiresAt, refreshStarted, 90*24*time.Hour)
+}
+
 func TestRevokingCurrentLocalDeviceClearsKeyMaterialAndBlocksDecryption(t *testing.T) {
 	st := testInitializedStore(t)
 	current := testDevice(t, "current")
